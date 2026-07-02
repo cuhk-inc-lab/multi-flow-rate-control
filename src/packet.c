@@ -1,22 +1,13 @@
 #include "packet.h"
+#include "time_utils.h"
 
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
-static int monotonic_now(struct timespec *ts)
-{
-    if (ts == NULL) {
-        return -1;
-    }
-
-    if (clock_gettime(CLOCK_MONOTONIC, ts) != 0) {
-        return -1;
-    }
-
-    return 0;
-}
+typedef struct PacketAdoptCtx {
+    PacketPayloadFreeFn free_fn;
+    void               *free_ctx;
+} PacketAdoptCtx;
 
 DataPacket *packet_create(uint32_t flow_id, const void *data, size_t len)
 {
@@ -43,7 +34,7 @@ DataPacket *packet_create(uint32_t flow_id, const void *data, size_t len)
         memcpy(pkt->payload, data, len);
     }
 
-    if (monotonic_now(&pkt->enqueue_ts) != 0) {
+    if (time_utils_now_mono(&pkt->enqueue_ts) != TU_OK) {
         free(pkt->payload);
         free(pkt);
         return NULL;
@@ -84,7 +75,7 @@ DataPacket *packet_adopt(uint32_t flow_id,
     pkt->payload = payload;
     pkt->user_data = adopt;
 
-    if (monotonic_now(&pkt->enqueue_ts) != 0) {
+    if (time_utils_now_mono(&pkt->enqueue_ts) != TU_OK) {
         free(adopt);
         free(pkt);
         return NULL;
@@ -114,12 +105,15 @@ void packet_free(DataPacket *pkt)
     free(pkt);
 }
 
-int packet_stamp_now(DataPacket *pkt)
+PacketStatus packet_stamp_now(DataPacket *pkt)
 {
     if (pkt == NULL) {
-        errno = EINVAL;
-        return -1;
+        return PKT_ERR_INVALID;
     }
 
-    return monotonic_now(&pkt->enqueue_ts) == 0 ? 0 : -1;
+    if (time_utils_now_mono(&pkt->enqueue_ts) != TU_OK) {
+        return PKT_ERR_SYSTEM;
+    }
+
+    return PKT_OK;
 }

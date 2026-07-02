@@ -129,8 +129,11 @@ static FlowBufferStatus enqueue_locked(FlowCircularBuffer *fb,
 
 static FlowBufferStatus dequeue_locked(FlowCircularBuffer *fb,
                                        DataPacket **pkt,
-                                       int block)
+                                       int block,
+                                       int *woke_from_idle)
 {
+    int waited_on_empty = 0;
+
     if (!valid_buffer(fb) || pkt == NULL) {
         return FB_ERR_INVALID;
     }
@@ -142,6 +145,7 @@ static FlowBufferStatus dequeue_locked(FlowCircularBuffer *fb,
             pthread_mutex_unlock(&fb->mutex);
             return FB_ERR_INVALID;
         }
+        waited_on_empty = 1;
         pthread_cond_wait(&fb->not_empty, &fb->mutex);
     }
 
@@ -158,6 +162,10 @@ static FlowBufferStatus dequeue_locked(FlowCircularBuffer *fb,
     pthread_cond_signal(&fb->not_full);
     pthread_mutex_unlock(&fb->mutex);
 
+    if (woke_from_idle != NULL) {
+        *woke_from_idle = waited_on_empty;
+    }
+
     return FB_OK;
 }
 
@@ -166,9 +174,11 @@ FlowBufferStatus flow_buffer_enqueue(FlowCircularBuffer *fb, DataPacket **pkt)
     return enqueue_locked(fb, pkt, 1);
 }
 
-FlowBufferStatus flow_buffer_dequeue(FlowCircularBuffer *fb, DataPacket **pkt)
+FlowBufferStatus flow_buffer_dequeue(FlowCircularBuffer *fb,
+                                     DataPacket **pkt,
+                                     int *woke_from_idle)
 {
-    return dequeue_locked(fb, pkt, 1);
+    return dequeue_locked(fb, pkt, 1, woke_from_idle);
 }
 
 FlowBufferStatus flow_buffer_try_enqueue(FlowCircularBuffer *fb, DataPacket **pkt)
@@ -186,7 +196,7 @@ FlowBufferStatus flow_buffer_try_enqueue(FlowCircularBuffer *fb, DataPacket **pk
 
     if (fb->count == fb->capacity) {
         pthread_mutex_unlock(&fb->mutex);
-        return FB_ERR_INVALID;
+        return FB_ERR_FULL;
     }
 
     fb->slots[fb->tail] = *pkt;
@@ -209,7 +219,7 @@ FlowBufferStatus flow_buffer_try_dequeue(FlowCircularBuffer *fb, DataPacket **pk
     pthread_mutex_lock(&fb->mutex);
 
     if (fb->count == 0) {
-        FlowBufferStatus st = fb->shutdown ? FB_ERR_SHUTDOWN : FB_ERR_INVALID;
+        FlowBufferStatus st = fb->shutdown ? FB_ERR_SHUTDOWN : FB_ERR_EMPTY;
         pthread_mutex_unlock(&fb->mutex);
         return st;
     }

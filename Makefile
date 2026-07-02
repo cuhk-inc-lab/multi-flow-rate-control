@@ -4,19 +4,30 @@ LDFLAGS = -pthread
 
 SRC_DIR  = src
 TEST_DIR = tests
+APP_DIR  = apps/demo
 OBJ_DIR  = build
 
-SRCS = \
+LIB_SRCS = \
 	$(SRC_DIR)/packet.c \
-	$(SRC_DIR)/flow_buffer.c
+	$(SRC_DIR)/time_utils.c \
+	$(SRC_DIR)/flow_buffer.c \
+	$(SRC_DIR)/mixed_queue.c \
+	$(SRC_DIR)/fd_sink.c \
+	$(SRC_DIR)/flow_context.c \
+	$(SRC_DIR)/flow_worker.c \
+	$(SRC_DIR)/dispatcher.c \
+	$(SRC_DIR)/flow_manager.c
 
-OBJS = $(SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
-LIB  = $(OBJ_DIR)/libmulti_flow.a
+LIB_OBJS = $(LIB_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+LIB      = $(OBJ_DIR)/libmulti_flow.a
 TEST_BIN = $(OBJ_DIR)/run_tests
+DEMO_BIN = $(OBJ_DIR)/multi_flow_demo
 
-.PHONY: all test check sanitize clean
+.PHONY: all test check demo sanitize clean
 
 all: $(LIB)
+
+demo: $(DEMO_BIN)
 
 test check: $(TEST_BIN)
 	./$(TEST_BIN)
@@ -31,11 +42,14 @@ $(OBJ_DIR):
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(LIB): $(OBJS) | $(OBJ_DIR)
+$(LIB): $(LIB_OBJS) | $(OBJ_DIR)
 	ar rcs $@ $^
 
-$(TEST_BIN): $(TEST_DIR)/test_flow_buffer.c $(OBJS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) $(TEST_DIR)/test_flow_buffer.c $(OBJS) -o $@ $(LDFLAGS)
+$(TEST_BIN): $(TEST_DIR)/run_tests.c $(LIB_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(TEST_DIR)/run_tests.c $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+$(DEMO_BIN): $(APP_DIR)/main.c $(LIB_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(APP_DIR)/main.c $(LIB_OBJS) -o $@ $(LDFLAGS)
 
 clean:
 	rm -rf $(OBJ_DIR)
