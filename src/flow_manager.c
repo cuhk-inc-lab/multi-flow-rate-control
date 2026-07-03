@@ -34,8 +34,21 @@ FlowManagerStatus flow_manager_init(FlowManager *mgr, const FlowManagerConfig *c
         return FM_ERR_ALLOC;
     }
 
+    if (pthread_mutex_init(&mgr->dispatch_wake_mtx, NULL) != 0) {
+        mixed_queue_destroy(&mgr->mixed);
+        return FM_ERR_ALLOC;
+    }
+
+    if (pthread_cond_init(&mgr->dispatch_wake_cv, NULL) != 0) {
+        pthread_mutex_destroy(&mgr->dispatch_wake_mtx);
+        mixed_queue_destroy(&mgr->mixed);
+        return FM_ERR_ALLOC;
+    }
+
     mgr->flows = calloc(cfg->max_flows, sizeof(*mgr->flows));
     if (mgr->flows == NULL) {
+        pthread_cond_destroy(&mgr->dispatch_wake_cv);
+        pthread_mutex_destroy(&mgr->dispatch_wake_mtx);
         mixed_queue_destroy(&mgr->mixed);
         return FM_ERR_ALLOC;
     }
@@ -58,6 +71,8 @@ FlowManagerStatus flow_manager_init(FlowManager *mgr, const FlowManagerConfig *c
             }
             free(mgr->flows);
             mgr->flows = NULL;
+            pthread_cond_destroy(&mgr->dispatch_wake_cv);
+            pthread_mutex_destroy(&mgr->dispatch_wake_mtx);
             mixed_queue_destroy(&mgr->mixed);
             return FM_ERR_ALLOC;
         }
@@ -65,6 +80,18 @@ FlowManagerStatus flow_manager_init(FlowManager *mgr, const FlowManagerConfig *c
         if (cfg->encode_scratch_cap > 0) {
             flow_context_set_encoder(&mgr->flows[i], NULL, NULL, cfg->encode_scratch_cap);
         }
+    }
+
+    if (!dispatcher_init_deferred(mgr)) {
+        for (i = 0; i < cfg->max_flows; i++) {
+            flow_context_destroy(&mgr->flows[i]);
+        }
+        free(mgr->flows);
+        mgr->flows = NULL;
+        pthread_cond_destroy(&mgr->dispatch_wake_cv);
+        pthread_mutex_destroy(&mgr->dispatch_wake_mtx);
+        mixed_queue_destroy(&mgr->mixed);
+        return FM_ERR_ALLOC;
     }
 
     return FM_OK;
@@ -130,6 +157,8 @@ FlowManagerStatus flow_manager_stop(FlowManager *mgr)
         flow_buffer_shutdown(&mgr->flows[i].queue);
     }
 
+    flow_manager_dispatch_wake(mgr);
+
     if (mgr->dispatcher_started) {
         dispatcher_join(mgr);
     }
@@ -153,6 +182,8 @@ void flow_manager_destroy(FlowManager *mgr)
 
     flow_manager_stop(mgr);
 
+    dispatcher_destroy_deferred(mgr);
+
     if (mgr->flows != NULL) {
         for (i = 0; i < mgr->config.max_flows; i++) {
             flow_context_destroy(&mgr->flows[i]);
@@ -162,10 +193,23 @@ void flow_manager_destroy(FlowManager *mgr)
     }
 
     mixed_queue_destroy(&mgr->mixed);
+    pthread_cond_destroy(&mgr->dispatch_wake_cv);
+    pthread_mutex_destroy(&mgr->dispatch_wake_mtx);
     mgr->dispatcher_started = 0;
     mgr->running = 0;
     mgr->shutdown_requested = 0;
     mgr->route_errors = 0;
+}
+
+void flow_manager_dispatch_wake(FlowManager *mgr)
+{
+    if (mgr == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->dispatch_wake_mtx);
+    pthread_cond_broadcast(&mgr->dispatch_wake_cv);
+    pthread_mutex_unlock(&mgr->dispatch_wake_mtx);
 }
 
 FlowManagerStatus flow_manager_push(FlowManager *mgr, DataPacket **pkt)

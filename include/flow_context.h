@@ -22,7 +22,7 @@ typedef struct FlowMetrics {
     _Atomic uint64_t dequeued_packets;
     _Atomic uint64_t enqueued_bytes;
     _Atomic uint64_t dequeued_bytes;
-    uint64_t         pacing_sleeps;
+    _Atomic uint64_t pacing_sleeps;
 
     pthread_mutex_t  bps_mutex;
     double           calculated_enqueue_bps;
@@ -79,6 +79,10 @@ void flow_context_destroy(FlowContext *ctx);
 
 void flow_metrics_record_enqueue(FlowMetrics *metrics, size_t bytes);
 void flow_metrics_record_dequeue(FlowMetrics *metrics, size_t bytes);
-void flow_metrics_tick(FlowMetrics *metrics, double window_sec);
+/* Returns 1 when a full window elapsed and bps values were updated. */
+int flow_metrics_tick(FlowMetrics *metrics, double window_sec);
+
+double flow_metrics_get_enqueue_bps(const FlowMetrics *metrics);
+double flow_metrics_get_dequeue_bps(const FlowMetrics *metrics);
 
 #endif /* FLOW_CONTEXT_H */

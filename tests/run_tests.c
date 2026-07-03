@@ -3,6 +3,7 @@
 #include "time_utils.h"
 
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -513,6 +514,396 @@ static int test_flow_manager_invalid_route(void)
     return 0;
 }
 
+/* ---- pacing timeline ---- */
+
+#define PACE_PKTS        5
+#define PACE_PAYLOAD     16
+#define PACE_INTERVAL_MS 100
+
+typedef struct {
+    int              fd;
+    struct timespec  times[PACE_PKTS];
+    int              count;
+    int              errors;
+} PaceReaderCtx;
+
+static void *pace_reader_thread(void *arg)
+{
+    PaceReaderCtx *ctx = arg;
+    unsigned char  buf[PACE_PAYLOAD];
+
+    while (ctx->count < PACE_PKTS) {
+        ssize_t got = 0;
+
+        while (got < PACE_PAYLOAD) {
+            ssize_t n = read(ctx->fd, buf + got, (size_t)(PACE_PAYLOAD - got));
+
+            if (n <= 0) {
+                ctx->errors++;
+                return NULL;
+            }
+            got += n;
+        }
+
+        if (time_utils_now_mono(&ctx->times[ctx->count]) != TU_OK) {
+            ctx->errors++;
+            return NULL;
+        }
+        ctx->count++;
+    }
+
+    return NULL;
+}
+
+static int pacing_interval_ok(const struct timespec *a, const struct timespec *b)
+{
+    struct timespec delta;
+    long ms;
+
+    if (time_utils_ts_sub(b, a, &delta) != TU_OK) {
+        return 0;
+    }
+
+    ms = delta.tv_sec * 1000L + delta.tv_nsec / 1000000L;
+    return ms >= (PACE_INTERVAL_MS - 35) && ms <= (PACE_INTERVAL_MS + 50);
+}
+
+static int test_pacing_timeline(void)
+{
+    FlowManager mgr;
+    FlowManagerConfig cfg = {
+        .max_flows = 1,
+        .per_flow_queue_capacity = 8,
+        .mixed_queue_capacity = 16,
+        .default_output_fd = -1,
+        .output_fds = NULL,
+        .encode_scratch_cap = 0
+    };
+    int pipefd[2];
+    int null_fd = open("/dev/null", O_WRONLY);
+    int fds[1];
+    pthread_t reader;
+    PaceReaderCtx rctx = { .fd = -1, .count = 0, .errors = 0 };
+    struct timespec delay = { .tv_sec = 0,
+                              .tv_nsec = (long)PACE_INTERVAL_MS * 1000000L };
+    unsigned char payload[PACE_PAYLOAD];
+
+    memset(payload, 'x', sizeof(payload));
+
+    if (null_fd < 0 || pipe(pipefd) != 0) {
+        close(null_fd);
+        return 1;
+    }
+
+    fds[0] = pipefd[1];
+    cfg.output_fds = fds;
+
+    if (flow_manager_init(&mgr, &cfg) != FM_OK) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(null_fd);
+        return 1;
+    }
+
+    flow_context_set_pacing(&mgr.flows[0], 1);
+
+    if (flow_manager_start(&mgr) != FM_OK) {
+        flow_manager_destroy(&mgr);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(null_fd);
+        return 1;
+    }
+
+    rctx.fd = pipefd[0];
+    if (pthread_create(&reader, NULL, pace_reader_thread, &rctx) != 0) {
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(null_fd);
+        return 1;
+    }
+
+    for (int i = 0; i < PACE_PKTS; i++) {
+        DataPacket *pkt = packet_create(0, payload, PACE_PAYLOAD);
+
+        if (pkt == NULL) {
+            flow_manager_stop(&mgr);
+            pthread_join(reader, NULL);
+            flow_manager_destroy(&mgr);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            close(null_fd);
+            return 1;
+        }
+
+        if (flow_manager_push(&mgr, &pkt) != FM_OK) {
+            packet_free(pkt);
+            flow_manager_stop(&mgr);
+            pthread_join(reader, NULL);
+            flow_manager_destroy(&mgr);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            close(null_fd);
+            return 1;
+        }
+
+        if (i + 1 < PACE_PKTS) {
+            time_utils_sleep_for(&delay);
+        }
+    }
+
+    pthread_join(reader, NULL);
+    flow_manager_stop(&mgr);
+    flow_manager_destroy(&mgr);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    close(null_fd);
+
+    if (rctx.errors != 0 || rctx.count != PACE_PKTS) {
+        return 1;
+    }
+
+    for (int i = 1; i < PACE_PKTS; i++) {
+        if (!pacing_interval_ok(&rctx.times[i - 1], &rctx.times[i])) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* ---- ±1% bps over 5s window ---- */
+
+#define RATE_WINDOW_SEC   5.0
+#define RATE_RUN_SEC      6
+#define RATE_INTERVAL_MS  20
+#define RATE_PAYLOAD      100
+#define RATE_COUNT        ((RATE_RUN_SEC * 1000) / RATE_INTERVAL_MS)
+
+static void *rate_producer_thread(void *arg)
+{
+    MgrProducerCtx *ctx = arg;
+    struct timespec delay = { .tv_sec = 0,
+                              .tv_nsec = (long)RATE_INTERVAL_MS * 1000000L };
+    unsigned char payload[RATE_PAYLOAD];
+
+    memset(payload, 'r', sizeof(payload));
+
+    for (int i = 0; i < RATE_COUNT; i++) {
+        DataPacket *pkt = packet_create(ctx->flow_id, payload, RATE_PAYLOAD);
+
+        if (pkt == NULL) {
+            ctx->errors++;
+            return NULL;
+        }
+
+        if (flow_manager_push(ctx->mgr, &pkt) != FM_OK) {
+            packet_free(pkt);
+            ctx->errors++;
+            return NULL;
+        }
+
+        if (i + 1 < RATE_COUNT) {
+            time_utils_sleep_for(&delay);
+        }
+    }
+
+    return NULL;
+}
+
+static int test_rate_match_5s(void)
+{
+    FlowManager mgr;
+    FlowManagerConfig cfg = {
+        .max_flows = 1,
+        .per_flow_queue_capacity = 32,
+        .mixed_queue_capacity = 64,
+        .default_output_fd = -1,
+        .output_fds = NULL,
+        .encode_scratch_cap = 0
+    };
+    int null_fd = open("/dev/null", O_WRONLY);
+    int fds[1];
+    pthread_t prod;
+    MgrProducerCtx pctx;
+    int got_window = 0;
+    double last_enq = 0.0;
+    double last_deq = 0.0;
+
+    if (null_fd < 0) {
+        return 1;
+    }
+
+    fds[0] = null_fd;
+    cfg.output_fds = fds;
+
+    if (flow_manager_init(&mgr, &cfg) != FM_OK) {
+        close(null_fd);
+        return 1;
+    }
+
+    flow_context_set_pacing(&mgr.flows[0], 1);
+
+    if (flow_manager_start(&mgr) != FM_OK) {
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
+
+    pctx = (MgrProducerCtx){
+        .mgr = &mgr, .flow_id = 0, .count = RATE_COUNT,
+        .interval_ms = RATE_INTERVAL_MS, .errors = 0
+    };
+
+    if (pthread_create(&prod, NULL, rate_producer_thread, &pctx) != 0) {
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
+
+    while (atomic_load(&mgr.flows[0].metrics.dequeued_packets) < (uint64_t)RATE_COUNT) {
+        if (flow_metrics_tick(&mgr.flows[0].metrics, RATE_WINDOW_SEC)) {
+            last_enq = flow_metrics_get_enqueue_bps(&mgr.flows[0].metrics);
+            last_deq = flow_metrics_get_dequeue_bps(&mgr.flows[0].metrics);
+            if (last_enq > 0.0) {
+                got_window = 1;
+            }
+        }
+
+        {
+            struct timespec tick_delay = { .tv_sec = 0, .tv_nsec = 50000000L };
+            nanosleep(&tick_delay, NULL);
+        }
+    }
+
+    pthread_join(prod, NULL);
+
+    while (!flow_metrics_tick(&mgr.flows[0].metrics, RATE_WINDOW_SEC)) {
+        struct timespec tick_delay = { .tv_sec = 0, .tv_nsec = 10000000L };
+        nanosleep(&tick_delay, NULL);
+    }
+    last_enq = flow_metrics_get_enqueue_bps(&mgr.flows[0].metrics);
+    last_deq = flow_metrics_get_dequeue_bps(&mgr.flows[0].metrics);
+    if (last_enq > 0.0) {
+        got_window = 1;
+    }
+
+    {
+        uint64_t enq_bytes =
+            atomic_load(&mgr.flows[0].metrics.enqueued_bytes);
+        uint64_t deq_bytes =
+            atomic_load(&mgr.flows[0].metrics.dequeued_bytes);
+
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+
+        if (pctx.errors != 0 || !got_window) {
+            return 1;
+        }
+
+        if (enq_bytes != deq_bytes) {
+            return 1;
+        }
+
+        if (last_enq <= 0.0) {
+            return 1;
+        }
+
+        if (fabs(last_deq - last_enq) / last_enq > 0.01) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* ---- dispatcher HOL avoidance ---- */
+
+static int test_dispatcher_avoids_hol(void)
+{
+    FlowManager mgr;
+    FlowManagerConfig cfg = {
+        .max_flows = 2,
+        .per_flow_queue_capacity = 1,
+        .mixed_queue_capacity = 16,
+        .default_output_fd = -1,
+        .output_fds = NULL,
+        .encode_scratch_cap = 0
+    };
+    int null_fd = open("/dev/null", O_WRONLY);
+    int fds[2];
+    unsigned char payload[8];
+
+    memset(payload, 'a', sizeof(payload));
+
+    if (null_fd < 0) {
+        return 1;
+    }
+
+    fds[0] = null_fd;
+    fds[1] = null_fd;
+    cfg.output_fds = fds;
+
+    if (flow_manager_init(&mgr, &cfg) != FM_OK) {
+        close(null_fd);
+        return 1;
+    }
+
+    flow_context_set_pacing(&mgr.flows[0], 0);
+    flow_context_set_pacing(&mgr.flows[1], 0);
+
+    if (flow_manager_start(&mgr) != FM_OK) {
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        DataPacket *pkt = packet_create(0, payload, sizeof(payload));
+
+        if (pkt == NULL || flow_manager_push(&mgr, &pkt) != FM_OK) {
+            packet_free(pkt);
+            flow_manager_stop(&mgr);
+            flow_manager_destroy(&mgr);
+            close(null_fd);
+            return 1;
+        }
+    }
+
+    {
+        DataPacket *pkt = packet_create(1, payload, sizeof(payload));
+
+        if (pkt == NULL || flow_manager_push(&mgr, &pkt) != FM_OK) {
+            packet_free(pkt);
+            flow_manager_stop(&mgr);
+            flow_manager_destroy(&mgr);
+            close(null_fd);
+            return 1;
+        }
+    }
+
+    {
+        struct timespec wait = { .tv_sec = 0, .tv_nsec = 50000000L };
+        nanosleep(&wait, NULL);
+    }
+
+    if (atomic_load(&mgr.flows[1].metrics.dequeued_packets) < 1) {
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
+
+    flow_manager_stop(&mgr);
+    flow_manager_destroy(&mgr);
+    close(null_fd);
+    return 0;
+}
+
 int main(void)
 {
     if (test_packet_create_free() != 0) {
@@ -545,6 +936,18 @@ int main(void)
     }
     if (test_flow_manager_e2e() != 0) {
         fprintf(stderr, "test_flow_manager_e2e failed\n");
+        return 1;
+    }
+    if (test_pacing_timeline() != 0) {
+        fprintf(stderr, "test_pacing_timeline failed\n");
+        return 1;
+    }
+    if (test_rate_match_5s() != 0) {
+        fprintf(stderr, "test_rate_match_5s failed\n");
+        return 1;
+    }
+    if (test_dispatcher_avoids_hol() != 0) {
+        fprintf(stderr, "test_dispatcher_avoids_hol failed\n");
         return 1;
     }
 

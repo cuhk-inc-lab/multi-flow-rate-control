@@ -5,6 +5,7 @@
  * Default output_dir: /tmp/mfrc_demo
  */
 
+#include "flow_context.h"
 #include "flow_manager.h"
 #include "packet.h"
 #include "time_utils.h"
@@ -24,11 +25,32 @@
 #define FLOWS       2
 #define PKTS_EACH   8
 #define INTERVAL_MS 50
+#define METRICS_WINDOW_SEC 5.0
 
 typedef struct {
     FlowManager *mgr;
     uint32_t     flow_id;
 } DemoProducerCtx;
+
+typedef struct {
+    FlowManager  *mgr;
+    _Atomic int   running;
+} DemoMetricsCtx;
+
+static void *demo_metrics_thread(void *arg)
+{
+    DemoMetricsCtx *ctx = arg;
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 200000000L };
+
+    while (atomic_load(&ctx->running)) {
+        for (uint32_t i = 0; i < FLOWS; i++) {
+            (void)flow_metrics_tick(&ctx->mgr->flows[i].metrics, METRICS_WINDOW_SEC);
+        }
+        time_utils_sleep_for(&delay);
+    }
+
+    return NULL;
+}
 
 static void *demo_producer(void *arg)
 {
@@ -77,7 +99,9 @@ int main(int argc, char **argv)
     FlowManagerConfig cfg;
     int fds[FLOWS];
     pthread_t threads[FLOWS];
+    pthread_t metrics_thread;
     DemoProducerCtx ctx[FLOWS];
+    DemoMetricsCtx mctx;
     uint32_t i;
 
     if (argc > 1) {
@@ -127,6 +151,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    mctx.mgr = &mgr;
+    atomic_store(&mctx.running, 1);
+    if (pthread_create(&metrics_thread, NULL, demo_metrics_thread, &mctx) != 0) {
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        for (i = 0; i < FLOWS; i++) {
+            close(fds[i]);
+        }
+        return 1;
+    }
+
     for (i = 0; i < FLOWS; i++) {
         ctx[i].mgr = &mgr;
         ctx[i].flow_id = i;
@@ -144,17 +179,24 @@ int main(int argc, char **argv)
         pthread_join(threads[i], NULL);
     }
 
+    atomic_store(&mctx.running, 0);
+    pthread_join(metrics_thread, NULL);
+
     flow_manager_stop(&mgr);
 
     printf("Demo complete. Output directory: %s\n", out_dir);
     for (i = 0; i < FLOWS; i++) {
-        printf("  flow %u: enqueued=%llu dequeued=%llu enq_bytes=%llu deq_bytes=%llu sleeps=%llu\n",
+        printf("  flow %u: enqueued=%llu dequeued=%llu enq_bytes=%llu deq_bytes=%llu "
+               "sleeps=%llu enq_bps=%.0f deq_bps=%.0f\n",
                i,
                (unsigned long long)atomic_load(&mgr.flows[i].metrics.enqueued_packets),
                (unsigned long long)atomic_load(&mgr.flows[i].metrics.dequeued_packets),
                (unsigned long long)atomic_load(&mgr.flows[i].metrics.enqueued_bytes),
                (unsigned long long)atomic_load(&mgr.flows[i].metrics.dequeued_bytes),
-               (unsigned long long)mgr.flows[i].metrics.pacing_sleeps);
+               (unsigned long long)atomic_load(
+                   &mgr.flows[i].metrics.pacing_sleeps),
+               flow_metrics_get_enqueue_bps(&mgr.flows[i].metrics),
+               flow_metrics_get_dequeue_bps(&mgr.flows[i].metrics));
         close(fds[i]);
     }
 

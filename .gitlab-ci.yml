@@ -1,0 +1,37 @@
+image: ubuntu:22.04
+
+stages:
+  - test
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+
+.test_setup:
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends build-essential gcc make
+
+unit-test:
+  extends: .test_setup
+  stage: test
+  script:
+    - make test
+
+asan:
+  extends: .test_setup
+  stage: test
+  script:
+    - make sanitize
+
+tsan:
+  extends: .test_setup
+  stage: test
+  script:
+    - make tsan
+
+app-test:
+  extends: .test_setup
+  stage: test
+  script:
+    - make app-test
+    - make app-test-multi

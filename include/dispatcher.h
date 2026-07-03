@@ -12,6 +12,9 @@ typedef enum {
 DispatcherStatus dispatcher_start(FlowManager *mgr);
 DispatcherStatus dispatcher_join(FlowManager *mgr);
 
+int  dispatcher_init_deferred(FlowManager *mgr);
+void dispatcher_destroy_deferred(FlowManager *mgr);
+
 void *dispatcher_thread(void *arg);
 
 #endif /* DISPATCHER_H */

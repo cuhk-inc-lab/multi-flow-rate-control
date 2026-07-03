@@ -1,6 +1,7 @@
 #include "flow_worker.h"
 
 #include "fd_sink.h"
+#include "flow_manager.h"
 #include "time_utils.h"
 
 static FlowWorkerStatus emit_packet(FlowContext *ctx, DataPacket *pkt, ssize_t *written)
@@ -69,7 +70,7 @@ static void pace_packet(FlowContext *ctx, const DataPacket *pkt)
 
     if (time_utils_ts_sub(&target_dequeue, &now, &sleep_for) == TU_OK) {
         time_utils_sleep_for(&sleep_for);
-        ctx->metrics.pacing_sleeps++;
+        atomic_fetch_add_explicit(&ctx->metrics.pacing_sleeps, 1, memory_order_relaxed);
     }
 }
 
@@ -97,6 +98,10 @@ void *flow_worker_thread(void *arg)
 
         if (woke_from_idle) {
             ctx->pacing.has_stream_start = 0;
+        }
+
+        if (ctx->owner != NULL) {
+            flow_manager_dispatch_wake(ctx->owner);
         }
 
         pace_packet(ctx, pkt);

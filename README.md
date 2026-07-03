@@ -29,7 +29,7 @@ make app          # multi_flow_relay (CircularBuffer + codec + FlowManager)
 make app-test     # byte-exact single-flow roundtrip (pacing off)
 make app-test-multi
 make sanitize     # ASan + app-test
-make tsan         # ThreadSanitizer on unit tests
+make tsan         # ThreadSanitizer on unit tests + app-test-multi
 make clean
 ```
 
@@ -73,3 +73,5 @@ Reset stream anchor after idle dequeue wait.
 ## Metrics
 
 Per-flow `_Atomic` byte/packet counters and rolling-window bps (`flow_metrics_tick`).
+`relay` and `demo` sample metrics during execution. Unit tests include
+`test_rate_match_5s` (±1% dequeue vs enqueue bps over 5s) and `test_pacing_timeline`.

@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void framer_payload_free(void *payload, void *ctx)
+{
+    (void)ctx;
+    free(payload);
+}
+
 PacketFramerStatus packet_framer_pump(CircularBuffer *src,
                                       FlowManager *mgr,
                                       uint32_t flow_id,
@@ -35,9 +41,9 @@ PacketFramerStatus packet_framer_pump(CircularBuffer *src,
         return PF_ERR_IO;
     }
 
-    pkt = packet_create(flow_id, block, block_size);
-    free(block);
+    pkt = packet_adopt(flow_id, block, block_size, framer_payload_free, NULL);
     if (pkt == NULL) {
+        free(block);
         return PF_ERR_IO;
     }
 

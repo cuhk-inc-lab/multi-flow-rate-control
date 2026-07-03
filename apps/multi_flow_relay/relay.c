@@ -6,6 +6,7 @@
 #include "stream_config.h"
 
 #include "circular_buffer.h"
+#include "flow_context.h"
 #include "flow_manager.h"
 #include "packet_framer.h"
 #include "pipe_io.h"
@@ -348,6 +349,11 @@ RelayStatus Relay_run(const RelayConfig *config)
             }
         }
 
+        for (i = 0; i < config->flow_count; i++) {
+            uint32_t fid = config->flows[i].flow_id;
+            (void)flow_metrics_tick(&mgr.flows[fid].metrics, 5.0);
+        }
+
         if (!progress) {
             struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000000L };
             nanosleep(&delay, NULL);
@@ -355,6 +361,16 @@ RelayStatus Relay_run(const RelayConfig *config)
     }
 
 cleanup_running:
+    for (i = 0; i < config->flow_count; i++) {
+        uint32_t fid = config->flows[i].flow_id;
+        fprintf(stderr,
+                "flow %u: enq_bps=%.0f deq_bps=%.0f packets=%llu\n",
+                fid,
+                flow_metrics_get_enqueue_bps(&mgr.flows[fid].metrics),
+                flow_metrics_get_dequeue_bps(&mgr.flows[fid].metrics),
+                (unsigned long long)atomic_load(
+                    &mgr.flows[fid].metrics.dequeued_packets));
+    }
     flow_manager_stop(&mgr);
 
 cleanup_mgr:

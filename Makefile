@@ -89,7 +89,7 @@ sanitize: clean test app-test
 
 tsan: CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 tsan: LDFLAGS += -fsanitize=thread
-tsan: clean test
+tsan: clean test app-test-multi
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
