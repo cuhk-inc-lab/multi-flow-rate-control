@@ -1,98 +1,75 @@
 # multi-flow-rate-control
 
-C11 / pthreads multi-flow rate-matched queueing module.
-
-Mixed upstream packets are dispatched into per-flow isolated blocking rings.
-Each flow worker dequeues with timestamp-based pacing and writes via `write()`.
+C11 / pthreads multi-flow rate-matched queueing module with CircularBuffer integration.
 
 ## Architecture
 
 ```
-Producer(s) → MixedQueue → Dispatcher → FlowCircularBuffer[flow_id]
-                                              ↓
-                                        FlowWorker (paced) → write(fd)
+file.ts
+  → CircularBuffer (sending_in)
+  → BlockCodec encode
+  → CircularBuffer (sending_out)
+  → packet_framer → FlowManager (MixedQueue → per-flow queues)
+  → paced worker → pipe
+  → CircularBuffer (receiver_in)
+  → BlockCodec decode
+  → CircularBuffer (receiver_out)
+  → file.ts
 ```
 
-## Project layout
-
-```
-multi-flow-rate-control/
-├── include/
-│   ├── packet.h
-│   ├── time_utils.h
-│   ├── flow_buffer.h
-│   ├── mixed_queue.h
-│   ├── fd_sink.h
-│   ├── flow_context.h
-│   ├── flow_worker.h
-│   ├── dispatcher.h
-│   └── flow_manager.h
-├── src/
-├── tests/run_tests.c
-├── apps/demo/main.c
-├── Makefile
-└── README.md
-```
+Depends on `../buffer-management-module` for `CircularBuffer` only (linked at build time).
 
 ## Build
 
 ```bash
-make          # static library → build/libmulti_flow.a
-make test     # unit + integration tests
-make demo     # demo app → build/multi_flow_demo
-make sanitize # ASan/UBSan test run
+make              # libmulti_flow.a + circular_buffer.o
+make test         # unit + integration tests
+make demo         # synthetic multi-flow demo
+make app          # multi_flow_relay (CircularBuffer + codec + FlowManager)
+make app-test     # byte-exact single-flow roundtrip (pacing off)
+make app-test-multi
+make sanitize     # ASan + app-test
+make tsan         # ThreadSanitizer on unit tests
 make clean
 ```
 
-## Demo
+## multi_flow_relay
 
 ```bash
-make demo
-./build/multi_flow_demo /tmp/mfrc_demo
-cat /tmp/mfrc_demo/flow_0.out
-cat /tmp/mfrc_demo/flow_1.out
+# Single flow (like stream_relay)
+./build/multi_flow_relay --no-pace input.ts output.ts
+cmp input.ts output.ts
+
+# Two flows
+./build/multi_flow_relay --no-pace --multi in0.ts out0.ts in1.ts out1.ts
+
+# With rate pacing enabled (output timing differs; use cmp only with --no-pace)
+./build/multi_flow_relay input.ts output.ts
 ```
 
-Two flows emit 8 packets each with 50 ms producer spacing; workers reproduce
-inter-packet timing from `enqueue_ts`.
+## Library modules
 
-## Library usage (sketch)
+| Module | Role |
+|--------|------|
+| `packet` | DataPacket alloc/free |
+| `flow_buffer` | Per-flow blocking packet ring |
+| `mixed_queue` | Upstream mixed input |
+| `flow_manager` | Dispatcher + workers + lifecycle |
+| `flow_worker` | Spec-style timeline pacing + write |
+| `packet_framer` | CircularBuffer → DataPacket |
+| `pipe_io` | Paced transfer between encode/decode stages |
+| `fd_sink` | write() with partial retry |
 
-```c
-FlowManager mgr;
-FlowManagerConfig cfg = {
-    .max_flows = 4,
-    .per_flow_queue_capacity = 32,
-    .mixed_queue_capacity = 64,
-    .default_output_fd = STDOUT_FILENO,
-    .output_fds = NULL,
-    .encode_scratch_cap = 0,
-};
+## Pacing
 
-flow_manager_init(&mgr, &cfg);
-flow_manager_start(&mgr);
+Uses absolute timeline projection per spec:
 
-DataPacket *pkt = packet_create(flow_id, data, len);
-flow_manager_push(&mgr, &pkt);   /* blocks if mixed queue full */
-
-flow_manager_stop(&mgr);
-flow_manager_destroy(&mgr);
+```
+target_dequeue = stream_start_dequeue + (pkt_ts - stream_start_enqueue)
 ```
 
-## Integration with circular buffer project
+Reset stream anchor after idle dequeue wait.
 
-Upstream stages can keep using `CircularBuffer` (`buffer-management-module`).
-At the boundary, read bytes, frame into `DataPacket`, and call `flow_manager_push()`.
-No payload copy occurs inside this module after packet creation.
+## Metrics
 
-## Design notes
-
-- Queues store `DataPacket*` only.
-- Blocking uses `pthread_cond_wait` inside `while` loops.
-- Timestamps use `CLOCK_MONOTONIC`.
-- Optional `PacketEncodeFn` per flow for future encoder hookup.
-- Shutdown broadcasts condition variables and joins all threads.
-
-## Status
-
-All core modules implemented with tests and demo application.
+Per-flow `_Atomic` byte/packet counters and rolling-window bps (`flow_metrics_tick`).

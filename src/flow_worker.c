@@ -26,6 +26,53 @@ static FlowWorkerStatus emit_packet(FlowContext *ctx, DataPacket *pkt, ssize_t *
     return sink_st == FD_SINK_OK ? FW_OK : FW_ERR_SYSTEM;
 }
 
+static void pace_packet(FlowContext *ctx, const DataPacket *pkt)
+{
+    struct timespec now;
+    struct timespec producer_delta;
+    struct timespec target_dequeue;
+    struct timespec sleep_for;
+
+    if (!ctx->pacing_enabled) {
+        return;
+    }
+
+    if (!ctx->pacing.has_stream_start) {
+        if (time_utils_now_mono(&now) != TU_OK) {
+            return;
+        }
+        ctx->pacing.stream_start_enqueue = pkt->enqueue_ts;
+        ctx->pacing.stream_start_dequeue = now;
+        ctx->pacing.has_stream_start = 1;
+        return;
+    }
+
+    if (time_utils_ts_sub(&pkt->enqueue_ts,
+                          &ctx->pacing.stream_start_enqueue,
+                          &producer_delta) != TU_OK) {
+        return;
+    }
+
+    if (time_utils_ts_add(&ctx->pacing.stream_start_dequeue,
+                          &producer_delta,
+                          &target_dequeue) != TU_OK) {
+        return;
+    }
+
+    if (time_utils_now_mono(&now) != TU_OK) {
+        return;
+    }
+
+    if (!time_utils_ts_before(&now, &target_dequeue)) {
+        return;
+    }
+
+    if (time_utils_ts_sub(&target_dequeue, &now, &sleep_for) == TU_OK) {
+        time_utils_sleep_for(&sleep_for);
+        ctx->metrics.pacing_sleeps++;
+    }
+}
+
 void *flow_worker_thread(void *arg)
 {
     FlowContext *ctx = arg;
@@ -37,10 +84,10 @@ void *flow_worker_thread(void *arg)
     while (1) {
         DataPacket *pkt = NULL;
         FlowBufferStatus st;
-        struct timespec delta;
         ssize_t written = 0;
+        int woke_from_idle = 0;
 
-        st = flow_buffer_dequeue(&ctx->queue, &pkt, NULL);
+        st = flow_buffer_dequeue(&ctx->queue, &pkt, &woke_from_idle);
         if (st == FB_ERR_SHUTDOWN) {
             break;
         }
@@ -48,27 +95,21 @@ void *flow_worker_thread(void *arg)
             continue;
         }
 
-        if (ctx->pacing.has_last_ts) {
-            if (time_utils_ts_sub(&pkt->enqueue_ts,
-                                  &ctx->pacing.last_pkt_ts,
-                                  &delta) == TU_OK) {
-                time_utils_sleep_for(&delta);
-                ctx->metrics.pacing_sleeps++;
-            }
+        if (woke_from_idle) {
+            ctx->pacing.has_stream_start = 0;
         }
+
+        pace_packet(ctx, pkt);
 
         if (emit_packet(ctx, pkt, &written) != FW_OK) {
             packet_free(pkt);
             continue;
         }
 
-        ctx->metrics.dequeued++;
+        flow_metrics_record_dequeue(&ctx->metrics, pkt->payload_len);
         if (written > 0) {
-            ctx->metrics.bytes_written += (uint64_t)written;
+            (void)written;
         }
-
-        ctx->pacing.last_pkt_ts = pkt->enqueue_ts;
-        ctx->pacing.has_last_ts = 1;
 
         packet_free(pkt);
     }

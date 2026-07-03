@@ -1,7 +1,86 @@
 #include "flow_context.h"
 
+#include "time_utils.h"
+
 #include <stdlib.h>
 #include <string.h>
+
+void flow_metrics_record_enqueue(FlowMetrics *metrics, size_t bytes)
+{
+    if (metrics == NULL) {
+        return;
+    }
+
+    atomic_fetch_add_explicit(&metrics->enqueued_packets, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&metrics->enqueued_bytes, bytes, memory_order_relaxed);
+}
+
+void flow_metrics_record_dequeue(FlowMetrics *metrics, size_t bytes)
+{
+    if (metrics == NULL) {
+        return;
+    }
+
+    atomic_fetch_add_explicit(&metrics->dequeued_packets, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&metrics->dequeued_bytes, bytes, memory_order_relaxed);
+}
+
+void flow_metrics_tick(FlowMetrics *metrics, double window_sec)
+{
+    struct timespec now;
+    struct timespec elapsed;
+    double seconds;
+
+    if (metrics == NULL || window_sec <= 0.0) {
+        return;
+    }
+
+    if (time_utils_now_mono(&now) != TU_OK) {
+        return;
+    }
+
+    pthread_mutex_lock(&metrics->bps_mutex);
+
+    if (metrics->bps_window_start.tv_sec == 0 &&
+        metrics->bps_window_start.tv_nsec == 0) {
+        metrics->bps_window_start = now;
+        metrics->bps_window_enq_bytes =
+            atomic_load_explicit(&metrics->enqueued_bytes, memory_order_relaxed);
+        metrics->bps_window_deq_bytes =
+            atomic_load_explicit(&metrics->dequeued_bytes, memory_order_relaxed);
+        pthread_mutex_unlock(&metrics->bps_mutex);
+        return;
+    }
+
+    if (time_utils_ts_sub(&now, &metrics->bps_window_start, &elapsed) != TU_OK) {
+        pthread_mutex_unlock(&metrics->bps_mutex);
+        return;
+    }
+
+    seconds = (double)elapsed.tv_sec + (double)elapsed.tv_nsec / 1e9;
+    if (seconds < window_sec) {
+        pthread_mutex_unlock(&metrics->bps_mutex);
+        return;
+    }
+
+    {
+        uint64_t enq_now =
+            atomic_load_explicit(&metrics->enqueued_bytes, memory_order_relaxed);
+        uint64_t deq_now =
+            atomic_load_explicit(&metrics->dequeued_bytes, memory_order_relaxed);
+
+        metrics->calculated_enqueue_bps =
+            (double)(enq_now - metrics->bps_window_enq_bytes) * 8.0 / seconds;
+        metrics->calculated_dequeue_bps =
+            (double)(deq_now - metrics->bps_window_deq_bytes) * 8.0 / seconds;
+
+        metrics->bps_window_start = now;
+        metrics->bps_window_enq_bytes = enq_now;
+        metrics->bps_window_deq_bytes = deq_now;
+    }
+
+    pthread_mutex_unlock(&metrics->bps_mutex);
+}
 
 FlowContextStatus flow_context_init(FlowContext *ctx,
                                     uint32_t flow_id,
@@ -17,8 +96,14 @@ FlowContextStatus flow_context_init(FlowContext *ctx,
     ctx->flow_id = flow_id;
     ctx->output_fd = output_fd;
     ctx->owner = owner;
+    ctx->pacing_enabled = 1;
+
+    if (pthread_mutex_init(&ctx->metrics.bps_mutex, NULL) != 0) {
+        return FC_ERR_ALLOC;
+    }
 
     if (flow_buffer_init(&ctx->queue, queue_capacity) != FB_OK) {
+        pthread_mutex_destroy(&ctx->metrics.bps_mutex);
         return FC_ERR_ALLOC;
     }
 
@@ -54,6 +139,13 @@ void flow_context_set_encoder(FlowContext *ctx,
     ctx->encode_scratch_cap = scratch_cap;
 }
 
+void flow_context_set_pacing(FlowContext *ctx, int enabled)
+{
+    if (ctx != NULL) {
+        ctx->pacing_enabled = enabled ? 1 : 0;
+    }
+}
+
 void flow_context_destroy(FlowContext *ctx)
 {
     if (ctx == NULL) {
@@ -67,4 +159,5 @@ void flow_context_destroy(FlowContext *ctx)
     ctx->encode_fn = NULL;
     ctx->encode_ctx = NULL;
     ctx->worker_started = 0;
+    pthread_mutex_destroy(&ctx->metrics.bps_mutex);
 }

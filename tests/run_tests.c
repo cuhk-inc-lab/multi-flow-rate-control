@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -364,6 +365,9 @@ static int test_flow_manager_e2e(void)
         return 1;
     }
 
+    flow_context_set_pacing(&mgr.flows[0], 0);
+    flow_context_set_pacing(&mgr.flows[1], 0);
+
     p0 = (MgrProducerCtx){ .mgr = &mgr, .flow_id = 0, .count = 4, .interval_ms = 20, .errors = 0 };
     p1 = (MgrProducerCtx){ .mgr = &mgr, .flow_id = 1, .count = 4, .interval_ms = 20, .errors = 0 };
 
@@ -390,10 +394,10 @@ static int test_flow_manager_e2e(void)
         return 1;
     }
 
-    if (mgr.flows[0].metrics.enqueued != 4 ||
-        mgr.flows[1].metrics.enqueued != 4 ||
-        mgr.flows[0].metrics.dequeued != 4 ||
-        mgr.flows[1].metrics.dequeued != 4) {
+    if (atomic_load(&mgr.flows[0].metrics.enqueued_packets) != 4 ||
+        atomic_load(&mgr.flows[1].metrics.enqueued_packets) != 4 ||
+        atomic_load(&mgr.flows[0].metrics.dequeued_packets) != 4 ||
+        atomic_load(&mgr.flows[1].metrics.dequeued_packets) != 4) {
         flow_manager_destroy(&mgr);
         close(fds[0]);
         close(fds[1]);

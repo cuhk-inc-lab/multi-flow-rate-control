@@ -31,17 +31,19 @@ void *dispatcher_thread(void *arg)
         }
 
         flow = &mgr->flows[flow_id];
-        fb_st = flow_buffer_enqueue(&flow->queue, &pkt);
-        if (fb_st == FB_ERR_SHUTDOWN) {
-            packet_free(pkt);
-            break;
+        {
+            size_t bytes = pkt->payload_len;
+            fb_st = flow_buffer_enqueue(&flow->queue, &pkt);
+            if (fb_st == FB_ERR_SHUTDOWN) {
+                packet_free(pkt);
+                break;
+            }
+            if (fb_st != FB_OK) {
+                packet_free(pkt);
+                continue;
+            }
+            flow_metrics_record_enqueue(&flow->metrics, bytes);
         }
-        if (fb_st != FB_OK) {
-            packet_free(pkt);
-            continue;
-        }
-
-        flow->metrics.enqueued++;
     }
 
     return NULL;

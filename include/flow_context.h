@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <pthread.h>
 
@@ -17,17 +18,24 @@ typedef ssize_t (*PacketEncodeFn)(const DataPacket *in,
                                   void *ctx);
 
 typedef struct FlowMetrics {
-    uint64_t enqueued;
-    uint64_t dequeued;
-    uint64_t blocked_enqueue;
-    uint64_t blocked_dequeue;
-    uint64_t bytes_written;
-    uint64_t pacing_sleeps;
+    _Atomic uint64_t enqueued_packets;
+    _Atomic uint64_t dequeued_packets;
+    _Atomic uint64_t enqueued_bytes;
+    _Atomic uint64_t dequeued_bytes;
+    uint64_t         pacing_sleeps;
+
+    pthread_mutex_t  bps_mutex;
+    double           calculated_enqueue_bps;
+    double           calculated_dequeue_bps;
+    struct timespec  bps_window_start;
+    uint64_t         bps_window_enq_bytes;
+    uint64_t         bps_window_deq_bytes;
 } FlowMetrics;
 
 typedef struct FlowPacingState {
-    struct timespec last_pkt_ts;
-    int             has_last_ts;
+    struct timespec stream_start_enqueue;
+    struct timespec stream_start_dequeue;
+    int             has_stream_start;
 } FlowPacingState;
 
 typedef enum {
@@ -42,6 +50,7 @@ typedef struct FlowContext {
     FlowMetrics         metrics;
     FlowPacingState     pacing;
     int                 output_fd;
+    int                 pacing_enabled;
 
     PacketEncodeFn      encode_fn;
     void               *encode_ctx;
@@ -64,6 +73,12 @@ void flow_context_set_encoder(FlowContext *ctx,
                               void *encode_ctx,
                               size_t scratch_cap);
 
+void flow_context_set_pacing(FlowContext *ctx, int enabled);
+
 void flow_context_destroy(FlowContext *ctx);
+
+void flow_metrics_record_enqueue(FlowMetrics *metrics, size_t bytes);
+void flow_metrics_record_dequeue(FlowMetrics *metrics, size_t bytes);
+void flow_metrics_tick(FlowMetrics *metrics, double window_sec);
 
 #endif /* FLOW_CONTEXT_H */

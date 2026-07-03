@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,11 +148,12 @@ int main(int argc, char **argv)
 
     printf("Demo complete. Output directory: %s\n", out_dir);
     for (i = 0; i < FLOWS; i++) {
-        printf("  flow %u: enqueued=%llu dequeued=%llu bytes=%llu sleeps=%llu\n",
+        printf("  flow %u: enqueued=%llu dequeued=%llu enq_bytes=%llu deq_bytes=%llu sleeps=%llu\n",
                i,
-               (unsigned long long)mgr.flows[i].metrics.enqueued,
-               (unsigned long long)mgr.flows[i].metrics.dequeued,
-               (unsigned long long)mgr.flows[i].metrics.bytes_written,
+               (unsigned long long)atomic_load(&mgr.flows[i].metrics.enqueued_packets),
+               (unsigned long long)atomic_load(&mgr.flows[i].metrics.dequeued_packets),
+               (unsigned long long)atomic_load(&mgr.flows[i].metrics.enqueued_bytes),
+               (unsigned long long)atomic_load(&mgr.flows[i].metrics.dequeued_bytes),
                (unsigned long long)mgr.flows[i].metrics.pacing_sleeps);
         close(fds[i]);
     }
