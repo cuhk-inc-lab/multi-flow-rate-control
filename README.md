@@ -82,6 +82,9 @@ make tsan         # ThreadSanitizer on unit tests + app-test-multi
 make clean
 ```
 
+See **[tests/TESTING.md](tests/TESTING.md)** for a full description of every test
+target and what each `test_*` function checks.
+
 ## Library modules
 
 | Module | Role |
@@ -108,6 +111,7 @@ Reset stream anchor after idle dequeue wait.
 ## Metrics
 
 Per-flow `_Atomic` byte/packet counters and rolling-window bps (`flow_metrics_tick`).
-`spec_pipeline`, `relay`, and `demo` sample metrics during execution. Unit tests
-include `test_rate_match_5s` (±1% dequeue vs enqueue bps over 5s) and
-`test_pacing_timeline`.
+`spec_pipeline`, `relay`, and `demo` sample metrics during execution.
+
+For test coverage (including `test_rate_match_5s` and `test_pacing_timeline`), see
+[tests/TESTING.md](tests/TESTING.md).
