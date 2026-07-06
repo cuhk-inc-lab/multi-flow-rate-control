@@ -1,20 +1,32 @@
 # spec_pipeline
 
-**Spec-compliant** reference application for the Rate-Matched Queueing Module.
+Reference app for the **Technical Specification module boundary**.
 
-## Pipeline (matches Technical Specification)
+## What is in the spec vs what is test-only
+
+| Layer | In spec? | In this app |
+|-------|----------|-------------|
+| `CircularBuffer` ← upstream bytes | yes | fed by `FileIngest` reading `input.ts` |
+| `packet_framer` → `FlowManager` → paced `write()` | yes | core path |
+| `output_fd` (any fd) | yes | opened as `output.ts` for `cmp` tests |
+| `FileIngest` / paths on disk | no | convenience for local verification |
+
+## Module flow (spec)
 
 ```
-file.ts
-  → FileIngest
-  → CircularBuffer (byte ring from buffer-management-module)
-  → packet_framer (188B transport packets → DataPacket)
-  → FlowManager (MixedQueue → per-flow queues → paced workers)
-  → write(output.ts)          # direct fd write, no pipe / decode
+[upstream] → CircularBuffer → packet_framer → FlowManager → write(output_fd) → [downstream]
 ```
 
-This is the canonical module boundary. It does **not** include encode/decode or
-pipe roundtrip logic (see `../multi_flow_relay` for integration testing).
+## How this app wires it (test harness)
+
+```
+input.ts  ──FileIngest──►  CircularBuffer  ──►  framer  ──►  FlowManager  ──►  write(fd)
+                                                                              │
+output.ts  ◄──────────────────────── open as output fd ─────────────────────┘
+```
+
+`input.ts` / `output.ts` are **not** part of the module. They only simulate
+“something fills the ring buffer” and “something receives `write()` output”.
 
 ## Build & run
 
@@ -24,11 +36,13 @@ make spec
 cmp input.ts output.ts
 ```
 
-Multi-flow:
+Multi-flow (one input/output pair per `flow_id`):
 
 ```bash
 ./build/spec_pipeline --no-pace --multi in0.ts out0.ts in1.ts out1.ts
 ```
 
-Files with a trailing partial packet (&lt; 188 bytes) bypass FlowManager and are
-written directly to the output fd after the paced path drains.
+Trailing bytes shorter than 188B bypass FlowManager and are written directly to
+the output fd after the paced path drains (keeps `cmp` byte-exact).
+
+For encode/decode integration, see `../multi_flow_relay`.

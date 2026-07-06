@@ -1,10 +1,10 @@
 /*
  * Spec-compliant pipeline (Plan A):
  *
- *   file -> CircularBuffer -> packet_framer -> FlowManager -> write(output fd)
+ *   [upstream] -> CircularBuffer -> packet_framer -> FlowManager -> write(fd)
  *
- * No encode/decode, no pipe loop. Matches the Technical Specification module
- * boundary when integrated with buffer-management-module CircularBuffer.
+ * FileIngest / output file paths are test harness only (not part of the spec
+ * module). See apps/spec_pipeline/README.md.
  *
  * Usage:
  *   ./build/spec_pipeline [--no-pace] <input.ts> <output.ts>
