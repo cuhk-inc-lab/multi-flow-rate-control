@@ -162,6 +162,19 @@ static int flow_queues_drained(const FlowManager *mgr, uint32_t flow_id)
            flow_buffer_is_empty(&mgr->flows[flow_id].queue);
 }
 
+static int ring_only_tail_remaining(const SpecStage *stage)
+{
+    if (stage == NULL || stage->ring == NULL || Buffer_IsEmpty(stage->ring)) {
+        return 1;
+    }
+
+    if (!stage->ingest_done) {
+        return 0;
+    }
+
+    return (size_t)stage->ring->size < PKG_SIZE;
+}
+
 static int stage_quiescent(const SpecStage *stage, const FlowManager *mgr,
                            uint64_t expected_packets)
 {
@@ -179,7 +192,8 @@ static int stage_quiescent(const SpecStage *stage, const FlowManager *mgr,
         return 0;
     }
 
-    return Buffer_IsEmpty(stage->ring) && flow_queues_drained(mgr, stage->flow_id);
+    return ring_only_tail_remaining(stage) &&
+           flow_queues_drained(mgr, stage->flow_id);
 }
 
 static int flush_ring_tail(SpecStage *stage)

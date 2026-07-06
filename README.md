@@ -72,6 +72,7 @@ make              # libmulti_flow.a + circular_buffer.o
 make test         # unit + integration tests
 make spec         # spec_pipeline (spec-aligned app)
 make spec-test    # byte-exact spec pipeline (pacing off)
+make complex-test # multi-flow, tails, large files, paced smoke
 make demo         # synthetic multi-flow demo (memory producers, no files)
 make app          # multi_flow_relay integration harness
 make app-test     # byte-exact relay roundtrip (pacing off)

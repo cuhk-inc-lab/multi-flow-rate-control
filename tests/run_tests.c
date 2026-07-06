@@ -904,6 +904,152 @@ static int test_dispatcher_avoids_hol(void)
     return 0;
 }
 
+/* ---- complex multi-flow: uneven rates, sizes, concurrent producers ---- */
+
+typedef struct {
+    FlowManager *mgr;
+    uint32_t     flow_id;
+    int          count;
+    int          interval_ms;
+    size_t       payload_len;
+    int          errors;
+} ComplexProducerCtx;
+
+static void *complex_producer_thread(void *arg)
+{
+    ComplexProducerCtx *ctx = arg;
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 0 };
+    unsigned char *payload;
+
+    delay.tv_nsec = (long)ctx->interval_ms * 1000000L;
+    payload = malloc(ctx->payload_len);
+    if (payload == NULL) {
+        ctx->errors++;
+        return NULL;
+    }
+
+    memset(payload, (int)('a' + (char)ctx->flow_id), ctx->payload_len);
+
+    for (int i = 0; i < ctx->count; i++) {
+        DataPacket *pkt = packet_create(ctx->flow_id, payload, ctx->payload_len);
+
+        if (pkt == NULL) {
+            ctx->errors++;
+            free(payload);
+            return NULL;
+        }
+
+        if (flow_manager_push(ctx->mgr, &pkt) != FM_OK) {
+            packet_free(pkt);
+            ctx->errors++;
+            free(payload);
+            return NULL;
+        }
+
+        if (i + 1 < ctx->count && delay.tv_nsec > 0) {
+            time_utils_sleep_for(&delay);
+        }
+    }
+
+    free(payload);
+    return NULL;
+}
+
+static int test_complex_multi_flow(void)
+{
+    FlowManager mgr;
+    FlowManagerConfig cfg = {
+        .max_flows = 2,
+        .per_flow_queue_capacity = 16,
+        .mixed_queue_capacity = 64,
+        .default_output_fd = -1,
+        .output_fds = NULL,
+        .encode_scratch_cap = 0
+    };
+    int null_fd = open("/dev/null", O_WRONLY);
+    int fds[2];
+    pthread_t t0;
+    pthread_t t1;
+    ComplexProducerCtx p0;
+    ComplexProducerCtx p1;
+    const int count0 = 40;
+    const int count1 = 28;
+
+    if (null_fd < 0) {
+        return 1;
+    }
+
+    fds[0] = null_fd;
+    fds[1] = null_fd;
+    cfg.output_fds = fds;
+
+    if (flow_manager_init(&mgr, &cfg) != FM_OK) {
+        close(null_fd);
+        return 1;
+    }
+
+    flow_context_set_pacing(&mgr.flows[0], 1);
+    flow_context_set_pacing(&mgr.flows[1], 1);
+
+    if (flow_manager_start(&mgr) != FM_OK) {
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
+
+    p0 = (ComplexProducerCtx){
+        .mgr = &mgr, .flow_id = 0, .count = count0,
+        .interval_ms = 25, .payload_len = 96, .errors = 0
+    };
+    p1 = (ComplexProducerCtx){
+        .mgr = &mgr, .flow_id = 1, .count = count1,
+        .interval_ms = 40, .payload_len = 160, .errors = 0
+    };
+
+    if (pthread_create(&t0, NULL, complex_producer_thread, &p0) != 0 ||
+        pthread_create(&t1, NULL, complex_producer_thread, &p1) != 0) {
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
+
+    pthread_join(t0, NULL);
+    pthread_join(t1, NULL);
+
+    {
+        uint64_t enq0 = atomic_load(&mgr.flows[0].metrics.enqueued_packets);
+        uint64_t deq0 = atomic_load(&mgr.flows[0].metrics.dequeued_packets);
+        uint64_t enq1 = atomic_load(&mgr.flows[1].metrics.enqueued_packets);
+        uint64_t deq1 = atomic_load(&mgr.flows[1].metrics.dequeued_packets);
+        uint64_t enq_bytes0 = atomic_load(&mgr.flows[0].metrics.enqueued_bytes);
+        uint64_t deq_bytes0 = atomic_load(&mgr.flows[0].metrics.dequeued_bytes);
+        uint64_t enq_bytes1 = atomic_load(&mgr.flows[1].metrics.enqueued_bytes);
+        uint64_t deq_bytes1 = atomic_load(&mgr.flows[1].metrics.dequeued_bytes);
+
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+
+        if (p0.errors != 0 || p1.errors != 0) {
+            return 1;
+        }
+        if (enq0 != (uint64_t)count0 || deq0 != (uint64_t)count0 ||
+            enq1 != (uint64_t)count1 || deq1 != (uint64_t)count1) {
+            return 1;
+        }
+        if (enq_bytes0 != deq_bytes0 || enq_bytes1 != deq_bytes1) {
+            return 1;
+        }
+        if (enq_bytes0 != (uint64_t)count0 * 96u ||
+            enq_bytes1 != (uint64_t)count1 * 160u) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_packet_create_free() != 0) {
@@ -948,6 +1094,10 @@ int main(void)
     }
     if (test_dispatcher_avoids_hol() != 0) {
         fprintf(stderr, "test_dispatcher_avoids_hol failed\n");
+        return 1;
+    }
+    if (test_complex_multi_flow() != 0) {
+        fprintf(stderr, "test_complex_multi_flow failed\n");
         return 1;
     }
 

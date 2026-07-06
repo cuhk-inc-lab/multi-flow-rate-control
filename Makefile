@@ -62,7 +62,18 @@ APP_TEST_OUTPUT2 = $(OBJ_DIR)/app_test_output1.ts
 SPEC_TEST_INPUT  = $(OBJ_DIR)/spec_test_input.ts
 SPEC_TEST_OUTPUT = $(OBJ_DIR)/spec_test_output.ts
 
-.PHONY: all test check demo app spec app-test app-test-multi spec-test sanitize tsan clean
+CX_SPEC_IN0  = $(OBJ_DIR)/cx_spec_in0.ts
+CX_SPEC_OUT0 = $(OBJ_DIR)/cx_spec_out0.ts
+CX_SPEC_IN1  = $(OBJ_DIR)/cx_spec_in1.ts
+CX_SPEC_OUT1 = $(OBJ_DIR)/cx_spec_out1.ts
+CX_SPEC_LARGE_IN  = $(OBJ_DIR)/cx_spec_large_in.ts
+CX_SPEC_LARGE_OUT = $(OBJ_DIR)/cx_spec_large_out.ts
+CX_RELAY_IN0  = $(OBJ_DIR)/cx_relay_in0.ts
+CX_RELAY_OUT0 = $(OBJ_DIR)/cx_relay_out0.ts
+CX_RELAY_IN1  = $(OBJ_DIR)/cx_relay_in1.ts
+CX_RELAY_OUT1 = $(OBJ_DIR)/cx_relay_out1.ts
+
+.PHONY: all test check demo app spec app-test app-test-multi spec-test complex-test sanitize tsan clean
 
 all: $(LIB)
 
@@ -93,6 +104,34 @@ spec-test: $(SPEC_BIN)
 	dd if=/dev/urandom of=$(SPEC_TEST_INPUT) bs=188 count=20 status=none
 	./$(SPEC_BIN) --no-pace $(SPEC_TEST_INPUT) $(SPEC_TEST_OUTPUT)
 	cmp $(SPEC_TEST_INPUT) $(SPEC_TEST_OUTPUT)
+
+complex-test: $(SPEC_BIN) $(RELAY_BIN) $(TEST_BIN)
+	./$(TEST_BIN)
+	@echo "== spec multi-flow: 50 pkts + 30 pkts with 127B tail =="
+	dd if=/dev/urandom of=$(CX_SPEC_IN0) bs=188 count=50 status=none
+	dd if=/dev/urandom of=$(CX_SPEC_IN1) bs=188 count=30 status=none
+	dd if=/dev/urandom bs=1 count=127 status=none >> $(CX_SPEC_IN1)
+	./$(SPEC_BIN) --no-pace --multi $(CX_SPEC_IN0) $(CX_SPEC_OUT0) \
+		$(CX_SPEC_IN1) $(CX_SPEC_OUT1)
+	cmp $(CX_SPEC_IN0) $(CX_SPEC_OUT0)
+	cmp $(CX_SPEC_IN1) $(CX_SPEC_OUT1)
+	@echo "== spec large single-flow: 200 transport packets =="
+	dd if=/dev/urandom of=$(CX_SPEC_LARGE_IN) bs=188 count=200 status=none
+	./$(SPEC_BIN) --no-pace $(CX_SPEC_LARGE_IN) $(CX_SPEC_LARGE_OUT)
+	cmp $(CX_SPEC_LARGE_IN) $(CX_SPEC_LARGE_OUT)
+	@echo "== spec paced smoke: 30 pkts, pacing on =="
+	dd if=/dev/urandom of=$(CX_SPEC_LARGE_IN) bs=188 count=30 status=none
+	./$(SPEC_BIN) $(CX_SPEC_LARGE_IN) $(CX_SPEC_LARGE_OUT)
+	@test $$(wc -c < $(CX_SPEC_LARGE_IN)) -eq $$(wc -c < $(CX_SPEC_LARGE_OUT))
+	@echo "== relay multi-flow: uneven encode blocks + tail =="
+	dd if=/dev/urandom of=$(CX_RELAY_IN0) bs=752 count=8 status=none
+	dd if=/dev/urandom of=$(CX_RELAY_IN1) bs=752 count=3 status=none
+	dd if=/dev/urandom bs=1 count=400 status=none >> $(CX_RELAY_IN1)
+	./$(RELAY_BIN) --no-pace --multi $(CX_RELAY_IN0) $(CX_RELAY_OUT0) \
+		$(CX_RELAY_IN1) $(CX_RELAY_OUT1)
+	cmp $(CX_RELAY_IN0) $(CX_RELAY_OUT0)
+	cmp $(CX_RELAY_IN1) $(CX_RELAY_OUT1)
+	@echo "complex data-flow tests passed"
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
