@@ -33,5 +33,6 @@ app-test:
   extends: .test_setup
   stage: test
   script:
+    - make spec-test
     - make app-test
     - make app-test-multi

@@ -10,6 +10,7 @@ SRC_DIR  = src
 TEST_DIR = tests
 DEMO_DIR = apps/demo
 RELAY_DIR = apps/multi_flow_relay
+SPEC_DIR = apps/spec_pipeline
 OBJ_DIR  = build
 
 CFLAGS += -I$(CB_INC)
@@ -34,6 +35,7 @@ LIB      = $(OBJ_DIR)/libmulti_flow.a
 TEST_BIN = $(OBJ_DIR)/run_tests
 DEMO_BIN = $(OBJ_DIR)/multi_flow_demo
 RELAY_BIN = $(OBJ_DIR)/multi_flow_relay
+SPEC_BIN = $(OBJ_DIR)/spec_pipeline
 
 RELAY_SRCS = \
 	$(RELAY_DIR)/main.c \
@@ -57,14 +59,18 @@ APP_TEST_INPUT1 = $(OBJ_DIR)/app_test_input0.ts
 APP_TEST_INPUT2 = $(OBJ_DIR)/app_test_input1.ts
 APP_TEST_OUTPUT1 = $(OBJ_DIR)/app_test_output0.ts
 APP_TEST_OUTPUT2 = $(OBJ_DIR)/app_test_output1.ts
+SPEC_TEST_INPUT  = $(OBJ_DIR)/spec_test_input.ts
+SPEC_TEST_OUTPUT = $(OBJ_DIR)/spec_test_output.ts
 
-.PHONY: all test check demo app app-test sanitize tsan clean
+.PHONY: all test check demo app spec app-test app-test-multi spec-test sanitize tsan clean
 
 all: $(LIB)
 
 demo: $(DEMO_BIN)
 
 app: $(RELAY_BIN)
+
+spec: $(SPEC_BIN)
 
 test check: $(TEST_BIN)
 	./$(TEST_BIN)
@@ -83,9 +89,14 @@ app-test-multi: $(RELAY_BIN)
 	cmp $(APP_TEST_INPUT1) $(APP_TEST_OUTPUT1)
 	cmp $(APP_TEST_INPUT2) $(APP_TEST_OUTPUT2)
 
+spec-test: $(SPEC_BIN)
+	dd if=/dev/urandom of=$(SPEC_TEST_INPUT) bs=188 count=20 status=none
+	./$(SPEC_BIN) --no-pace $(SPEC_TEST_INPUT) $(SPEC_TEST_OUTPUT)
+	cmp $(SPEC_TEST_INPUT) $(SPEC_TEST_OUTPUT)
+
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
-sanitize: clean test app-test
+sanitize: clean test spec-test app-test
 
 tsan: CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 tsan: LDFLAGS += -fsanitize=thread
@@ -114,6 +125,12 @@ $(OBJ_DIR)/relay_%.o: $(RELAY_DIR)/%.c | $(OBJ_DIR)
 
 $(RELAY_BIN): $(RELAY_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(RELAY_DIR) $(RELAY_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+$(OBJ_DIR)/spec_main.o: $(SPEC_DIR)/main.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -c $< -o $@
+
+$(SPEC_BIN): $(OBJ_DIR)/spec_main.o $(OBJ_DIR)/relay_file_ingest.o $(LIB_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) $(OBJ_DIR)/spec_main.o $(OBJ_DIR)/relay_file_ingest.o $(LIB_OBJS) -o $@ $(LDFLAGS)
 
 clean:
 	rm -rf $(OBJ_DIR)

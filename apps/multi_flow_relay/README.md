@@ -1,23 +1,25 @@
 # multi_flow_relay
 
-Application test: integrates `CircularBuffer` (buffer-management-module) with
-the multi-flow rate-matched queue in the middle of an encode/decode pipeline.
+**Integration harness** (not the spec-canonical pipeline).
 
-## Per-flow pipeline
+Exercises the full buffer-management-module stack: file ingest, encode,
+FlowManager rate matching, pipe transfer, decode, and file drain.
+
+## Pipeline
 
 ```
-input.ts
-  → sending_in (CircularBuffer)
-  → encode (752 → 1504)
-  → sending_out
-  → packet_framer → FlowManager → paced pipe
-  → receiver_in
-  → decode (1504 → 752)
-  → receiver_out
-  → output.ts
+file.ts
+  → CircularBuffer (sending_in)
+  → BlockCodec encode (4×188 → 8×188)
+  → CircularBuffer (sending_out)
+  → packet_framer → FlowManager
+  → paced worker → pipe
+  → decode → CircularBuffer → file.ts
 ```
 
-## Usage
+For the Technical Specification module flow, use `../spec_pipeline` instead.
+
+## Build & run
 
 ```bash
 make app
@@ -25,10 +27,4 @@ make app
 cmp input.ts output.ts
 ```
 
-Use `--no-pace` for byte-exact verification. Omit it to exercise rate matching.
-
-## Multi-flow
-
-```bash
-./build/multi_flow_relay --no-pace --multi in0.ts out0.ts in1.ts out1.ts
-```
+See project root `README.md` for `make app-test` / `make app-test-multi`.
