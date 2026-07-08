@@ -17,6 +17,12 @@ unit-test:
   script:
     - make test
 
+integration-test:
+  extends: .test_setup
+  stage: test
+  script:
+    - make integration-test
+
 asan:
   extends: .test_setup
   stage: test
@@ -28,11 +34,3 @@ tsan:
   stage: test
   script:
     - make tsan
-
-app-test:
-  extends: .test_setup
-  stage: test
-  script:
-    - make spec-test
-    - make app-test
-    - make app-test-multi

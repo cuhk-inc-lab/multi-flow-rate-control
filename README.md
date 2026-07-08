@@ -38,47 +38,40 @@ input.ts          ─┐  test harness (FileIngest)
 output.ts         ─┘  test harness (open output file as fd) ◄──────┘
 ```
 
-```bash
-make spec
-make spec-test
-./build/spec_pipeline --no-pace input.ts output.ts
-cmp input.ts output.ts
-```
+Build with `make spec`. See `apps/spec_pipeline/README.md`.
 
-In production, replace `FileIngest` with your upstream writer to `CircularBuffer`,
-and point `output_fd` at socket/pipe/`STDOUT_FILENO` instead of a file.
+### wg-obfs integration path (`wg_multi_pipeline`) — **multi before encode**
 
-### Integration harness (`multi_flow_relay`)
-
-Full stack test with encode/decode and a pipe roundtrip. **Outside** the spec
-module boundary; validates `buffer-management-module` codecs.
+Ingress (`ingress_push` / future UDP peer map) → FlowManager → per-flow encode →
+buffer transfer → decode → separate output files. Files mock wg-obfs with a fixed
+`flow_id` per input path.
 
 ```
-input.ts ──► CircularBuffer ──► encode ──► packet_framer ──► FlowManager
-         ──► paced pipe ──► decode ──► CircularBuffer ──► output.ts
-         (files are test I/O only; same as above)
+ingress (flow_id) ──► FlowManager (split + pacing) ──► raw bytes
+                 ──► encode ──► transfer ──► decode ──► output.ts
 ```
 
 ```bash
-make app
-make app-test
-make app-test-multi
+make wg-demo
+make integration-test
+./build/wg_multi_pipeline --no-pace --multi in0.ts out0.ts in1.ts out1.ts in2.ts out2.ts
 ```
 
-## Build
+Future UDP hook: `ingress_push_peer(mgr, map, src_addr, ...)` — see
+`include/ingress_push.h` and `include/flow_peer_map.h`. No wg-obfs code changes required.
+
+## Build & test
 
 ```bash
-make              # libmulti_flow.a + circular_buffer.o
-make test         # unit + integration tests
-make spec         # spec_pipeline (spec-aligned app)
-make spec-test    # byte-exact spec pipeline (pacing off)
-make complex-test # multi-flow, tails, large files, paced smoke
-make demo         # synthetic multi-flow demo (memory producers, no files)
-make app          # multi_flow_relay integration harness
-make app-test     # byte-exact relay roundtrip (pacing off)
-make app-test-multi
-make sanitize     # ASan + test + spec-test + app-test
-make tsan         # ThreadSanitizer on unit tests + app-test-multi
+make                  # libmulti_flow.a
+make test             # unit tests (run_tests.c)
+make integration-test # multi-file wg_multi_pipeline (3 flows, cmp)
+make wg-demo          # build wg_multi_pipeline
+make spec             # spec_pipeline (optional reference app)
+make app              # multi_flow_relay (legacy, optional)
+make demo             # in-memory demo (manual)
+make sanitize         # ASan + test + integration-test
+make tsan             # TSan + test + integration-test
 make clean
 ```
 
@@ -97,6 +90,8 @@ target and what each `test_*` function checks.
 | `packet_framer` | CircularBuffer → DataPacket |
 | `pipe_io` | Used by integration harness only |
 | `fd_sink` | write() with partial retry |
+| `flow_peer_map` | UDP src_addr → flow_id (wg-obfs ingress) |
+| `ingress_push` | Upstream bytes → `flow_manager_push` |
 
 ## Pacing
 

@@ -1,14 +1,19 @@
 #include "flow_manager.h"
+#include "flow_peer_map.h"
+#include "ingress_push.h"
 #include "packet.h"
 #include "time_utils.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <math.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1050,6 +1055,52 @@ static int test_complex_multi_flow(void)
     return 0;
 }
 
+/* ---- ingress / peer map ---- */
+
+static int test_flow_peer_map(void)
+{
+    FlowPeerMap       *map = NULL;
+    struct sockaddr_in a;
+    struct sockaddr_in b;
+    uint32_t           f0;
+    uint32_t           f1;
+
+    if (flow_peer_map_init(&map, 4) != FPM_OK) {
+        return 1;
+    }
+
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(4000);
+    if (inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) != 1) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    memset(&b, 0, sizeof(b));
+    b.sin_family = AF_INET;
+    b.sin_port = htons(4001);
+    if (inet_pton(AF_INET, "127.0.0.1", &b.sin_addr) != 1) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    f0 = flow_peer_map_lookup(map, (struct sockaddr *)&a, sizeof(a));
+    f1 = flow_peer_map_lookup(map, (struct sockaddr *)&b, sizeof(b));
+    if (f0 != 0 || f1 != 1) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    if (flow_peer_map_lookup(map, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    flow_peer_map_destroy(map);
+    return 0;
+}
+
 int main(void)
 {
     if (test_packet_create_free() != 0) {
@@ -1098,6 +1149,10 @@ int main(void)
     }
     if (test_complex_multi_flow() != 0) {
         fprintf(stderr, "test_complex_multi_flow failed\n");
+        return 1;
+    }
+    if (test_flow_peer_map() != 0) {
+        fprintf(stderr, "test_flow_peer_map failed\n");
         return 1;
     }
 

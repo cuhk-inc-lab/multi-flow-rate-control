@@ -1,6 +1,8 @@
 # multi_flow_relay
 
-**Integration harness** (not the spec-canonical pipeline).
+**Legacy integration harness** (encode **before** FlowManager).
+
+For the wg-obfs / multi-before-encode path, use `../wg_multi_pipeline` instead.
 
 Exercises the full buffer-management-module stack: file ingest, encode,
 FlowManager rate matching, pipe transfer, decode, and file drain.
