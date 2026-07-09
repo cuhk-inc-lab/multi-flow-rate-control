@@ -2,9 +2,6 @@
 
 **Multi before encode:** ingress → FlowManager → per-flow encode → transfer → decode.
 
-This is the canonical wg-obfs integration path: rate control and per-flow splitting
-happen **before** block encode. Legacy `multi_flow_relay` keeps encode-before-FM order.
-
 ## Build
 
 ```bash

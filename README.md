@@ -38,60 +38,31 @@ build fails with errors such as `circular_buffer.h: No such file or directory`.
 
 To use a different path, change `CB_DIR` in the `Makefile`.
 
-## Spec module boundary
+## Module boundary
 
-The Technical Specification defines this **module** (not files on disk):
+Core library path:
 
 ```
-[upstream producer]
-  → CircularBuffer (byte ring)
-  → packet_framer (bytes → DataPacket + enqueue_ts)
+ingress_push / ingress_push_tuple
   → FlowManager (MixedQueue → per-flow queues)
-  → paced worker → write(output_fd)    # stdout, socket, pipe, or file fd
-  → [downstream consumer]
+  → paced worker → write(output_fd)
 ```
 
-- **Ingress:** bytes already in (or being written to) `CircularBuffer` by another
-  thread or component.
-- **Egress:** `write()` to any open file descriptor; a path like `output.ts` is
-  only one way to hold that fd in tests.
-- **Not in the module:** reading `input.ts` from disk, encode/decode, or pipe
-  roundtrips (those live in demo apps below).
+Encode / decode / file harness live in `apps/wg_multi_pipeline/` (demo app).
 
-## Two reference applications
+## Application — `wg_multi_pipeline`
 
-### Spec-aligned demo (`spec_pipeline`)
-
-Uses **files only as a test harness** to feed the ring buffer and capture output:
-
-```
-input.ts          ─┐  test harness (FileIngest)
-                   ▼
-              CircularBuffer ──► packet_framer ──► FlowManager ──► write(fd)
-                   ▲                                              │
-output.ts         ─┘  test harness (open output file as fd) ◄──────┘
-```
-
-Build with `make spec`. See `apps/spec_pipeline/README.md`.
-
-### wg-obfs integration path (`wg_multi_pipeline`) — **multi before encode**
-
-Ingress (`ingress_push` / `ingress_push_tuple`) → FlowManager → per-flow encode →
-buffer transfer → decode → separate output files.
+Ingress → FlowManager → per-flow encode → buffer transfer → decode → output.
 
 ```
 ingress ──► FlowManager (split + pacing) ──► raw bytes
        ──► encode ──► transfer ──► decode ──► output file
 ```
 
-**File demo:** each input path is assigned a fixed internal `flow_id` (0, 1, 2, …).
-**UDP (library):** route by full 5-tuple `(src, dst, protocol)` via `flow_peer_map`;
-`flow_id` is only the compact slot index inside FlowManager — not a second grouping
-rule. See `apps/wg_multi_pipeline/README.md`.
+**Multi-file:** fixed `flow_id` per input path (`ingress_push`).  
+**UDP:** full 5-tuple routing (`ingress_push_tuple`). See `apps/wg_multi_pipeline/README.md`.
 
-#### Quick test with your own files
-
-Extension does not matter — inputs are raw bytes.
+### Quick test
 
 ```bash
 make wg-demo
@@ -100,34 +71,26 @@ make wg-demo
 cmp a.txt out_a.txt && cmp b.bin out_b.bin && cmp c.ts out_c.ts
 ```
 
+```bash
+./build/wg_multi_pipeline --no-pace --udp 5000 /tmp/out_ --idle-sec 3
+```
+
 Automated 3-flow roundtrip: `make integration-test`.
 
-UDP demo: `./build/wg_multi_pipeline --no-pace --udp 5000 /tmp/out_` (see
-[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)).
-
-UDP 5-tuple mapping (library only, no UDP recv in the demo yet): `make test`
-(`test_flow_peer_map`). Full testing guide: **[tests/TESTING.md](tests/TESTING.md)**.
-wg-obfs handoff points: **[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)**.
+wg-obfs handoff: **[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)**.  
+Testing: **[tests/TESTING.md](tests/TESTING.md)**.
 
 ## Build & test
-
-From `multi-flow-rate-control/` (with `../buffer-management-module` present):
 
 ```bash
 make                  # libmulti_flow.a
 make test             # unit tests (run_tests.c)
 make integration-test # multi-file wg_multi_pipeline (3 flows, cmp)
 make wg-demo          # build wg_multi_pipeline
-make spec             # spec_pipeline (optional reference app)
-make app              # multi_flow_relay (legacy, optional)
-make demo             # in-memory demo (manual)
 make sanitize         # ASan + test + integration-test
 make tsan             # TSan + test + integration-test
 make clean
 ```
-
-See **[tests/TESTING.md](tests/TESTING.md)** for a full description of every test
-target and what each `test_*` function checks.
 
 ## Library modules
 
@@ -137,27 +100,16 @@ target and what each `test_*` function checks.
 | `flow_buffer` | Per-flow blocking packet ring |
 | `mixed_queue` | Upstream mixed input |
 | `flow_manager` | Dispatcher + workers + lifecycle |
-| `flow_worker` | Spec-style timeline pacing + write |
-| `packet_framer` | CircularBuffer → DataPacket |
-| `pipe_io` | Used by integration harness only |
+| `flow_worker` | Timeline pacing + write |
+| `pipe_io` | Pipe I/O and drain-to-buffer glue |
 | `fd_sink` | write() with partial retry |
-| `flow_peer_map` | UDP 5-tuple → internal flow slot (wg-obfs ingress) |
+| `flow_peer_map` | UDP 5-tuple → internal flow slot |
 | `ingress_push` | Upstream bytes → `flow_manager_push` |
 
 ## Pacing
-
-Uses absolute timeline projection per spec:
 
 ```
 target_dequeue = stream_start_dequeue + (pkt_ts - stream_start_enqueue)
 ```
 
 Reset stream anchor after idle dequeue wait.
-
-## Metrics
-
-Per-flow `_Atomic` byte/packet counters and rolling-window bps (`flow_metrics_tick`).
-`spec_pipeline`, `relay`, and `demo` sample metrics during execution.
-
-For test coverage (including `test_rate_match_5s` and `test_pacing_timeline`), see
-[tests/TESTING.md](tests/TESTING.md).
