@@ -79,6 +79,8 @@ ingress_push_tuple(mgr, peer_map, &tuple, payload, len);
 There is no UDP `recvfrom` loop in this app yet; wire the calls above in wg-obfs or
 a small glue process when moving off file mocks.
 
+Integration handoff details: [docs/INTEGRATION_BOUNDARIES.md](../../docs/INTEGRATION_BOUNDARIES.md).
+
 ## Pipeline diagram
 
 ```

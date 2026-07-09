@@ -104,6 +104,7 @@ Automated 3-flow roundtrip: `make integration-test`.
 
 UDP 5-tuple mapping (library only, no UDP recv in the demo yet): `make test`
 (`test_flow_peer_map`). Full testing guide: **[tests/TESTING.md](tests/TESTING.md)**.
+wg-obfs handoff points: **[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)**.
 
 ## Build & test
 
