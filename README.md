@@ -2,7 +2,41 @@
 
 C11 / pthreads multi-flow rate-matched queueing module with CircularBuffer integration.
 
-Depends on `../buffer-management-module` for `CircularBuffer` only (linked at build time).
+## Prerequisites — `buffer-management-module`
+
+This repo **does not vendor** `CircularBuffer`. You must clone
+[buffer-management-module](https://gitlab.hk/scyyy-group/buffer-management-module)
+as a **sibling directory** (not a git submodule):
+
+```
+work/
+├── multi-flow-rate-control/     ← this repo
+└── buffer-management-module/    ← required at ../buffer-management-module
+```
+
+The Makefile resolves:
+
+```
+../buffer-management-module/include/circular_buffer.h
+../buffer-management-module/src/circular_buffer.c   # compiled into this project
+```
+
+You **do not** need to `make` the buffer repo first — `multi-flow-rate-control`
+compiles `circular_buffer.c` directly when you run `make` here.
+
+### Clone (new machine)
+
+```bash
+mkdir -p ~/work && cd ~/work
+
+git clone git@gitlab.hk:Scyyy/multi-flow-rate-control.git
+git clone git@gitlab.hk:scyyy-group/buffer-management-module.git
+```
+
+If `buffer-management-module` is missing or not at `../buffer-management-module`,
+build fails with errors such as `circular_buffer.h: No such file or directory`.
+
+To use a different path, change `CB_DIR` in the `Makefile`.
 
 ## Spec module boundary
 
@@ -72,6 +106,8 @@ UDP 5-tuple mapping (library only, no UDP recv in the demo yet): `make test`
 (`test_flow_peer_map`). Full testing guide: **[tests/TESTING.md](tests/TESTING.md)**.
 
 ## Build & test
+
+From `multi-flow-rate-control/` (with `../buffer-management-module` present):
 
 ```bash
 make                  # libmulti_flow.a
