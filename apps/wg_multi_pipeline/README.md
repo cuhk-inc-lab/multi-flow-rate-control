@@ -45,6 +45,16 @@ cmp c.ts  out_c.ts
 make integration-test
 ```
 
+**UDP ingress demo** (`ingress_push_tuple` + full pipeline):
+
+```bash
+make wg-demo
+./build/wg_multi_pipeline --no-pace --udp 5000 /tmp/out_ --idle-sec 3
+echo -n flow-a | nc -u -p 4001 127.0.0.1 5000
+echo -n flow-b | nc -u -p 4002 127.0.0.1 5000
+# → /tmp/out_0.bin, /tmp/out_1.bin, ...
+```
+
 See [tests/TESTING.md](../../tests/TESTING.md) for full coverage.
 
 ## Ingress: files vs UDP

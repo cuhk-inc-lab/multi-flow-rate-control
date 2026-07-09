@@ -20,6 +20,15 @@ typedef struct WgPipelineConfig {
     int               pacing_enabled;
 } WgPipelineConfig;
 
+typedef struct WgUdpConfig {
+    uint16_t    port;
+    const char *output_prefix;
+    uint32_t    max_flows;
+    unsigned    idle_sec;
+    int         pacing_enabled;
+} WgUdpConfig;
+
 WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config);
+WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config);
 
 #endif /* WG_PIPELINE_H */

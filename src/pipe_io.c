@@ -113,3 +113,54 @@ PipeIoStatus pipe_io_read_to_buffer(int fd, CircularBuffer *dst, size_t block_si
 
     return PIPE_IO_OK;
 }
+
+int pipe_io_drain_to_buffer(int fd, CircularBuffer *dst)
+{
+    unsigned char  buf[4096];
+    ssize_t        n;
+    int            flags;
+    int            saved_flags = -1;
+    int            total = 0;
+
+    if (fd < 0 || dst == NULL) {
+        return -1;
+    }
+
+    flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) {
+        saved_flags = flags;
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    for (;;) {
+        do {
+            n = read(fd, buf, sizeof(buf));
+        } while (n < 0 && errno == EINTR);
+
+        if (n > 0) {
+            if (Buffer_Write(dst, buf, (size_t)n) != CB_OK) {
+                if (saved_flags >= 0) {
+                    (void)fcntl(fd, F_SETFL, saved_flags);
+                }
+                return -1;
+            }
+            total += (int)n;
+            continue;
+        }
+
+        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            break;
+        }
+
+        if (saved_flags >= 0) {
+            (void)fcntl(fd, F_SETFL, saved_flags);
+        }
+        return -1;
+    }
+
+    if (saved_flags >= 0) {
+        (void)fcntl(fd, F_SETFL, saved_flags);
+    }
+
+    return total;
+}

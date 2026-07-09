@@ -27,4 +27,11 @@ PipeIoStatus pipe_io_write_full(int fd, const void *buf, size_t len);
 PipeIoStatus pipe_io_read_to_buffer(int fd, CircularBuffer *dst, size_t block_size,
                                     int blocking);
 
+/*
+ * Non-blocking drain: read all currently available bytes from fd into dst.
+ * Returns bytes written (>= 0), or -1 on I/O / buffer error.
+ * Use after FlowManager write(pipe) to feed post_multi_in (see docs).
+ */
+int pipe_io_drain_to_buffer(int fd, CircularBuffer *dst);
+
 #endif /* PIPE_IO_H */

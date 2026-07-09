@@ -10,9 +10,12 @@
 #include "flow_context.h"
 #include "flow_manager.h"
 #include "ingress_push.h"
+#include "pipe_io.h"
+#include "time_utils.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,6 +23,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 typedef struct FlowStage {
     uint32_t        flow_id;
@@ -66,61 +73,9 @@ static WgPipelineStatus passthrough_tail(CircularBuffer *src, CircularBuffer *ds
     return WG_PIPE_OK;
 }
 
-static int drain_pipe_to_buffer(int fd, CircularBuffer *dst)
-{
-    unsigned char  buf[PKG_SIZE];
-    ssize_t        n;
-    int            flags;
-    int            saved_flags = -1;
-    int            progress = 0;
-
-    if (fd < 0 || dst == NULL) {
-        return 0;
-    }
-
-    flags = fcntl(fd, F_GETFL);
-    if (flags >= 0) {
-        saved_flags = flags;
-        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-
-    for (;;) {
-        do {
-            n = read(fd, buf, sizeof(buf));
-        } while (n < 0 && errno == EINTR);
-
-        if (n > 0) {
-            if (Buffer_Write(dst, buf, (size_t)n) != CB_OK) {
-                if (saved_flags >= 0) {
-                    (void)fcntl(fd, F_SETFL, saved_flags);
-                }
-                return -1;
-            }
-            progress = 1;
-            continue;
-        }
-
-        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
-            break;
-        }
-
-        if (saved_flags >= 0) {
-            (void)fcntl(fd, F_SETFL, saved_flags);
-        }
-        return -1;
-    }
-
-    if (saved_flags >= 0) {
-        (void)fcntl(fd, F_SETFL, saved_flags);
-    }
-
-    return progress;
-}
-
 static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path)
 {
-    if (stage == NULL || path == NULL || path->input_path == NULL ||
-        path->output_path == NULL) {
+    if (stage == NULL || path == NULL || path->output_path == NULL) {
         return WG_PIPE_ERR;
     }
 
@@ -129,16 +84,20 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
     stage->pipefd[0] = -1;
     stage->pipefd[1] = -1;
 
-    strncpy(stage->input_path, path->input_path, sizeof(stage->input_path) - 1u);
-    stage->input_path[sizeof(stage->input_path) - 1u] = '\0';
+    if (path->input_path != NULL) {
+        strncpy(stage->input_path, path->input_path, sizeof(stage->input_path) - 1u);
+        stage->input_path[sizeof(stage->input_path) - 1u] = '\0';
+    }
 
     if (pipe(stage->pipefd) != 0) {
         return WG_PIPE_ERR;
     }
 
-    stage->input_fp = fopen(path->input_path, "rb");
-    if (stage->input_fp == NULL) {
-        return WG_PIPE_ERR;
+    if (path->input_path != NULL) {
+        stage->input_fp = fopen(path->input_path, "rb");
+        if (stage->input_fp == NULL) {
+            return WG_PIPE_ERR;
+        }
     }
 
     if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
@@ -351,7 +310,7 @@ static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
     }
 
     for (;;) {
-        if (drain_pipe_to_buffer(st->pipefd[0], st->post_multi_in) <= 0) {
+        if (pipe_io_drain_to_buffer(st->pipefd[0], st->post_multi_in) <= 0) {
             break;
         }
     }
@@ -425,7 +384,7 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
             FlowStage *st = &stages[i];
             int        dr;
 
-            dr = drain_pipe_to_buffer(st->pipefd[0], st->post_multi_in);
+            dr = pipe_io_drain_to_buffer(st->pipefd[0], st->post_multi_in);
             if (dr > 0) {
                 progress = 1;
             } else if (dr < 0) {
@@ -510,6 +469,338 @@ cleanup:
         }
         free(stages);
     }
+
+    return status;
+}
+
+typedef struct UdpIngressCtx {
+    int                      sock;
+    FlowManager             *mgr;
+    FlowPeerMap             *map;
+    FlowStage               *stages;
+    uint32_t                 flow_count;
+    struct sockaddr_storage  local;
+    socklen_t                local_len;
+    _Atomic int              running;
+    _Atomic int              any_recv;
+    _Atomic int64_t          last_recv_ns;
+} UdpIngressCtx;
+
+static void udp_touch_recv(UdpIngressCtx *ctx)
+{
+    struct timespec now;
+
+    if (ctx == NULL) {
+        return;
+    }
+
+    atomic_store(&ctx->any_recv, 1);
+    if (time_utils_now_mono(&now) == TU_OK) {
+        atomic_store(&ctx->last_recv_ns,
+                     (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec);
+    }
+}
+
+static void *udp_ingress_thread(void *arg)
+{
+    UdpIngressCtx           *ctx = arg;
+    unsigned char            buf[2048];
+    struct sockaddr_storage  peer;
+    socklen_t                peer_len;
+    ssize_t                  n;
+    FlowTuple                tuple;
+
+    while (atomic_load(&ctx->running)) {
+        peer_len = sizeof(peer);
+        do {
+            n = recvfrom(ctx->sock, buf, sizeof(buf), 0,
+                         (struct sockaddr *)&peer, &peer_len);
+        } while (n < 0 && errno == EINTR);
+
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000000L };
+
+                nanosleep(&delay, NULL);
+                continue;
+            }
+            break;
+        }
+
+        if (flow_tuple_set(&tuple,
+                           (struct sockaddr *)&peer, peer_len,
+                           (struct sockaddr *)&ctx->local, ctx->local_len,
+                           IPPROTO_UDP) != 0) {
+            continue;
+        }
+
+        {
+            uint32_t flow_id = flow_peer_map_lookup(ctx->map, &tuple);
+
+            if (flow_id == (uint32_t)-1) {
+                continue;
+            }
+
+            if (ingress_push(ctx->mgr, flow_id, buf, (size_t)n) == INGRESS_PUSH_OK) {
+                ctx->stages[flow_id].packets_pushed++;
+                udp_touch_recv(ctx);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int udp_open_socket(uint16_t port)
+{
+    int                sock;
+    int                on = 1;
+    struct sockaddr_in addr;
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+        close(sock);
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
+{
+    FlowManager       mgr;
+    FlowManagerConfig mgr_cfg;
+    FlowStage        *stages = NULL;
+    WgFlowPath       *paths = NULL;
+    char            (*out_paths)[512] = NULL;
+    FlowPeerMap      *peer_map = NULL;
+    UdpIngressCtx     udp_ctx;
+    pthread_t         udp_thread;
+    uint32_t          i;
+    const Codec      *codec = BlockCodec_get();
+    WgPipelineStatus  status = WG_PIPE_OK;
+    unsigned char     work[ENCODE_BLOCK];
+    int               sock = -1;
+    int               udp_started = 0;
+
+    if (config == NULL || config->output_prefix == NULL ||
+        config->max_flows == 0 || config->port == 0) {
+        return WG_PIPE_ERR;
+    }
+
+    stages = calloc(config->max_flows, sizeof(*stages));
+    paths = calloc(config->max_flows, sizeof(*paths));
+    out_paths = calloc(config->max_flows, sizeof(*out_paths));
+    if (stages == NULL || paths == NULL || out_paths == NULL) {
+        status = WG_PIPE_ERR;
+        goto cleanup;
+    }
+
+    for (i = 0; i < config->max_flows; i++) {
+        int n = snprintf(out_paths[i], sizeof(out_paths[i]), "%s%u.bin",
+                         config->output_prefix, i);
+
+        if (n < 0 || (size_t)n >= sizeof(out_paths[i])) {
+            status = WG_PIPE_ERR;
+            goto cleanup;
+        }
+
+        paths[i].flow_id = i;
+        paths[i].input_path = NULL;
+        paths[i].output_path = out_paths[i];
+
+        if (init_flow_stage(&stages[i], &paths[i]) != WG_PIPE_OK) {
+            status = WG_PIPE_ERR;
+            goto cleanup;
+        }
+    }
+
+    if (flow_peer_map_init(&peer_map, config->max_flows) != FPM_OK) {
+        status = WG_PIPE_ERR;
+        goto cleanup;
+    }
+
+    mgr_cfg = (FlowManagerConfig){
+        .max_flows = config->max_flows,
+        .per_flow_queue_capacity = MF_QUEUE_CAPACITY,
+        .mixed_queue_capacity = MF_MIXED_CAPACITY,
+        .default_output_fd = -1,
+        .output_fds = NULL,
+        .encode_scratch_cap = 0
+    };
+
+    if (flow_manager_init(&mgr, &mgr_cfg) != FM_OK) {
+        status = WG_PIPE_ERR;
+        goto cleanup;
+    }
+
+    for (i = 0; i < config->max_flows; i++) {
+        mgr.flows[i].output_fd = stages[i].pipefd[1];
+        flow_context_set_pacing(&mgr.flows[i], config->pacing_enabled);
+    }
+
+    sock = udp_open_socket(config->port);
+    if (sock < 0) {
+        status = WG_PIPE_ERR;
+        goto cleanup_mgr;
+    }
+
+    udp_ctx.sock = sock;
+    udp_ctx.mgr = &mgr;
+    udp_ctx.map = peer_map;
+    udp_ctx.stages = stages;
+    udp_ctx.flow_count = config->max_flows;
+    udp_ctx.local_len = sizeof(udp_ctx.local);
+    atomic_store(&udp_ctx.running, 1);
+    atomic_store(&udp_ctx.any_recv, 0);
+    atomic_store(&udp_ctx.last_recv_ns, 0);
+
+    if (getsockname(sock, (struct sockaddr *)&udp_ctx.local, &udp_ctx.local_len) != 0) {
+        status = WG_PIPE_ERR;
+        goto cleanup_mgr;
+    }
+
+    if (flow_manager_start(&mgr) != FM_OK) {
+        status = WG_PIPE_ERR;
+        goto cleanup_mgr;
+    }
+
+    if (pthread_create(&udp_thread, NULL, udp_ingress_thread, &udp_ctx) != 0) {
+        status = WG_PIPE_ERR;
+        goto cleanup_running;
+    }
+    udp_started = 1;
+
+    fprintf(stderr, "UDP ingress on port %u, outputs %s0.bin …\n",
+            (unsigned)config->port, config->output_prefix);
+
+    for (;;) {
+        int           progress = 0;
+        struct timespec now;
+        int64_t       now_ns = 0;
+        int64_t       last_ns;
+
+        if (time_utils_now_mono(&now) == TU_OK) {
+            now_ns = (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec;
+        }
+
+        if (atomic_load(&udp_ctx.any_recv) && config->idle_sec > 0) {
+            last_ns = atomic_load(&udp_ctx.last_recv_ns);
+            if (last_ns > 0 &&
+                (now_ns - last_ns) >= (int64_t)config->idle_sec * 1000000000LL) {
+                for (i = 0; i < config->max_flows; i++) {
+                    stages[i].ingest_done = true;
+                }
+            }
+        }
+
+        for (i = 0; i < config->max_flows; i++) {
+            FlowStage *st = &stages[i];
+            int        dr;
+
+            dr = pipe_io_drain_to_buffer(st->pipefd[0], st->post_multi_in);
+            if (dr > 0) {
+                progress = 1;
+            } else if (dr < 0) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+
+            if (process_flow_post_multi(st, codec, work, &progress) != WG_PIPE_OK) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+        }
+
+        {
+            bool all_done = true;
+
+            for (i = 0; i < config->max_flows; i++) {
+                if (!stages[i].ingest_done) {
+                    all_done = false;
+                    break;
+                }
+                if (!flow_stage_quiescent(&stages[i], &mgr)) {
+                    all_done = false;
+                    break;
+                }
+            }
+
+            if (all_done) {
+                break;
+            }
+        }
+
+        for (i = 0; i < config->max_flows; i++) {
+            (void)flow_metrics_tick(&mgr.flows[i].metrics, 5.0);
+        }
+
+        if (!progress) {
+            struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000000L };
+
+            nanosleep(&delay, NULL);
+        }
+    }
+
+    for (i = 0; i < config->max_flows; i++) {
+        if (flush_flow_tails(&stages[i], codec) != WG_PIPE_OK) {
+            status = WG_PIPE_ERR;
+            goto cleanup_running;
+        }
+    }
+
+cleanup_running:
+    atomic_store(&udp_ctx.running, 0);
+    if (sock >= 0) {
+        shutdown(sock, SHUT_RDWR);
+    }
+    if (udp_started) {
+        pthread_join(udp_thread, NULL);
+    }
+
+    for (i = 0; i < config->max_flows; i++) {
+        fprintf(stderr,
+                "flow %u: enq_bps=%.0f deq_bps=%.0f packets=%llu pushed=%llu -> %s\n",
+                i,
+                flow_metrics_get_enqueue_bps(&mgr.flows[i].metrics),
+                flow_metrics_get_dequeue_bps(&mgr.flows[i].metrics),
+                (unsigned long long)atomic_load(
+                    &mgr.flows[i].metrics.dequeued_packets),
+                (unsigned long long)stages[i].packets_pushed,
+                out_paths[i]);
+    }
+    flow_manager_stop(&mgr);
+
+cleanup_mgr:
+    flow_manager_destroy(&mgr);
+
+cleanup:
+    if (sock >= 0) {
+        close(sock);
+    }
+    flow_peer_map_destroy(peer_map);
+    if (stages != NULL) {
+        for (i = 0; i < config->max_flows; i++) {
+            destroy_flow_stage(&stages[i]);
+        }
+        free(stages);
+    }
+    free(paths);
+    free(out_paths);
 
     return status;
 }
