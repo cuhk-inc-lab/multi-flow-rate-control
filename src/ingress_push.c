@@ -28,20 +28,19 @@ IngressPushStatus ingress_push(FlowManager *mgr,
     return INGRESS_PUSH_OK;
 }
 
-IngressPushStatus ingress_push_peer(FlowManager *mgr,
-                                    FlowPeerMap *map,
-                                    const struct sockaddr *sa,
-                                    socklen_t salen,
-                                    const void *data,
-                                    size_t len)
+IngressPushStatus ingress_push_tuple(FlowManager *mgr,
+                                     FlowPeerMap *map,
+                                     const FlowTuple *tuple,
+                                     const void *data,
+                                     size_t len)
 {
     uint32_t flow_id;
 
-    if (map == NULL || sa == NULL) {
+    if (map == NULL || tuple == NULL) {
         return INGRESS_PUSH_ERR_INVALID;
     }
 
-    flow_id = flow_peer_map_lookup(map, sa, salen);
+    flow_id = flow_peer_map_lookup(map, tuple);
     if (flow_id == (uint32_t)-1) {
         return INGRESS_PUSH_ERR_PEER;
     }

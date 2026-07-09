@@ -29,4 +29,6 @@ make app
 cmp input.ts output.ts
 ```
 
-See project root `README.md` for `make app-test` / `make app-test-multi`.
+See project root [README.md](../../README.md) and [tests/TESTING.md](../../tests/TESTING.md).
+For multi-file testing of the canonical pipeline, use `../wg_multi_pipeline` and
+`make integration-test`.

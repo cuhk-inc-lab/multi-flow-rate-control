@@ -3,12 +3,13 @@
 
 /*
  * Push upstream bytes into FlowManager as DataPackets.
- * Demo uses fixed flow_id; production UDP uses flow_peer_map_lookup().
+ *
+ * - File demo: ingress_push(mgr, fixed_flow_id, ...)
+ * - UDP: build FlowTuple (5-tuple) -> ingress_push_tuple(...)
  */
 
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
 
 #include "flow_manager.h"
 #include "flow_peer_map.h"
@@ -26,11 +27,14 @@ IngressPushStatus ingress_push(FlowManager *mgr,
                                const void *data,
                                size_t len);
 
-IngressPushStatus ingress_push_peer(FlowManager *mgr,
-                                    FlowPeerMap *map,
-                                    const struct sockaddr *sa,
-                                    socklen_t salen,
-                                    const void *data,
-                                    size_t len);
+/*
+ * Resolve internal flow slot from the full UDP 5-tuple, then push.
+ * The tuple is the routing key; flow_id is only the assigned slot index.
+ */
+IngressPushStatus ingress_push_tuple(FlowManager *mgr,
+                                     FlowPeerMap *map,
+                                     const FlowTuple *tuple,
+                                     const void *data,
+                                     size_t len);
 
 #endif /* INGRESS_PUSH_H */

@@ -42,23 +42,34 @@ Build with `make spec`. See `apps/spec_pipeline/README.md`.
 
 ### wg-obfs integration path (`wg_multi_pipeline`) — **multi before encode**
 
-Ingress (`ingress_push` / future UDP peer map) → FlowManager → per-flow encode →
-buffer transfer → decode → separate output files. Files mock wg-obfs with a fixed
-`flow_id` per input path.
+Ingress (`ingress_push` / `ingress_push_tuple`) → FlowManager → per-flow encode →
+buffer transfer → decode → separate output files.
 
 ```
-ingress (flow_id) ──► FlowManager (split + pacing) ──► raw bytes
-                 ──► encode ──► transfer ──► decode ──► output.ts
+ingress ──► FlowManager (split + pacing) ──► raw bytes
+       ──► encode ──► transfer ──► decode ──► output file
 ```
+
+**File demo:** each input path is assigned a fixed internal `flow_id` (0, 1, 2, …).
+**UDP (library):** route by full 5-tuple `(src, dst, protocol)` via `flow_peer_map`;
+`flow_id` is only the compact slot index inside FlowManager — not a second grouping
+rule. See `apps/wg_multi_pipeline/README.md`.
+
+#### Quick test with your own files
+
+Extension does not matter — inputs are raw bytes.
 
 ```bash
 make wg-demo
-make integration-test
-./build/wg_multi_pipeline --no-pace --multi in0.ts out0.ts in1.ts out1.ts in2.ts out2.ts
+./build/wg_multi_pipeline --no-pace --multi \
+  a.txt out_a.txt b.bin out_b.bin c.ts out_c.ts
+cmp a.txt out_a.txt && cmp b.bin out_b.bin && cmp c.ts out_c.ts
 ```
 
-Future UDP hook: `ingress_push_peer(mgr, map, src_addr, ...)` — see
-`include/ingress_push.h` and `include/flow_peer_map.h`. No wg-obfs code changes required.
+Automated 3-flow roundtrip: `make integration-test`.
+
+UDP 5-tuple mapping (library only, no UDP recv in the demo yet): `make test`
+(`test_flow_peer_map`). Full testing guide: **[tests/TESTING.md](tests/TESTING.md)**.
 
 ## Build & test
 
@@ -90,7 +101,7 @@ target and what each `test_*` function checks.
 | `packet_framer` | CircularBuffer → DataPacket |
 | `pipe_io` | Used by integration harness only |
 | `fd_sink` | write() with partial retry |
-| `flow_peer_map` | UDP src_addr → flow_id (wg-obfs ingress) |
+| `flow_peer_map` | UDP 5-tuple → internal flow slot (wg-obfs ingress) |
 | `ingress_push` | Upstream bytes → `flow_manager_push` |
 
 ## Pacing

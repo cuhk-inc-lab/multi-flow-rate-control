@@ -4,9 +4,8 @@
 #include <string.h>
 
 typedef struct FlowPeerEntry {
-    struct sockaddr_storage addr;
-    socklen_t               addrlen;
-    uint32_t                flow_id;
+    FlowTuple tuple;
+    uint32_t  flow_id;
 } FlowPeerEntry;
 
 struct FlowPeerMap {
@@ -17,8 +16,10 @@ struct FlowPeerMap {
     uint32_t       max_flows;
 };
 
-static int peer_addr_equal(const struct sockaddr *a, socklen_t alen,
-                           const struct sockaddr *b, socklen_t blen)
+static int sockaddr_equal(const struct sockaddr_storage *a,
+                          socklen_t alen,
+                          const struct sockaddr_storage *b,
+                          socklen_t blen)
 {
     if (a == NULL || b == NULL || alen == 0 || blen == 0) {
         return 0;
@@ -29,6 +30,42 @@ static int peer_addr_equal(const struct sockaddr *a, socklen_t alen,
     }
 
     return memcmp(a, b, alen) == 0;
+}
+
+static int tuple_equal(const FlowTuple *a, const FlowTuple *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    if (a->protocol != b->protocol) {
+        return 0;
+    }
+
+    return sockaddr_equal(&a->src, a->src_len, &b->src, b->src_len) &&
+           sockaddr_equal(&a->dst, a->dst_len, &b->dst, b->dst_len);
+}
+
+int flow_tuple_set(FlowTuple *out,
+                   const struct sockaddr *src,
+                   socklen_t src_len,
+                   const struct sockaddr *dst,
+                   socklen_t dst_len,
+                   uint8_t protocol)
+{
+    if (out == NULL || src == NULL || dst == NULL ||
+        src_len == 0 || dst_len == 0 ||
+        src_len > sizeof(out->src) || dst_len > sizeof(out->dst)) {
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    memcpy(&out->src, src, src_len);
+    out->src_len = src_len;
+    memcpy(&out->dst, dst, dst_len);
+    out->dst_len = dst_len;
+    out->protocol = protocol;
+    return 0;
 }
 
 FlowPeerMapStatus flow_peer_map_init(FlowPeerMap **map, uint32_t max_flows)
@@ -67,21 +104,16 @@ void flow_peer_map_destroy(FlowPeerMap *map)
     free(map);
 }
 
-uint32_t flow_peer_map_lookup(FlowPeerMap *map,
-                              const struct sockaddr *sa,
-                              socklen_t salen)
+uint32_t flow_peer_map_lookup(FlowPeerMap *map, const FlowTuple *tuple)
 {
     size_t i;
 
-    if (map == NULL || sa == NULL || salen == 0 ||
-        salen > sizeof(struct sockaddr_storage)) {
+    if (map == NULL || tuple == NULL) {
         return (uint32_t)-1;
     }
 
     for (i = 0; i < map->count; i++) {
-        if (peer_addr_equal(sa, salen,
-                            (const struct sockaddr *)&map->entries[i].addr,
-                            map->entries[i].addrlen)) {
+        if (tuple_equal(&map->entries[i].tuple, tuple)) {
             return map->entries[i].flow_id;
         }
     }
@@ -106,8 +138,7 @@ uint32_t flow_peer_map_lookup(FlowPeerMap *map,
     }
 
     map->entries[map->count].flow_id = map->next_flow_id;
-    memcpy(&map->entries[map->count].addr, sa, salen);
-    map->entries[map->count].addrlen = salen;
+    map->entries[map->count].tuple = *tuple;
     map->count++;
     return map->next_flow_id++;
 }

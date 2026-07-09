@@ -2,9 +2,10 @@
 #define FLOW_PEER_MAP_H
 
 /*
- * Map UDP peer (src IP:port) to flow_id for multi-flow ingress.
- * Used when wg-obfs (or any UDP source) delivers datagrams without an
- * application-level flow header.
+ * Map a UDP 5-tuple to an internal flow slot (flow_id) for FlowManager.
+ *
+ * Tuple = (src IP:port, dst IP:port, protocol). The full tuple is the
+ * routing key; flow_id is the compact index assigned on first sight.
  */
 
 #include <netinet/in.h>
@@ -18,17 +19,34 @@ typedef enum {
     FPM_ERR_LIMIT = -3
 } FlowPeerMapStatus;
 
+typedef struct FlowTuple {
+    struct sockaddr_storage src;
+    socklen_t               src_len;
+    struct sockaddr_storage dst;
+    socklen_t               dst_len;
+    uint8_t                 protocol; /* e.g. IPPROTO_UDP */
+} FlowTuple;
+
 typedef struct FlowPeerMap FlowPeerMap;
+
+/*
+ * Fill out from recvfrom src plus local socket bind address (dst) and protocol.
+ * Returns 0 on success, -1 on invalid arguments.
+ */
+int flow_tuple_set(FlowTuple *out,
+                   const struct sockaddr *src,
+                   socklen_t src_len,
+                   const struct sockaddr *dst,
+                   socklen_t dst_len,
+                   uint8_t protocol);
 
 FlowPeerMapStatus flow_peer_map_init(FlowPeerMap **map, uint32_t max_flows);
 void              flow_peer_map_destroy(FlowPeerMap *map);
 
 /*
- * Return existing flow_id for sa, or assign the next id in [0, max_flows).
+ * Return flow_id for this 5-tuple, or assign the next slot on first use.
  * Returns (uint32_t)-1 on error or when the table is full.
  */
-uint32_t flow_peer_map_lookup(FlowPeerMap *map,
-                              const struct sockaddr *sa,
-                              socklen_t salen);
+uint32_t flow_peer_map_lookup(FlowPeerMap *map, const FlowTuple *tuple);
 
 #endif /* FLOW_PEER_MAP_H */

@@ -15,8 +15,8 @@ static void print_usage(const char *prog)
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
             "         -> BlockCodec encode -> buffer transfer -> decode -> file\n"
             "\n"
-            "File ingress mocks wg-obfs datagrams with a fixed flow_id per path.\n"
-            "Future UDP: ingress_push_peer() maps src_addr to flow_id.\n"
+            "File ingress mocks wg-obfs with a fixed flow_id per path.\n"
+            "Future UDP: FlowTuple (5-tuple) -> ingress_push_tuple().\n"
             "\n"
             "Verify: cmp <input.ts> <output.ts>\n",
             prog, prog);

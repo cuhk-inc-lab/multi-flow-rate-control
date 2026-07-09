@@ -1060,39 +1060,94 @@ static int test_complex_multi_flow(void)
 static int test_flow_peer_map(void)
 {
     FlowPeerMap       *map = NULL;
-    struct sockaddr_in a;
-    struct sockaddr_in b;
+    struct sockaddr_in src_a;
+    struct sockaddr_in src_b;
+    struct sockaddr_in dst0;
+    struct sockaddr_in dst1;
+    FlowTuple          tuple;
     uint32_t           f0;
     uint32_t           f1;
+    uint32_t           f2;
 
     if (flow_peer_map_init(&map, 4) != FPM_OK) {
         return 1;
     }
 
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons(4000);
-    if (inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) != 1) {
+    memset(&dst0, 0, sizeof(dst0));
+    dst0.sin_family = AF_INET;
+    dst0.sin_port = htons(5000);
+    if (inet_pton(AF_INET, "127.0.0.1", &dst0.sin_addr) != 1) {
         flow_peer_map_destroy(map);
         return 1;
     }
 
-    memset(&b, 0, sizeof(b));
-    b.sin_family = AF_INET;
-    b.sin_port = htons(4001);
-    if (inet_pton(AF_INET, "127.0.0.1", &b.sin_addr) != 1) {
+    memset(&dst1, 0, sizeof(dst1));
+    dst1.sin_family = AF_INET;
+    dst1.sin_port = htons(5001);
+    if (inet_pton(AF_INET, "127.0.0.1", &dst1.sin_addr) != 1) {
         flow_peer_map_destroy(map);
         return 1;
     }
 
-    f0 = flow_peer_map_lookup(map, (struct sockaddr *)&a, sizeof(a));
-    f1 = flow_peer_map_lookup(map, (struct sockaddr *)&b, sizeof(b));
-    if (f0 != 0 || f1 != 1) {
+    memset(&src_a, 0, sizeof(src_a));
+    src_a.sin_family = AF_INET;
+    src_a.sin_port = htons(4000);
+    if (inet_pton(AF_INET, "10.0.0.1", &src_a.sin_addr) != 1) {
         flow_peer_map_destroy(map);
         return 1;
     }
 
-    if (flow_peer_map_lookup(map, (struct sockaddr *)&a, sizeof(a)) != 0) {
+    memset(&src_b, 0, sizeof(src_b));
+    src_b.sin_family = AF_INET;
+    src_b.sin_port = htons(4000);
+    if (inet_pton(AF_INET, "10.0.0.2", &src_b.sin_addr) != 1) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    if (flow_tuple_set(&tuple,
+                       (struct sockaddr *)&src_a, sizeof(src_a),
+                       (struct sockaddr *)&dst0, sizeof(dst0),
+                       IPPROTO_UDP) != 0) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    f0 = flow_peer_map_lookup(map, &tuple);
+    if (f0 != 0) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    if (flow_peer_map_lookup(map, &tuple) != 0) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    if (flow_tuple_set(&tuple,
+                       (struct sockaddr *)&src_b, sizeof(src_b),
+                       (struct sockaddr *)&dst0, sizeof(dst0),
+                       IPPROTO_UDP) != 0) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    f1 = flow_peer_map_lookup(map, &tuple);
+    if (f1 != 1) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    if (flow_tuple_set(&tuple,
+                       (struct sockaddr *)&src_a, sizeof(src_a),
+                       (struct sockaddr *)&dst1, sizeof(dst1),
+                       IPPROTO_UDP) != 0) {
+        flow_peer_map_destroy(map);
+        return 1;
+    }
+
+    f2 = flow_peer_map_lookup(map, &tuple);
+    if (f2 != 2) {
         flow_peer_map_destroy(map);
         return 1;
     }
