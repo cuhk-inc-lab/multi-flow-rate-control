@@ -80,20 +80,20 @@ This generates `build/wg_test_in{0,1,2}.ts`, runs the pipeline, and `cmp`s outpu
 
 ```bash
 ./build/wg_multi_pipeline --no-pace --multi \
-  input.ts  output0.ts \
-  input1.ts output1.ts \
-  input2.ts output2.ts
+  input0.bin  output0.bin \
+  input1.bin output1.bin \
+  input2.bin output2.bin
 
-cmp input.ts  output0.ts && echo "flow 0 OK"
-cmp input1.ts output1.ts && echo "flow 1 OK"
-cmp input2.ts output2.ts && echo "flow 2 OK"
+cmp input0.bin  output0.bin && echo "flow 0 OK"
+cmp input1.bin output1.bin && echo "flow 1 OK"
+cmp input2.bin output2.bin && echo "flow 2 OK"
 ```
 
 **Single file:**
 
 ```bash
-./build/wg_multi_pipeline --no-pace input.ts output.ts
-cmp input.ts output.ts
+./build/wg_multi_pipeline --no-pace input.bin output.bin
+cmp input.bin output.bin
 ```
 
 ### Implementation notes
