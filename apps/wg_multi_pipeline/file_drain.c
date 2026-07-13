@@ -102,6 +102,34 @@ DrainStatus FileDrain_flush_remainder(FileDrain *drain, CircularBuffer *buf,
     return DRAIN_OK;
 }
 
+DrainStatus FileDrain_write_packet(FileDrain *drain, const DataPacket *pkt,
+                                   size_t *written)
+{
+    size_t out;
+
+    if (drain == NULL || pkt == NULL || drain->fp == NULL) {
+        return DRAIN_ERR;
+    }
+
+    if (pkt->payload_len == 0) {
+        if (written != NULL) {
+            *written = 0;
+        }
+        return DRAIN_OK;
+    }
+
+    out = fwrite(pkt->payload, 1, pkt->payload_len, drain->fp);
+    if (out != pkt->payload_len) {
+        return DRAIN_ERR;
+    }
+
+    if (written != NULL) {
+        *written = out;
+    }
+
+    return DRAIN_OK;
+}
+
 void FileDrain_close(FileDrain *drain)
 {
     if (drain == NULL) {

@@ -90,7 +90,10 @@ tsan: clean test integration-test
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+INCLUDE_HDRS := $(wildcard include/*.h)
+WG_HDRS := $(wildcard $(WG_DIR)/*.h)
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(INCLUDE_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/circular_buffer.o: $(CB_SRC) | $(OBJ_DIR)
@@ -102,7 +105,7 @@ $(LIB): $(LIB_OBJS) | $(OBJ_DIR)
 $(TEST_BIN): $(TEST_DIR)/run_tests.c $(LIB_OBJS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) $(TEST_DIR)/run_tests.c $(LIB_OBJS) -o $@ $(LDFLAGS)
 
-$(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c | $(OBJ_DIR)
+$(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -c $< -o $@
 
 $(WG_BIN): $(WG_OBJS) $(LIB_OBJS) | $(OBJ_DIR)

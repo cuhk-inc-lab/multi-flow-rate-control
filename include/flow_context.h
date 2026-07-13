@@ -58,6 +58,7 @@ typedef struct FlowContext {
     size_t              encode_scratch_cap;
 
     FlowManager        *owner;
+    FlowCircularBuffer *relay_queue;
     pthread_t           worker_thread;
     int                 worker_started;
 } FlowContext;

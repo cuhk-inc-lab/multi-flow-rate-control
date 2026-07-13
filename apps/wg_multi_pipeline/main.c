@@ -8,13 +8,15 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--no-pace] <input.ts> <output.ts>\n"
-            "  %s [--no-pace] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
+            "  %s [--no-pace] [--no-codec] <input.ts> <output.ts>\n"
+            "  %s [--no-pace] [--no-codec] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
             "  %s [--no-pace] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
             "         -> BlockCodec encode -> buffer transfer -> decode -> file\n"
+            "\n"
+            "--no-codec: relay mode — pointer-only post-pacing queue, fwrite at send time\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>0.bin, ...\n"
             "     Stop after --idle-sec (default 3) with no packets.\n"
@@ -26,6 +28,7 @@ static void print_usage(const char *prog)
 int main(int argc, char **argv)
 {
     int pacing = 1;
+    int codec = 1;
     int argi = 1;
 
     if (argc < 3) {
@@ -33,8 +36,14 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (strcmp(argv[argi], "--no-pace") == 0) {
-        pacing = 0;
+    while (argi < argc &&
+           (strcmp(argv[argi], "--no-pace") == 0 ||
+            strcmp(argv[argi], "--no-codec") == 0)) {
+        if (strcmp(argv[argi], "--no-pace") == 0) {
+            pacing = 0;
+        } else {
+            codec = 0;
+        }
         argi++;
     }
 
@@ -141,7 +150,8 @@ int main(int argc, char **argv)
         cfg = (WgPipelineConfig){
             .flows = paths,
             .flow_count = (uint32_t)pairs,
-            .pacing_enabled = pacing
+            .pacing_enabled = pacing,
+            .codec_enabled = codec
         };
 
         if (wg_pipeline_run(&cfg) != WG_PIPE_OK) {

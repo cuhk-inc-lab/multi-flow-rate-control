@@ -18,6 +18,7 @@ typedef struct WgPipelineConfig {
     const WgFlowPath *flows;
     uint32_t          flow_count;
     int               pacing_enabled;
+    int               codec_enabled;
 } WgPipelineConfig;
 
 typedef struct WgUdpConfig {

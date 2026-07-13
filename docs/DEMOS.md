@@ -96,6 +96,15 @@ cmp input2.bin output2.bin && echo "flow 2 OK"
 cmp input.bin output.bin
 ```
 
+**Relay mode (`--no-codec`):** skips BlockCodec, pipe, and byte CircularBuffers.
+After pacing, workers enqueue `DataPacket*` into a pointer-only queue; the main
+thread writes payload bytes at drain time via `FileDrain_write_packet()`.
+
+```bash
+./build/wg_multi_pipeline --no-codec --no-pace input.bin output.bin
+cmp input.bin output.bin
+```
+
 ### Implementation notes
 
 - `main.c` parses `in out` pairs; pair *i* gets `flow_id = i`.

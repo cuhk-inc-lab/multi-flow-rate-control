@@ -6,6 +6,24 @@
 
 static FlowWorkerStatus emit_packet(FlowContext *ctx, DataPacket *pkt, ssize_t *written)
 {
+    FlowBufferStatus fb_st;
+
+    if (ctx->relay_queue != NULL) {
+        fb_st = flow_buffer_enqueue(ctx->relay_queue, &pkt);
+        if (fb_st == FB_OK) {
+            if (written != NULL) {
+                *written = 0;
+            }
+            return FW_OK;
+        }
+        if (fb_st == FB_ERR_SHUTDOWN) {
+            packet_free(pkt);
+            return FW_ERR_SHUTDOWN;
+        }
+        packet_free(pkt);
+        return FW_ERR_SYSTEM;
+    }
+
     ssize_t out_len = 0;
     FdSinkStatus sink_st;
 
@@ -106,17 +124,32 @@ void *flow_worker_thread(void *arg)
 
         pace_packet(ctx, pkt);
 
-        if (emit_packet(ctx, pkt, &written) != FW_OK) {
+        {
+            FlowWorkerStatus emit_st;
+            size_t             payload_len = pkt->payload_len;
+
+            emit_st = emit_packet(ctx, pkt, &written);
+            if (emit_st == FW_ERR_SHUTDOWN) {
+                break;
+            }
+            if (emit_st != FW_OK) {
+                if (pkt != NULL) {
+                    packet_free(pkt);
+                }
+                continue;
+            }
+
+            flow_metrics_record_dequeue(&ctx->metrics, payload_len);
+            if (written > 0) {
+                (void)written;
+            }
+
+            if (ctx->relay_queue != NULL) {
+                continue;
+            }
+
             packet_free(pkt);
-            continue;
         }
-
-        flow_metrics_record_dequeue(&ctx->metrics, pkt->payload_len);
-        if (written > 0) {
-            (void)written;
-        }
-
-        packet_free(pkt);
     }
 
     return NULL;

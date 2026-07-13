@@ -8,6 +8,7 @@
 
 #include "circular_buffer.h"
 #include "flow_context.h"
+#include "flow_buffer.h"
 #include "flow_manager.h"
 #include "ingress_push.h"
 #include "pipe_io.h"
@@ -29,21 +30,23 @@
 #include <sys/socket.h>
 
 typedef struct FlowStage {
-    uint32_t        flow_id;
-    FILE           *input_fp;
-    char            input_path[512];
-    FileDrain       drain;
-    CircularBuffer *post_multi_in;
-    CircularBuffer *sending_out;
-    CircularBuffer *receiver_in;
-    CircularBuffer *receiver_out;
-    int             pipefd[2];
-    bool            ingest_done;
-    uint64_t        packets_pushed;
-    unsigned char   ingress_partial[PKG_SIZE];
-    size_t          ingress_partial_len;
-    unsigned char   pipe_partial[PKG_SIZE];
-    size_t          pipe_partial_len;
+    uint32_t            flow_id;
+    FILE               *input_fp;
+    char                input_path[512];
+    FileDrain           drain;
+    bool                relay_mode;
+    FlowCircularBuffer  post_multi_pkts;
+    CircularBuffer     *post_multi_in;
+    CircularBuffer     *sending_out;
+    CircularBuffer     *receiver_in;
+    CircularBuffer     *receiver_out;
+    int                 pipefd[2];
+    bool                ingest_done;
+    uint64_t            packets_pushed;
+    unsigned char       ingress_partial[PKG_SIZE];
+    size_t              ingress_partial_len;
+    unsigned char       pipe_partial[PKG_SIZE];
+    size_t              pipe_partial_len;
 } FlowStage;
 
 static WgPipelineStatus passthrough_tail(CircularBuffer *src, CircularBuffer *dst)
@@ -77,7 +80,8 @@ static WgPipelineStatus passthrough_tail(CircularBuffer *src, CircularBuffer *ds
     return WG_PIPE_OK;
 }
 
-static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path)
+static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path,
+                                        bool relay_mode)
 {
     if (stage == NULL || path == NULL || path->output_path == NULL) {
         return WG_PIPE_ERR;
@@ -85,6 +89,7 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
 
     memset(stage, 0, sizeof(*stage));
     stage->flow_id = path->flow_id;
+    stage->relay_mode = relay_mode;
     stage->pipefd[0] = -1;
     stage->pipefd[1] = -1;
 
@@ -93,19 +98,25 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
         stage->input_path[sizeof(stage->input_path) - 1u] = '\0';
     }
 
-    if (pipe(stage->pipefd) != 0) {
-        return WG_PIPE_ERR;
-    }
+    if (relay_mode) {
+        if (flow_buffer_init(&stage->post_multi_pkts, MF_QUEUE_CAPACITY) != FB_OK) {
+            return WG_PIPE_ERR;
+        }
+    } else {
+        if (pipe(stage->pipefd) != 0) {
+            return WG_PIPE_ERR;
+        }
 
-    if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
-                    BUFFER_OVERFLOW_POLICY) != CB_OK ||
-        Buffer_Init(&stage->sending_out, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
-                    BUFFER_OVERFLOW_POLICY) != CB_OK ||
-        Buffer_Init(&stage->receiver_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
-                    BUFFER_OVERFLOW_POLICY) != CB_OK ||
-        Buffer_Init(&stage->receiver_out, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
-                    BUFFER_OVERFLOW_POLICY) != CB_OK) {
-        return WG_PIPE_ERR;
+        if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
+                        BUFFER_OVERFLOW_POLICY) != CB_OK ||
+            Buffer_Init(&stage->sending_out, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
+                        BUFFER_OVERFLOW_POLICY) != CB_OK ||
+            Buffer_Init(&stage->receiver_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
+                        BUFFER_OVERFLOW_POLICY) != CB_OK ||
+            Buffer_Init(&stage->receiver_out, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
+                        BUFFER_OVERFLOW_POLICY) != CB_OK) {
+            return WG_PIPE_ERR;
+        }
     }
 
   /* Output FIFO needs a reader (ffplay) before we return; input opens lazily. */
@@ -128,18 +139,24 @@ static void destroy_flow_stage(FlowStage *stage)
     }
 
     FileDrain_close(&stage->drain);
-    Buffer_Destroy(&stage->post_multi_in);
-    Buffer_Destroy(&stage->sending_out);
-    Buffer_Destroy(&stage->receiver_in);
-    Buffer_Destroy(&stage->receiver_out);
 
-    if (stage->pipefd[0] >= 0) {
-        close(stage->pipefd[0]);
-        stage->pipefd[0] = -1;
-    }
-    if (stage->pipefd[1] >= 0) {
-        close(stage->pipefd[1]);
-        stage->pipefd[1] = -1;
+    if (stage->relay_mode) {
+        flow_buffer_shutdown(&stage->post_multi_pkts);
+        flow_buffer_destroy(&stage->post_multi_pkts);
+    } else {
+        Buffer_Destroy(&stage->post_multi_in);
+        Buffer_Destroy(&stage->sending_out);
+        Buffer_Destroy(&stage->receiver_in);
+        Buffer_Destroy(&stage->receiver_out);
+
+        if (stage->pipefd[0] >= 0) {
+            close(stage->pipefd[0]);
+            stage->pipefd[0] = -1;
+        }
+        if (stage->pipefd[1] >= 0) {
+            close(stage->pipefd[1]);
+            stage->pipefd[1] = -1;
+        }
     }
 }
 
@@ -169,6 +186,11 @@ static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
 
     if (enq < st->packets_pushed || deq < st->packets_pushed) {
         return 0;
+    }
+
+    if (st->relay_mode) {
+        return flow_buffer_is_empty(&st->post_multi_pkts) &&
+               flow_queues_drained(mgr, st->flow_id);
     }
 
     return Buffer_IsEmpty(st->post_multi_in) &&
@@ -397,6 +419,10 @@ static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
         return 0;
     }
 
+    if (st->relay_mode && flow_buffer_is_full(&st->post_multi_pkts)) {
+        return 0;
+    }
+
     return 1;
 }
 
@@ -493,6 +519,39 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
     return WG_PIPE_OK;
 }
 
+static WgPipelineStatus process_flow_relay(FlowStage *st, int *progress)
+{
+    if (st == NULL) {
+        return WG_PIPE_ERR;
+    }
+
+    for (;;) {
+        DataPacket      *pkt = NULL;
+        FlowBufferStatus fb_st;
+        DrainStatus      drain_st;
+
+        fb_st = flow_buffer_try_dequeue(&st->post_multi_pkts, &pkt);
+        if (fb_st == FB_ERR_EMPTY) {
+            break;
+        }
+        if (fb_st != FB_OK || pkt == NULL) {
+            return WG_PIPE_ERR;
+        }
+
+        drain_st = FileDrain_write_packet(&st->drain, pkt, NULL);
+        packet_free(pkt);
+        if (drain_st != DRAIN_OK) {
+            return WG_PIPE_ERR;
+        }
+
+        if (progress != NULL) {
+            *progress = 1;
+        }
+    }
+
+    return WG_PIPE_OK;
+}
+
 static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
 {
     unsigned char work[ENCODE_BLOCK];
@@ -500,6 +559,10 @@ static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
 
     if (st == NULL) {
         return WG_PIPE_ERR;
+    }
+
+    if (st->relay_mode) {
+        return process_flow_relay(st, NULL);
     }
 
     for (;;) {
@@ -529,10 +592,13 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     const Codec      *codec = BlockCodec_get();
     WgPipelineStatus  status = WG_PIPE_OK;
     unsigned char     work[ENCODE_BLOCK];
+    bool              relay_mode = false;
 
     if (config == NULL || config->flows == NULL || config->flow_count == 0) {
         return WG_PIPE_ERR;
     }
+
+    relay_mode = config->codec_enabled == 0;
 
     stages = calloc(config->flow_count, sizeof(*stages));
     if (stages == NULL) {
@@ -546,7 +612,7 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     }
 
     for (i = 0; i < config->flow_count; i++) {
-        if (init_flow_stage(&stages[i], &config->flows[i]) != WG_PIPE_OK) {
+        if (init_flow_stage(&stages[i], &config->flows[i], relay_mode) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }
@@ -569,7 +635,12 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     for (i = 0; i < config->flow_count; i++) {
         uint32_t fid = config->flows[i].flow_id;
 
-        mgr.flows[fid].output_fd = stages[i].pipefd[1];
+        if (relay_mode) {
+            mgr.flows[fid].relay_queue = &stages[i].post_multi_pkts;
+            mgr.flows[fid].output_fd = -1;
+        } else {
+            mgr.flows[fid].output_fd = stages[i].pipefd[1];
+        }
         flow_context_set_pacing(&mgr.flows[fid], config->pacing_enabled);
     }
 
@@ -583,19 +654,27 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
 
         for (i = 0; i < config->flow_count; i++) {
             FlowStage *st = &stages[i];
-            int        dr;
 
-            dr = drain_pipe_to_post_multi(st);
-            if (dr > 0) {
-                progress = 1;
-            } else if (dr < 0) {
-                status = WG_PIPE_ERR;
-                goto cleanup_running;
-            }
+            if (relay_mode) {
+                if (process_flow_relay(st, &progress) != WG_PIPE_OK) {
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
+            } else {
+                int dr;
 
-            if (process_flow_post_multi(st, codec, work, &progress) != WG_PIPE_OK) {
-                status = WG_PIPE_ERR;
-                goto cleanup_running;
+                dr = drain_pipe_to_post_multi(st);
+                if (dr > 0) {
+                    progress = 1;
+                } else if (dr < 0) {
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
+
+                if (process_flow_post_multi(st, codec, work, &progress) != WG_PIPE_OK) {
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
             }
 
             if (!st->ingest_done) {
@@ -645,13 +724,18 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     }
 
     for (i = 0; i < config->flow_count; i++) {
-        if (flush_flow_tails(&stages[i], codec) != WG_PIPE_OK) {
+        if (flush_flow_tails(&stages[i], relay_mode ? NULL : codec) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup_running;
         }
     }
 
 cleanup_running:
+    for (i = 0; i < config->flow_count; i++) {
+        if (relay_mode) {
+            flow_buffer_shutdown(&stages[i].post_multi_pkts);
+        }
+    }
     for (i = 0; i < config->flow_count; i++) {
         uint32_t fid = config->flows[i].flow_id;
 
@@ -830,7 +914,7 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
         paths[i].input_path = NULL;
         paths[i].output_path = out_paths[i];
 
-        if (init_flow_stage(&stages[i], &paths[i]) != WG_PIPE_OK) {
+        if (init_flow_stage(&stages[i], &paths[i], false) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }

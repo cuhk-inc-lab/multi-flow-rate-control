@@ -6,7 +6,8 @@
 typedef enum {
     FW_OK = 0,
     FW_ERR_INVALID = -1,
-    FW_ERR_SYSTEM = -2
+    FW_ERR_SYSTEM = -2,
+    FW_ERR_SHUTDOWN = -3
 } FlowWorkerStatus;
 
 FlowWorkerStatus flow_worker_start(FlowContext *ctx);
