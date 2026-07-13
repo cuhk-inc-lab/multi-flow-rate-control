@@ -19,6 +19,16 @@ int flow_manager_is_running(const FlowManager *mgr)
     return mgr != NULL && mgr->running && !mgr->shutdown_requested;
 }
 
+size_t flow_manager_deferred_count(const FlowManager *mgr, uint32_t flow_id)
+{
+    if (mgr == NULL || mgr->deferred == NULL ||
+        flow_id >= mgr->config.max_flows) {
+        return 0;
+    }
+
+    return atomic_load(&mgr->deferred[flow_id].count);
+}
+
 FlowManagerStatus flow_manager_init(FlowManager *mgr, const FlowManagerConfig *cfg)
 {
     uint32_t i;

@@ -29,13 +29,26 @@ TransferStatus BufferTransfer_pump(CircularBuffer *src, CircularBuffer *dst,
         return TRANSFER_SRC_EMPTY;
     }
 
-    if (dst->overflow_policy == CB_OVERFLOW_OVERWRITE) {
-        n = min_size(avail, max_bytes);
+    if (max_bytes > 0) {
+        if (avail < max_bytes) {
+            return TRANSFER_SRC_EMPTY;
+        }
+
+        if (dst->overflow_policy != CB_OVERFLOW_OVERWRITE) {
+            size_t space = dst->capacity - dst->size;
+
+            if (space < max_bytes) {
+                return TRANSFER_DST_FULL;
+            }
+        }
+
+        n = max_bytes;
+    } else if (dst->overflow_policy == CB_OVERFLOW_OVERWRITE) {
+        n = avail;
     } else {
         size_t space = dst->capacity - dst->size;
 
         n = min_size(avail, space);
-        n = min_size(n, max_bytes);
         if (n == 0) {
             return TRANSFER_DST_FULL;
         }

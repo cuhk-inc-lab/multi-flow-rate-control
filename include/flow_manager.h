@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 #include "flow_context.h"
@@ -17,11 +18,11 @@ typedef enum {
 } FlowManagerStatus;
 
 typedef struct DeferredQueue {
-    DataPacket **slots;
-    size_t       capacity;
-    size_t       head;
-    size_t       tail;
-    size_t       count;
+    DataPacket    **slots;
+    size_t          capacity;
+    size_t          head;
+    size_t          tail;
+    _Atomic size_t  count;
 } DeferredQueue;
 
 typedef struct FlowManagerConfig {
@@ -55,6 +56,8 @@ void              flow_manager_destroy(FlowManager *mgr);
 FlowManagerStatus flow_manager_push(FlowManager *mgr, DataPacket **pkt);
 
 int flow_manager_is_running(const FlowManager *mgr);
+
+size_t flow_manager_deferred_count(const FlowManager *mgr, uint32_t flow_id);
 
 void flow_manager_dispatch_wake(FlowManager *mgr);
 

@@ -4,11 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static size_t min_size(size_t a, size_t b)
-{
-    return a < b ? a : b;
-}
-
 DrainStatus FileDrain_open(FileDrain *drain, const char *path)
 {
     if (drain == NULL || path == NULL) {
@@ -43,7 +38,49 @@ DrainStatus FileDrain_pull_once(FileDrain *drain, CircularBuffer *buf,
         return DRAIN_EMPTY;
     }
 
-    n = min_size(chunk_size, buf->size);
+    if (buf->size < chunk_size) {
+        return DRAIN_EMPTY;
+    }
+
+    n = chunk_size;
+    if (n > sizeof(chunk)) {
+        n = sizeof(chunk);
+    }
+
+    st = Buffer_Read(buf, chunk, n);
+    if (st != CB_OK) {
+        return DRAIN_ERR;
+    }
+
+    out = fwrite(chunk, 1, n, drain->fp);
+    if (out != n) {
+        return DRAIN_ERR;
+    }
+
+    if (written != NULL) {
+        *written = n;
+    }
+
+    return DRAIN_OK;
+}
+
+DrainStatus FileDrain_flush_remainder(FileDrain *drain, CircularBuffer *buf,
+                                      size_t *written)
+{
+    unsigned char chunk[PKG_SIZE];
+    size_t        n;
+    size_t        out;
+    CB_Status     st;
+
+    if (drain == NULL || buf == NULL || drain->fp == NULL) {
+        return DRAIN_ERR;
+    }
+
+    if (Buffer_IsEmpty(buf)) {
+        return DRAIN_EMPTY;
+    }
+
+    n = buf->size;
     if (n > sizeof(chunk)) {
         n = sizeof(chunk);
     }

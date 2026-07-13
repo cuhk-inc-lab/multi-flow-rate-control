@@ -40,6 +40,10 @@ typedef struct FlowStage {
     int             pipefd[2];
     bool            ingest_done;
     uint64_t        packets_pushed;
+    unsigned char   ingress_partial[PKG_SIZE];
+    size_t          ingress_partial_len;
+    unsigned char   pipe_partial[PKG_SIZE];
+    size_t          pipe_partial_len;
 } FlowStage;
 
 static WgPipelineStatus passthrough_tail(CircularBuffer *src, CircularBuffer *dst)
@@ -93,13 +97,6 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
         return WG_PIPE_ERR;
     }
 
-    if (path->input_path != NULL) {
-        stage->input_fp = fopen(path->input_path, "rb");
-        if (stage->input_fp == NULL) {
-            return WG_PIPE_ERR;
-        }
-    }
-
     if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
                     BUFFER_OVERFLOW_POLICY) != CB_OK ||
         Buffer_Init(&stage->sending_out, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
@@ -111,6 +108,7 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
         return WG_PIPE_ERR;
     }
 
+  /* Output FIFO needs a reader (ffplay) before we return; input opens lazily. */
     if (FileDrain_open(&stage->drain, path->output_path) != DRAIN_OK) {
         return WG_PIPE_ERR;
     }
@@ -152,7 +150,9 @@ static int flow_queues_drained(const FlowManager *mgr, uint32_t flow_id)
     }
 
     return mixed_queue_is_empty(&mgr->mixed) &&
-           flow_buffer_is_empty(&mgr->flows[flow_id].queue);
+           flow_buffer_is_empty(&mgr->flows[flow_id].queue) &&
+           (mgr->deferred == NULL ||
+            flow_manager_deferred_count(mgr, flow_id) == 0);
 }
 
 static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
@@ -178,13 +178,172 @@ static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
            flow_queues_drained(mgr, st->flow_id);
 }
 
+static WgPipelineStatus ensure_input_open(FlowStage *st)
+{
+    if (st == NULL || st->input_path[0] == '\0') {
+        return WG_PIPE_ERR;
+    }
+
+    if (st->input_fp != NULL) {
+        return WG_PIPE_OK;
+    }
+
+    st->input_fp = fopen(st->input_path, "rb");
+    if (st->input_fp == NULL) {
+        return WG_PIPE_ERR;
+    }
+
+    return WG_PIPE_OK;
+}
+
+static int drain_pipe_to_post_multi(FlowStage *st)
+{
+    unsigned char  buf[PKG_SIZE];
+    ssize_t        n;
+    int            flags;
+    int            saved_flags = -1;
+    int            total = 0;
+
+    if (st == NULL || st->pipefd[0] < 0 || st->post_multi_in == NULL) {
+        return -1;
+    }
+
+    flags = fcntl(st->pipefd[0], F_GETFL);
+    if (flags >= 0) {
+        saved_flags = flags;
+        (void)fcntl(st->pipefd[0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    for (;;) {
+        if (st->pipe_partial_len > 0) {
+            size_t need = PKG_SIZE - st->pipe_partial_len;
+
+            do {
+                n = read(st->pipefd[0], st->pipe_partial + st->pipe_partial_len,
+                         need);
+            } while (n < 0 && errno == EINTR);
+
+            if (n > 0) {
+                st->pipe_partial_len += (size_t)n;
+                if (st->pipe_partial_len < PKG_SIZE) {
+                    break;
+                }
+
+                if (Buffer_Write(st->post_multi_in, st->pipe_partial,
+                                 PKG_SIZE) != CB_OK) {
+                    if (saved_flags >= 0) {
+                        (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
+                    }
+                    return -1;
+                }
+
+                st->pipe_partial_len = 0;
+                total += (int)PKG_SIZE;
+                continue;
+            }
+
+            if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                break;
+            }
+
+            if (saved_flags >= 0) {
+                (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
+            }
+            return -1;
+        }
+
+        do {
+            n = read(st->pipefd[0], buf, PKG_SIZE);
+        } while (n < 0 && errno == EINTR);
+
+        if (n > 0) {
+            if ((size_t)n < PKG_SIZE) {
+                memcpy(st->pipe_partial, buf, (size_t)n);
+                st->pipe_partial_len = (size_t)n;
+                break;
+            }
+
+            if (Buffer_Write(st->post_multi_in, buf, PKG_SIZE) != CB_OK) {
+                if (saved_flags >= 0) {
+                    (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
+                }
+                return -1;
+            }
+
+            total += (int)PKG_SIZE;
+            continue;
+        }
+
+        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            break;
+        }
+
+        if (saved_flags >= 0) {
+            (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
+        }
+        return -1;
+    }
+
+    if (saved_flags >= 0) {
+        (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
+    }
+
+    return total;
+}
+
+static WgPipelineStatus push_ingress_packet(FlowStage *st, FlowManager *mgr,
+                                            const unsigned char *data, size_t len)
+{
+    if (ingress_push(mgr, st->flow_id, data, len) != INGRESS_PUSH_OK) {
+        return WG_PIPE_ERR;
+    }
+
+    st->packets_pushed++;
+    return WG_PIPE_OK;
+}
+
 static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
 {
     unsigned char buf[PKG_SIZE];
     size_t        n;
 
-    if (st == NULL || st->input_fp == NULL) {
+    if (st == NULL || mgr == NULL) {
         return WG_PIPE_ERR;
+    }
+
+    if (ensure_input_open(st) != WG_PIPE_OK) {
+        return WG_PIPE_ERR;
+    }
+
+    if (st->ingress_partial_len > 0) {
+        size_t need = PKG_SIZE - st->ingress_partial_len;
+
+        n = fread(st->ingress_partial + st->ingress_partial_len, 1, need,
+                  st->input_fp);
+        if (n == 0) {
+            if (feof(st->input_fp)) {
+                if (st->ingress_partial_len > 0) {
+                    WgPipelineStatus push_st;
+
+                    push_st = push_ingress_packet(st, mgr, st->ingress_partial,
+                                                  st->ingress_partial_len);
+                    st->ingress_partial_len = 0;
+                    if (push_st != WG_PIPE_OK) {
+                        return push_st;
+                    }
+                }
+                st->ingest_done = true;
+                return WG_PIPE_OK;
+            }
+            return WG_PIPE_ERR;
+        }
+
+        st->ingress_partial_len += n;
+        if (st->ingress_partial_len < PKG_SIZE) {
+            return WG_PIPE_OK;
+        }
+
+        return push_ingress_packet(st, mgr, st->ingress_partial, PKG_SIZE);
     }
 
     n = fread(buf, 1, PKG_SIZE, st->input_fp);
@@ -196,18 +355,59 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
         return WG_PIPE_ERR;
     }
 
-    if (ingress_push(mgr, st->flow_id, buf, n) != INGRESS_PUSH_OK) {
-        return WG_PIPE_ERR;
+    if (n < PKG_SIZE) {
+        memcpy(st->ingress_partial, buf, n);
+        st->ingress_partial_len = n;
+        return WG_PIPE_OK;
     }
 
-    st->packets_pushed++;
-    return WG_PIPE_OK;
+    return push_ingress_packet(st, mgr, buf, PKG_SIZE);
+}
+
+static int buffer_has_space(CircularBuffer *buf, size_t need)
+{
+    if (buf == NULL) {
+        return 0;
+    }
+
+    return (buf->capacity - buf->size) >= need;
+}
+
+static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
+{
+    size_t per_flow_cap;
+    size_t deferred_count;
+
+    if (st == NULL || mgr == NULL) {
+        return 0;
+    }
+
+    per_flow_cap = mgr->config.per_flow_queue_capacity;
+    deferred_count = flow_manager_deferred_count(mgr, st->flow_id);
+
+    if (mixed_queue_count(&mgr->mixed) + 1 >= mgr->config.mixed_queue_capacity) {
+        return 0;
+    }
+
+    if (flow_buffer_count(&mgr->flows[st->flow_id].queue) + 1 >= per_flow_cap) {
+        return 0;
+    }
+
+    if (deferred_count + 1 >= mgr->config.mixed_queue_capacity) {
+        return 0;
+    }
+
+    return 1;
 }
 
 static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *codec,
                                                 unsigned char *work, int *progress)
 {
     while (st->post_multi_in->size >= DECODE_BLOCK) {
+        if (!buffer_has_space(st->sending_out, ENCODE_BLOCK)) {
+            break;
+        }
+
         if (Buffer_Read(st->post_multi_in, work, DECODE_BLOCK) != CB_OK) {
             return WG_PIPE_ERR;
         }
@@ -239,6 +439,10 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
     }
 
     while (st->receiver_in->size >= ENCODE_BLOCK) {
+        if (!buffer_has_space(st->receiver_out, DECODE_BLOCK)) {
+            break;
+        }
+
         if (Buffer_Read(st->receiver_in, work, ENCODE_BLOCK) != CB_OK) {
             return WG_PIPE_ERR;
         }
@@ -261,40 +465,29 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
         }
     }
 
-    if (st->ingest_done && st->sending_out->size > 0 &&
-        st->sending_out->size < ENCODE_BLOCK) {
-        if (passthrough_tail(st->sending_out, st->receiver_out) != WG_PIPE_OK) {
-            return WG_PIPE_ERR;
-        }
-        if (progress != NULL) {
-            *progress = 1;
-        }
-    }
-
-    if (st->ingest_done && st->receiver_in->size > 0 &&
-        st->receiver_in->size < ENCODE_BLOCK) {
-        if (passthrough_tail(st->receiver_in, st->receiver_out) != WG_PIPE_OK) {
-            return WG_PIPE_ERR;
-        }
-        if (progress != NULL) {
-            *progress = 1;
-        }
-    }
-
-    for (;;) {
+    {
         DrainStatus drain_st;
 
-        drain_st = FileDrain_pull_once(&st->drain, st->receiver_out, PKG_SIZE, NULL);
-        if (drain_st == DRAIN_OK) {
-            if (progress != NULL) {
-                *progress = 1;
+        for (;;) {
+            drain_st = FileDrain_pull_once(&st->drain, st->receiver_out, PKG_SIZE, NULL);
+            if (drain_st == DRAIN_OK) {
+                if (progress != NULL) {
+                    *progress = 1;
+                }
+                continue;
             }
-            continue;
+            if (drain_st == DRAIN_EMPTY) {
+                break;
+            }
+            return WG_PIPE_ERR;
         }
-        if (drain_st == DRAIN_EMPTY) {
-            break;
+
+        if (st->ingest_done && !Buffer_IsEmpty(st->receiver_out)) {
+            drain_st = FileDrain_flush_remainder(&st->drain, st->receiver_out, NULL);
+            if (drain_st == DRAIN_ERR) {
+                return WG_PIPE_ERR;
+            }
         }
-        return WG_PIPE_ERR;
     }
 
     return WG_PIPE_OK;
@@ -310,9 +503,17 @@ static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
     }
 
     for (;;) {
-        if (pipe_io_drain_to_buffer(st->pipefd[0], st->post_multi_in) <= 0) {
+        if (drain_pipe_to_post_multi(st) <= 0) {
             break;
         }
+    }
+
+    if (st->pipe_partial_len > 0) {
+        if (Buffer_Write(st->post_multi_in, st->pipe_partial,
+                         st->pipe_partial_len) != CB_OK) {
+            return WG_PIPE_ERR;
+        }
+        st->pipe_partial_len = 0;
     }
 
     return process_flow_post_multi(st, codec, work, &progress);
@@ -384,7 +585,7 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
             FlowStage *st = &stages[i];
             int        dr;
 
-            dr = pipe_io_drain_to_buffer(st->pipefd[0], st->post_multi_in);
+            dr = drain_pipe_to_post_multi(st);
             if (dr > 0) {
                 progress = 1;
             } else if (dr < 0) {
@@ -398,10 +599,16 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
             }
 
             if (!st->ingest_done) {
-                WgPipelineStatus ingest_st = pump_file_ingress(st, &mgr);
+                WgPipelineStatus ingest_st = WG_PIPE_OK;
+
+                if (flow_can_accept_ingress(st, &mgr)) {
+                    ingest_st = pump_file_ingress(st, &mgr);
+                }
 
                 if (ingest_st == WG_PIPE_OK) {
-                    progress = 1;
+                    if (flow_can_accept_ingress(st, &mgr)) {
+                        progress = 1;
+                    }
                 } else {
                     status = WG_PIPE_ERR;
                     goto cleanup_running;
@@ -712,7 +919,7 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
             FlowStage *st = &stages[i];
             int        dr;
 
-            dr = pipe_io_drain_to_buffer(st->pipefd[0], st->post_multi_in);
+            dr = drain_pipe_to_post_multi(st);
             if (dr > 0) {
                 progress = 1;
             } else if (dr < 0) {

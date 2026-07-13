@@ -78,6 +78,7 @@ cmp a.txt out_a.txt && cmp b.bin out_b.bin && cmp c.ts out_c.ts
 Automated 3-flow roundtrip: `make integration-test`.
 
 wg-obfs handoff: **[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)**.  
+Demo walkthrough (offline + FIFO live): **[docs/DEMOS.md](docs/DEMOS.md)**.  
 Testing: **[tests/TESTING.md](tests/TESTING.md)**.
 
 ## Build & test

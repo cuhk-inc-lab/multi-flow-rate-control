@@ -52,7 +52,8 @@ echo -n flow-b | nc -u -p 4002 127.0.0.1 5000
 # → /tmp/out_0.bin, /tmp/out_1.bin, ...
 ```
 
-See [tests/TESTING.md](../../tests/TESTING.md) for full coverage.
+See [tests/TESTING.md](../../tests/TESTING.md) for full coverage.  
+Step-by-step demos (offline + FIFO live): [docs/DEMOS.md](../../docs/DEMOS.md).
 
 ## Ingress: files vs UDP
 

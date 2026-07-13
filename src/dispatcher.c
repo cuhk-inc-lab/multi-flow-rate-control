@@ -1,5 +1,6 @@
 #include "dispatcher.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 
 static int deferred_init(DeferredQueue *dq, size_t capacity)
@@ -16,7 +17,7 @@ static int deferred_init(DeferredQueue *dq, size_t capacity)
     dq->capacity = capacity;
     dq->head = 0;
     dq->tail = 0;
-    dq->count = 0;
+    atomic_store(&dq->count, 0);
     return 1;
 }
 
@@ -26,11 +27,11 @@ static void deferred_destroy(DeferredQueue *dq)
         return;
     }
 
-    while (dq->count > 0) {
+    while (atomic_load(&dq->count) > 0) {
         DataPacket *pkt = dq->slots[dq->head];
 
         dq->head = (dq->head + 1) % dq->capacity;
-        dq->count--;
+        atomic_fetch_sub(&dq->count, 1);
         packet_free(pkt);
     }
 
@@ -39,18 +40,19 @@ static void deferred_destroy(DeferredQueue *dq)
     dq->capacity = 0;
     dq->head = 0;
     dq->tail = 0;
-    dq->count = 0;
+    atomic_store(&dq->count, 0);
 }
 
 static int deferred_push(DeferredQueue *dq, DataPacket *pkt)
 {
-    if (dq == NULL || pkt == NULL || dq->count >= dq->capacity) {
+    if (dq == NULL || pkt == NULL ||
+        atomic_load(&dq->count) >= dq->capacity) {
         return 0;
     }
 
     dq->slots[dq->tail] = pkt;
     dq->tail = (dq->tail + 1) % dq->capacity;
-    dq->count++;
+    atomic_fetch_add(&dq->count, 1);
     return 1;
 }
 
@@ -58,14 +60,14 @@ static DataPacket *deferred_pop(DeferredQueue *dq)
 {
     DataPacket *pkt;
 
-    if (dq == NULL || dq->count == 0) {
+    if (dq == NULL || atomic_load(&dq->count) == 0) {
         return NULL;
     }
 
     pkt = dq->slots[dq->head];
     dq->slots[dq->head] = NULL;
     dq->head = (dq->head + 1) % dq->capacity;
-    dq->count--;
+    atomic_fetch_sub(&dq->count, 1);
     return pkt;
 }
 
@@ -79,7 +81,7 @@ static int deferred_total(const FlowManager *mgr)
     }
 
     for (i = 0; i < mgr->config.max_flows; i++) {
-        total += mgr->deferred[i].count;
+        total += atomic_load(&mgr->deferred[i].count);
     }
 
     return (int)total;
@@ -127,7 +129,7 @@ static int drain_deferred(FlowManager *mgr)
         DeferredQueue *dq = &mgr->deferred[i];
         FlowContext *flow = &mgr->flows[i];
 
-        while (dq->count > 0) {
+        while (atomic_load(&dq->count) > 0) {
             DataPacket *pkt = dq->slots[dq->head];
             FlowBufferStatus fb_st;
             size_t bytes = pkt->payload_len;
@@ -243,7 +245,7 @@ int dispatcher_init_deferred(FlowManager *mgr)
     }
 
     for (i = 0; i < mgr->config.max_flows; i++) {
-        if (!deferred_init(&mgr->deferred[i], mgr->config.per_flow_queue_capacity)) {
+        if (!deferred_init(&mgr->deferred[i], mgr->config.mixed_queue_capacity)) {
             while (i > 0) {
                 i--;
                 deferred_destroy(&mgr->deferred[i]);
