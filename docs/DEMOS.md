@@ -22,22 +22,20 @@ Requires sibling repo `../buffer-management-module` (see root [README.md](../REA
 
 ## Shared pipeline logic
 
-All file/FIFO demos use the same per-flow processing order (**multi before encode**):
+All file/FIFO demos use the same per-flow order (**multi before encode** by default):
 
 ```
 ingress (188-byte TS packets)
   → ingress_push(mgr, flow_id, …)
   → FlowManager
-       MixedQueue → dispatcher → per-flow queue → paced worker
-  → pipe (raw bytes per flow)
-  → drain_pipe_to_post_multi()   # packet-aligned reads
-  → post_multi_in (CircularBuffer)
-  → BlockCodec encode  (DECODE_BLOCK → ENCODE_BLOCK)
-  → BufferTransfer_pump (full ENCODE_BLOCK chunks only)
-  → receiver_in → BlockCodec decode → receiver_out
-  → FileDrain (188-byte TS packets) → output file or FIFO
+       MixedQueue → dispatcher → per-flow queue → (optional) paced worker
+  → either:
+       A) --no-codec relay: DataPacket* queue → FileDrain_write_packet → output
+       B) default codec: pipe → CircularBuffers → BlockCodec encode/decode → FileDrain
 ```
 
+**Relay (`--no-codec`)** is preferred for live `ffplay` demos (clean TS bytes).  
+**Codec path** is for block-coding / offline `cmp` tests.
 | Concept | Value / location |
 |---------|------------------|
 | TS packet size | 188 B — `PKG_SIZE` in `apps/wg_multi_pipeline/stream_config.h` |
@@ -189,73 +187,81 @@ cmp input1.ts /tmp/captured.ts
 
 ---
 
-## Demo 3 — Multi-stream FIFO live (TS)
+## Demo 3 — Multi-bitrate FIFO live (1M / 10M / 20M)
 
-**Purpose:** Same as Demo 2, but **two or more** simultaneous TS streams (e.g.
-`input1.ts` + `input2.ts`), each on its own `flow_id`.
+**Purpose:** Three simultaneous MPEG-TS flows at clearly different bitrates
+through one `wg_multi_pipeline --multi` process. Each flow has its own
+input/output FIFO and `ffplay` window.
 
-### Scripted (multi-bitrate live)
+### Prepare sources (720p, same duration)
+
+Do **not** only change bitrate on 4K — three soft-decoded 4K windows will stutter.
+Encode 720p multi-bitrate files once:
+
+```bash
+cd /path/to/multi-flow-rate-control
+# default source: input2.ts (or pass another .ts/.mp4)
+./scripts/encode_multibitrate.sh
+# → input_1m.ts  (~1 Mbps)
+# → input_10m.ts (~10 Mbps)
+# → input_20m.ts (~20 Mbps)
+```
+
+Optional: `DURATION=60 ./scripts/encode_multibitrate.sh source.mp4 .`
+
+### Scripted demo
 
 ```bash
 killall ffmpeg ffplay wg_multi_pipeline 2>/dev/null
 cd /path/to/multi-flow-rate-control
+make wg-demo
 ./scripts/run_dual_fifo.sh
 ```
 
-Expects `input_1m.ts`, `input_10m.ts`, and `input_20m.ts` in the repo root
-(or pass a directory as argument). Opens **three** `ffplay` windows and pushes
-each file with `ffmpeg -re` (realtime), same order as the old dual demo:
-player → pipeline → ffmpeg.
+What the script does:
 
-### Manual (dual stream)
+1. Opens **three** `ffplay` windows (`1Mbps` / `10Mbps` / `20Mbps`)
+2. Starts `./build/wg_multi_pipeline --no-pace --no-codec --multi …`
+3. Pushes all three files with `ffmpeg -re` (realtime)
 
-**Step 1 — FIFOs + players:**
+Behaviour:
 
-```bash
-killall ffmpeg ffplay wg_multi_pipeline 2>/dev/null
-rm -f /tmp/live_in0.ts /tmp/live_in1.ts /tmp/live_out0.ts /tmp/live_out1.ts
-mkfifo /tmp/live_in0.ts /tmp/live_in1.ts /tmp/live_out0.ts /tmp/live_out1.ts
+| Action | Result |
+|--------|--------|
+| Close **one** player window | That flow’s output is dropped; **other windows keep playing** |
+| Close **all three** windows | Demo shuts down (players / pushers / pipeline) |
+| Let files finish | Natural end when all `ffmpeg -re` exits |
+| `Ctrl+C` | Cleanup trap stops everything |
 
-ffplay -loglevel error -f mpegts /tmp/live_out0.ts   # window 0
-ffplay -loglevel error -f mpegts /tmp/live_out1.ts   # window 1 (second terminal)
-```
+Why `--no-pace --no-codec` for live playback:
 
-**Step 2 — pipeline:**
+- `ffmpeg -re` already paces realtime; pipeline pacing on top causes stutter under 3-flow load
+- BlockCodec alters/transfers via pipes; live `ffplay` needs clean TS bytes (`--no-codec` relay)
 
-```bash
-./build/wg_multi_pipeline --multi \
-  /tmp/live_in0.ts /tmp/live_out0.ts \
-  /tmp/live_in1.ts /tmp/live_out1.ts
-```
-
-**Step 3 — push (one ffmpeg per flow, stagger starts):**
+### Manual (same idea)
 
 ```bash
-ffmpeg -re -i input1.ts -c copy -f mpegts -y /tmp/live_in0.ts
-ffmpeg -re -i input2.ts -c copy -f mpegts -y /tmp/live_in1.ts
-```
-
-### Three or more streams
-
-Add one `in out` FIFO pair per flow; one `ffplay` and one `ffmpeg` per stream:
-
-```bash
-./build/wg_multi_pipeline --multi \
+# Players → pipeline → ffmpeg (order matters)
+./build/wg_multi_pipeline --no-pace --no-codec --multi \
   /tmp/live_in0.ts /tmp/live_out0.ts \
   /tmp/live_in1.ts /tmp/live_out1.ts \
   /tmp/live_in2.ts /tmp/live_out2.ts
+
+ffmpeg -re -i input_1m.ts  -c copy -f mpegts -y /tmp/live_in0.ts &
+ffmpeg -re -i input_10m.ts -c copy -f mpegts -y /tmp/live_in1.ts &
+ffmpeg -re -i input_20m.ts -c copy -f mpegts -y /tmp/live_in2.ts &
 ```
 
 ### Implementation notes
 
-- Same per-flow pipeline as Demo 2; `wg_pipeline_run()` loops all stages each tick.
-- `FlowManager` multiplexes all flows through `MixedQueue` → dispatcher → per-flow
-  workers; each worker writes to its own pipe.
-- Lazy input open is required for `--multi` so opening `live_in1` does not block
-  before `live_in0` has a writer.
+- Multi-flow **workers run in parallel** (one pthread per flow + dispatcher).
+- FIFO ingress uses non-blocking open/`read` so one stuck pipe does not freeze others.
+- Named-pipe inputs use `O_RDWR|O_NONBLOCK` so writers can connect without deadlocking the main loop.
+- Closing a viewer marks that flow `output_dead`; remaining flows continue (`SIGPIPE` ignored).
+- All outputs closed → pipeline exits with `all outputs closed; exiting`.
 
-**Key code:** `wg_pipeline_run()` main loop over `config->flow_count` stages;
-`scripts/run_dual_fifo.sh` for orchestration.
+**Key code:** `ensure_input_open()` / `pump_file_ingress()`, `process_flow_relay()`,
+`mark_output_dead()`; `scripts/run_dual_fifo.sh`, `scripts/encode_multibitrate.sh`.
 
 ---
 
@@ -264,11 +270,14 @@ Add one `in out` FIFO pair per flow; one `ffplay` and one `ffmpeg` per stream:
 | Symptom | Likely cause | Fix |
 |---------|----------------|-----|
 | Pipeline hangs on start | Output FIFO has no reader | Start `ffplay` (or `cat > file`) **before** pipeline |
-| Pipeline hangs in `--multi` | Input FIFO has no writer | Start `ffmpeg` **after** pipeline; inputs open lazily |
+| Pipeline hangs in `--multi` | Input FIFO open blocked other flows (old bug) | Rebuild; current code uses non-blocking FIFO ingest |
+| Only one window / others never start | 4K soft-decode overload or blocking FIFO open | Use 720p `input_*m.ts`; rebuild latest pipeline |
+| Stutter with 3 live windows | Double pacing (`-re` + pipeline pacing) or codec path | Script uses `--no-pace --no-codec` |
+| ffplay H264 “Missing reference” at start | Joined mid-GOP / low-delay | Benign for live FIFO; script quiets player logs |
+| Close one window → all stop | Old: one `FileDrain` error aborted whole run | Rebuild; per-flow `output_dead` keeps others alive |
+| Close all windows → process hangs | Script waited only on `ffmpeg` | Current script polls players and exits when all closed |
 | `ffmpeg` / `ffplay` Stopped (`jobs`) | Previous FIFO clients stuck | `killall ffmpeg ffplay wg_multi_pipeline` |
-| ffplay `changing packet size` / `Packet corrupt` | Corrupted or misaligned TS | Rebuild latest code; ensure 188-byte packet alignment |
-| Black screen, no error | Wrong order or no `ffmpeg` | Follow player → pipeline → ffmpeg |
-| `cmp` fails on large files | Old buffer/alignment bugs | Use current `stream_config.h` buffer sizes; `--no-pace` |
+| `cmp` fails on large files | Old buffer/alignment bugs | Use current `stream_config.h` sizes; `--no-pace` |
 
 ### Clean reset
 
@@ -285,7 +294,7 @@ rm -f /tmp/live_in*.ts /tmp/live_out*.ts
 |------|---------|--------|--------|
 | 1 Offline multi-file | Regular files | Regular files | `cmp` |
 | 2 Single FIFO live | FIFO ← `ffmpeg -re` | FIFO → `ffplay` | Playback |
-| 3 Multi FIFO live | N FIFOs ← N `ffmpeg` | N FIFOs → N `ffplay` | Playback |
+| 3 Multi-bitrate FIFO | 3 FIFOs ← 1M/10M/20M | 3 × `ffplay` | Playback + independent close |
 
 ---
 
@@ -293,12 +302,13 @@ rm -f /tmp/live_in*.ts /tmp/live_out*.ts
 
 | File | Role |
 |------|------|
-| `apps/wg_multi_pipeline/main.c` | CLI: `--multi`, `--no-pace`, file pairs |
-| `apps/wg_multi_pipeline/pipeline.c` | Main loop, FIFO ingress, post-multi codec chain |
+| `apps/wg_multi_pipeline/main.c` | CLI: `--multi`, `--no-pace`, `--no-codec`; ignores `SIGPIPE` |
+| `apps/wg_multi_pipeline/pipeline.c` | Main loop, non-blocking FIFO ingress, relay/`output_dead` |
 | `apps/wg_multi_pipeline/block_codec.c` | Reversible encode/decode transform |
 | `apps/wg_multi_pipeline/buffer_transfer.c` | Full-block pump between encode buffers |
-| `apps/wg_multi_pipeline/file_drain.c` | TS packet write to file/FIFO |
+| `apps/wg_multi_pipeline/file_drain.c` | TS / packet write to file/FIFO |
 | `apps/wg_multi_pipeline/stream_config.h` | Packet/block sizes, buffer capacities |
-| `scripts/run_dual_fifo.sh` | Three-stream FIFO live (1M / 10M / 20M) |
+| `scripts/run_dual_fifo.sh` | Three-stream live demo (1M / 10M / 20M) |
+| `scripts/encode_multibitrate.sh` | Encode 720p `input_{1,10,20}m.ts` |
 | `src/flow_manager.c` | Multi-flow queueing and worker lifecycle |
 | `src/dispatcher.c` | Mixed queue → per-flow routing |

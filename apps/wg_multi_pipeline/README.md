@@ -26,9 +26,13 @@ cmp c.ts  out_c.ts
 
 | Flag | Meaning |
 |------|---------|
-| `--no-pace` | Disable pacing; byte-exact output for `cmp` (recommended for tests) |
+| `--no-pace` | Disable pacing; byte-exact output for `cmp` (recommended for tests / live with `-re`) |
+| `--no-codec` | Relay mode: pointer-only post-worker queue, fwrite at send (best for live `ffplay`) |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
-| (default) | Pacing enabled — timeline rate-matching per flow |
+| (default) | Pacing + BlockCodec path |
+
+**Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  
+(`scripts/run_dual_fifo.sh` + `scripts/encode_multibitrate.sh`).
 
 **Single flow:**
 

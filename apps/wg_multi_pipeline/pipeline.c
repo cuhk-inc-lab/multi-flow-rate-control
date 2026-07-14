@@ -16,12 +16,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,6 +37,7 @@ typedef struct FlowStage {
     char                input_path[512];
     FileDrain           drain;
     bool                relay_mode;
+    bool                output_dead;
     FlowCircularBuffer  post_multi_pkts;
     CircularBuffer     *post_multi_in;
     CircularBuffer     *sending_out;
@@ -200,8 +203,29 @@ static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
            flow_queues_drained(mgr, st->flow_id);
 }
 
+static int input_is_fifo(const FlowStage *st)
+{
+    struct stat stbuf;
+
+    if (st == NULL || st->input_path[0] == '\0') {
+        return 0;
+    }
+    if (stat(st->input_path, &stbuf) != 0) {
+        return 0;
+    }
+    return S_ISFIFO(stbuf.st_mode);
+}
+static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr);
+static void mark_output_dead(FlowStage *st);
+
 static WgPipelineStatus ensure_input_open(FlowStage *st)
 {
+    int         fd;
+    int         flags;
+    int         oflags;
+    FILE       *fp;
+    struct stat stbuf;
+
     if (st == NULL || st->input_path[0] == '\0') {
         return WG_PIPE_ERR;
     }
@@ -210,12 +234,61 @@ static WgPipelineStatus ensure_input_open(FlowStage *st)
         return WG_PIPE_OK;
     }
 
-    st->input_fp = fopen(st->input_path, "rb");
-    if (st->input_fp == NULL) {
+    /*
+     * Regular files: O_RDONLY is fine; EOF ends the flow.
+     * FIFOs: use O_RDWR|O_NONBLOCK so (1) open never blocks the multi-flow
+     * main loop, (2) a writer side exists so peer ffmpeg open() can complete,
+     * (3) idle reads return EAGAIN instead of false EOF.
+     */
+    oflags = O_RDONLY | O_NONBLOCK;
+    if (stat(st->input_path, &stbuf) == 0 && S_ISFIFO(stbuf.st_mode)) {
+        oflags = O_RDWR | O_NONBLOCK;
+    }
+
+    do {
+        fd = open(st->input_path, oflags);
+    } while (fd < 0 && errno == EINTR);
+
+    if (fd < 0) {
+        if (errno == ENXIO || errno == EAGAIN || errno == EWOULDBLOCK ||
+            errno == EINTR) {
+            return WG_PIPE_OK;
+        }
         return WG_PIPE_ERR;
     }
 
+    flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    fp = fdopen(fd, "rb");
+    if (fp == NULL) {
+        close(fd);
+        return WG_PIPE_ERR;
+    }
+
+    setvbuf(fp, NULL, _IONBF, 0);
+    st->input_fp = fp;
     return WG_PIPE_OK;
+}
+
+static ssize_t read_input_nb(FlowStage *st, unsigned char *buf, size_t len)
+{
+    ssize_t n;
+    int     fd;
+
+    if (st == NULL || st->input_fp == NULL || buf == NULL || len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    fd = fileno(st->input_fp);
+    do {
+        n = read(fd, buf, len);
+    } while (n < 0 && errno == EINTR);
+
+    return n;
 }
 
 static int drain_pipe_to_post_multi(FlowStage *st)
@@ -327,7 +400,9 @@ static WgPipelineStatus push_ingress_packet(FlowStage *st, FlowManager *mgr,
 static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
 {
     unsigned char buf[PKG_SIZE];
-    size_t        n;
+    ssize_t       n;
+    int           pumped = 0;
+    const int     max_pkts = 64;
 
     if (st == NULL || mgr == NULL) {
         return WG_PIPE_ERR;
@@ -337,13 +412,31 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
         return WG_PIPE_ERR;
     }
 
-    if (st->ingress_partial_len > 0) {
-        size_t need = PKG_SIZE - st->ingress_partial_len;
+    /* Writer not connected yet (FIFO); keep other flows progressing. */
+    if (st->input_fp == NULL) {
+        return WG_PIPE_OK;
+    }
 
-        n = fread(st->ingress_partial + st->ingress_partial_len, 1, need,
-                  st->input_fp);
-        if (n == 0) {
-            if (feof(st->input_fp)) {
+    while (pumped < max_pkts && !st->ingest_done) {
+        if (!flow_can_accept_ingress(st, mgr)) {
+            break;
+        }
+
+        if (st->ingress_partial_len > 0) {
+            size_t need = PKG_SIZE - st->ingress_partial_len;
+
+            n = read_input_nb(st, st->ingress_partial + st->ingress_partial_len,
+                              need);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return WG_PIPE_OK;
+                }
+                return WG_PIPE_ERR;
+            }
+            if (n == 0) {
+                if (input_is_fifo(st)) {
+                    return WG_PIPE_OK;
+                }
                 if (st->ingress_partial_len > 0) {
                     WgPipelineStatus push_st;
 
@@ -357,33 +450,54 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
                 st->ingest_done = true;
                 return WG_PIPE_OK;
             }
+
+            st->ingress_partial_len += (size_t)n;
+            if (st->ingress_partial_len < PKG_SIZE) {
+                return WG_PIPE_OK;
+            }
+
+            {
+                WgPipelineStatus push_st;
+
+                push_st = push_ingress_packet(st, mgr, st->ingress_partial,
+                                              PKG_SIZE);
+                st->ingress_partial_len = 0;
+                if (push_st != WG_PIPE_OK) {
+                    return push_st;
+                }
+                pumped++;
+                continue;
+            }
+        }
+
+        n = read_input_nb(st, buf, PKG_SIZE);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return WG_PIPE_OK;
+            }
             return WG_PIPE_ERR;
         }
-
-        st->ingress_partial_len += n;
-        if (st->ingress_partial_len < PKG_SIZE) {
-            return WG_PIPE_OK;
-        }
-
-        return push_ingress_packet(st, mgr, st->ingress_partial, PKG_SIZE);
-    }
-
-    n = fread(buf, 1, PKG_SIZE, st->input_fp);
-    if (n == 0) {
-        if (feof(st->input_fp)) {
+        if (n == 0) {
+            if (input_is_fifo(st)) {
+                return WG_PIPE_OK;
+            }
             st->ingest_done = true;
             return WG_PIPE_OK;
         }
-        return WG_PIPE_ERR;
+
+        if ((size_t)n < PKG_SIZE) {
+            memcpy(st->ingress_partial, buf, (size_t)n);
+            st->ingress_partial_len = (size_t)n;
+            return WG_PIPE_OK;
+        }
+
+        if (push_ingress_packet(st, mgr, buf, PKG_SIZE) != WG_PIPE_OK) {
+            return WG_PIPE_ERR;
+        }
+        pumped++;
     }
 
-    if (n < PKG_SIZE) {
-        memcpy(st->ingress_partial, buf, n);
-        st->ingress_partial_len = n;
-        return WG_PIPE_OK;
-    }
-
-    return push_ingress_packet(st, mgr, buf, PKG_SIZE);
+    return WG_PIPE_OK;
 }
 
 static int buffer_has_space(CircularBuffer *buf, size_t need)
@@ -494,6 +608,25 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
     {
         DrainStatus drain_st;
 
+        if (st->output_dead) {
+            /* Drop decoded bytes for closed viewers. */
+            while (!Buffer_IsEmpty(st->receiver_out)) {
+                unsigned char discard[PKG_SIZE];
+                size_t        n = st->receiver_out->size;
+
+                if (n > sizeof(discard)) {
+                    n = sizeof(discard);
+                }
+                if (Buffer_Read(st->receiver_out, discard, n) != CB_OK) {
+                    break;
+                }
+                if (progress != NULL) {
+                    *progress = 1;
+                }
+            }
+            return WG_PIPE_OK;
+        }
+
         for (;;) {
             drain_st = FileDrain_pull_once(&st->drain, st->receiver_out, PKG_SIZE, NULL);
             if (drain_st == DRAIN_OK) {
@@ -505,18 +638,32 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
             if (drain_st == DRAIN_EMPTY) {
                 break;
             }
-            return WG_PIPE_ERR;
+            mark_output_dead(st);
+            break;
         }
 
-        if (st->ingest_done && !Buffer_IsEmpty(st->receiver_out)) {
+        if (!st->output_dead && st->ingest_done &&
+            !Buffer_IsEmpty(st->receiver_out)) {
             drain_st = FileDrain_flush_remainder(&st->drain, st->receiver_out, NULL);
             if (drain_st == DRAIN_ERR) {
-                return WG_PIPE_ERR;
+                mark_output_dead(st);
             }
         }
     }
 
     return WG_PIPE_OK;
+}
+
+static void mark_output_dead(FlowStage *st)
+{
+    if (st == NULL || st->output_dead) {
+        return;
+    }
+
+    st->output_dead = true;
+    FileDrain_close(&st->drain);
+    fprintf(stderr, "flow %u: output closed; continuing other flows\n",
+            st->flow_id);
 }
 
 static WgPipelineStatus process_flow_relay(FlowStage *st, int *progress)
@@ -538,10 +685,20 @@ static WgPipelineStatus process_flow_relay(FlowStage *st, int *progress)
             return WG_PIPE_ERR;
         }
 
+        if (st->output_dead) {
+            packet_free(pkt);
+            if (progress != NULL) {
+                *progress = 1;
+            }
+            continue;
+        }
+
         drain_st = FileDrain_write_packet(&st->drain, pkt, NULL);
         packet_free(pkt);
         if (drain_st != DRAIN_OK) {
-            return WG_PIPE_ERR;
+            /* Viewer closed this window — drop this flow's egress, keep others. */
+            mark_output_dead(st);
+            continue;
         }
 
         if (progress != NULL) {
@@ -697,12 +854,20 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
 
         {
             bool all_done = true;
+            bool all_outputs_closed = true;
 
             for (i = 0; i < config->flow_count; i++) {
+                if (!stages[i].output_dead) {
+                    all_outputs_closed = false;
+                }
                 if (!flow_stage_quiescent(&stages[i], &mgr)) {
                     all_done = false;
-                    break;
                 }
+            }
+
+            if (all_outputs_closed) {
+                fprintf(stderr, "all outputs closed; exiting\n");
+                break;
             }
 
             if (all_done) {

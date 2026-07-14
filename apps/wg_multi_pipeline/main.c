@@ -1,5 +1,6 @@
 #include "pipeline.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,9 @@ int main(int argc, char **argv)
     int pacing = 1;
     int codec = 1;
     int argi = 1;
+
+    /* Closing one ffplay must not kill the whole multi-flow process. */
+    signal(SIGPIPE, SIG_IGN);
 
     if (argc < 3) {
         print_usage(argv[0]);
