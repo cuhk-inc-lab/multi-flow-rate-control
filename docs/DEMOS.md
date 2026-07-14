@@ -194,7 +194,7 @@ cmp input1.ts /tmp/captured.ts
 **Purpose:** Same as Demo 2, but **two or more** simultaneous TS streams (e.g.
 `input1.ts` + `input2.ts`), each on its own `flow_id`.
 
-### Scripted (dual stream)
+### Scripted (multi-bitrate live)
 
 ```bash
 killall ffmpeg ffplay wg_multi_pipeline 2>/dev/null
@@ -202,8 +202,10 @@ cd /path/to/multi-flow-rate-control
 ./scripts/run_dual_fifo.sh
 ```
 
-Expects `input1.ts` and `input2.ts` in the repo root (or pass a directory as
-argument). Opens two `ffplay` windows.
+Expects `input_1m.ts`, `input_10m.ts`, and `input_20m.ts` in the repo root
+(or pass a directory as argument). Opens **three** `ffplay` windows and pushes
+each file with `ffmpeg -re` (realtime), same order as the old dual demo:
+player → pipeline → ffmpeg.
 
 ### Manual (dual stream)
 
@@ -297,6 +299,6 @@ rm -f /tmp/live_in*.ts /tmp/live_out*.ts
 | `apps/wg_multi_pipeline/buffer_transfer.c` | Full-block pump between encode buffers |
 | `apps/wg_multi_pipeline/file_drain.c` | TS packet write to file/FIFO |
 | `apps/wg_multi_pipeline/stream_config.h` | Packet/block sizes, buffer capacities |
-| `scripts/run_dual_fifo.sh` | Dual-stream FIFO orchestration |
+| `scripts/run_dual_fifo.sh` | Three-stream FIFO live (1M / 10M / 20M) |
 | `src/flow_manager.c` | Multi-flow queueing and worker lifecycle |
 | `src/dispatcher.c` | Mixed queue → per-flow routing |
