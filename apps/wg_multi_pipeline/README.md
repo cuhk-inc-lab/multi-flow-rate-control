@@ -26,13 +26,13 @@ cmp c.ts  out_c.ts
 
 | Flag | Meaning |
 |------|---------|
-| `--no-pace` | Disable pacing; byte-exact output for `cmp` (recommended for tests / live with `-re`) |
-| `--no-codec` | Relay mode: pointer-only post-worker queue, fwrite at send (best for live `ffplay`) |
+| `--no-pace` | Disable pacing; byte-exact for `cmp`; live scripts use this with `ffmpeg -re` |
+| `--no-codec` | Optional relay: skip BlockCodec; pointer-only post-worker queue |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
-| (default) | Pacing + BlockCodec path |
+| (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
 **Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  
-(`scripts/run_dual_fifo.sh` + `scripts/encode_multibitrate.sh`).
+(`scripts/run_dual_fifo.sh` uses `--no-pace --multi` with BlockCodec enabled).
 
 **Single flow:**
 
@@ -97,7 +97,10 @@ Integration handoff details: [docs/INTEGRATION_BOUNDARIES.md](../../docs/INTEGRA
 
 ```
 ingress (flow_id or 5-tuple)
-  → FlowManager (MixedQueue → per-flow queues → pacing)
-  → raw bytes (pipe per flow)
-  → BlockCodec encode → buffer transfer → decode → output file
+  → FlowManager (MixedQueue → per-flow queues → optional pacing)
+  → either:
+       A) default: pipe → BlockCodec encode → transfer → decode → output
+       B) --no-codec: DataPacket* queue → FileDrain_write_packet → output
 ```
+
+BlockCodec is a demo encode/decode transform only — not cryptographic encryption.

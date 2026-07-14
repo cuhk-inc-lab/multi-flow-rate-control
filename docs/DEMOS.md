@@ -30,12 +30,19 @@ ingress (188-byte TS packets)
   → FlowManager
        MixedQueue → dispatcher → per-flow queue → (optional) paced worker
   → either:
-       A) --no-codec relay: DataPacket* queue → FileDrain_write_packet → output
-       B) default codec: pipe → CircularBuffers → BlockCodec encode/decode → FileDrain
+       A) default: pipe → CircularBuffers → BlockCodec encode/decode → FileDrain
+       B) --no-codec relay: DataPacket* queue → FileDrain_write_packet → output
 ```
 
-**Relay (`--no-codec`)** is preferred for live `ffplay` demos (clean TS bytes).  
-**Codec path** is for block-coding / offline `cmp` tests.
+**BlockCodec is not encryption.** It is a reversible demo transform (per-byte
+`+/-` in `block_codec.c`) so you can exercise encode → transfer → decode. The
+output after decode should match the original payload for offline `cmp`.
+
+| Path | When | What |
+|------|------|------|
+| Default (codec on) | Demo 1, Demo 3 live script, `make integration-test` | Full BlockCodec encode/decode |
+| `--no-codec` | Optional relay | Skip BlockCodec; pointer-only pass-through |
+
 | Concept | Value / location |
 |---------|------------------|
 | TS packet size | 188 B — `PKG_SIZE` in `apps/wg_multi_pipeline/stream_config.h` |
@@ -49,9 +56,10 @@ ingress (188-byte TS packets)
 
 | Flag | Meaning |
 |------|---------|
-| `--no-pace` | Disable timeline pacing; byte-exact roundtrip for `cmp` |
-| `--multi` | Multiple `input output` pairs (required for 2+ offline/FIFO flows) |
-| (default) | Pacing enabled — closer to live rate matching |
+| `--no-pace` | Disable timeline pacing (needed for `cmp`; live demos use it because `ffmpeg -re` already paces) |
+| `--no-codec` | Skip BlockCodec; relay only (not used by Demo 3 script) |
+| `--multi` | Multiple `input output` pairs (required for 2+ flows) |
+| (default) | Pacing **on** + BlockCodec **on** |
 
 File extensions (`.ts`, `.bin`, `.txt`, …) are ignored; all inputs are raw bytes.
 For MPEG-TS demos, inputs should be multiples of 188 bytes per packet.
@@ -191,7 +199,8 @@ cmp input1.ts /tmp/captured.ts
 
 **Purpose:** Three simultaneous MPEG-TS flows at clearly different bitrates
 through one `wg_multi_pipeline --multi` process. Each flow has its own
-input/output FIFO and `ffplay` window.
+input/output FIFO and `ffplay` window. The script runs with **BlockCodec on**
+(demo encode/decode, not encryption) and `--no-pace` (realtime from `ffmpeg -re`).
 
 ### Prepare sources (720p, same duration)
 
@@ -221,8 +230,17 @@ make wg-demo
 What the script does:
 
 1. Opens **three** `ffplay` windows (`1Mbps` / `10Mbps` / `20Mbps`)
-2. Starts `./build/wg_multi_pipeline --no-pace --no-codec --multi …`
+2. Starts `./build/wg_multi_pipeline --no-pace --multi …`
+   (BlockCodec **on**: reversible per-byte `+/-` encode/decode — **not** crypto)
 3. Pushes all three files with `ffmpeg -re` (realtime)
+
+**Per-flow path in this demo:**
+
+```
+FIFO in → multi-flow split → paced-disabled worker → pipe
+       → BlockCodec encode → buffer transfer → BlockCodec decode
+       → FIFO out → ffplay
+```
 
 Behaviour:
 
@@ -233,16 +251,18 @@ Behaviour:
 | Let files finish | Natural end when all `ffmpeg -re` exits |
 | `Ctrl+C` | Cleanup trap stops everything |
 
-Why `--no-pace --no-codec` for live playback:
+Why `--no-pace` (codec stays **enabled**):
 
 - `ffmpeg -re` already paces realtime; pipeline pacing on top causes stutter under 3-flow load
-- BlockCodec alters/transfers via pipes; live `ffplay` needs clean TS bytes (`--no-codec` relay)
+- BlockCodec remains so each flow exercises encode → transfer → decode before display
+
+Optional: add `--no-codec` for pointer-only relay (no BlockCodec).
 
 ### Manual (same idea)
 
 ```bash
 # Players → pipeline → ffmpeg (order matters)
-./build/wg_multi_pipeline --no-pace --no-codec --multi \
+./build/wg_multi_pipeline --no-pace --multi \
   /tmp/live_in0.ts /tmp/live_out0.ts \
   /tmp/live_in1.ts /tmp/live_out1.ts \
   /tmp/live_in2.ts /tmp/live_out2.ts
@@ -260,8 +280,8 @@ ffmpeg -re -i input_20m.ts -c copy -f mpegts -y /tmp/live_in2.ts &
 - Closing a viewer marks that flow `output_dead`; remaining flows continue (`SIGPIPE` ignored).
 - All outputs closed → pipeline exits with `all outputs closed; exiting`.
 
-**Key code:** `ensure_input_open()` / `pump_file_ingress()`, `process_flow_relay()`,
-`mark_output_dead()`; `scripts/run_dual_fifo.sh`, `scripts/encode_multibitrate.sh`.
+**Key code:** `ensure_input_open()` / `pump_file_ingress()`, `process_flow_post_multi()` /
+`BlockCodec`, `mark_output_dead()`; `scripts/run_dual_fifo.sh`, `scripts/encode_multibitrate.sh`.
 
 ---
 
@@ -272,7 +292,8 @@ ffmpeg -re -i input_20m.ts -c copy -f mpegts -y /tmp/live_in2.ts &
 | Pipeline hangs on start | Output FIFO has no reader | Start `ffplay` (or `cat > file`) **before** pipeline |
 | Pipeline hangs in `--multi` | Input FIFO open blocked other flows (old bug) | Rebuild; current code uses non-blocking FIFO ingest |
 | Only one window / others never start | 4K soft-decode overload or blocking FIFO open | Use 720p `input_*m.ts`; rebuild latest pipeline |
-| Stutter with 3 live windows | Double pacing (`-re` + pipeline pacing) or codec path | Script uses `--no-pace --no-codec` |
+| Stutter with 3 live windows | Double pacing (`-re` + pipeline pacing) | Script uses `--no-pace` (codec still on) |
+| Live decode glitches with codec | Pipe/backpressure under load | Prefer 720p sources; rebuild latest FIFO fixes; or try `--no-codec` for relay-only |
 | ffplay H264 “Missing reference” at start | Joined mid-GOP / low-delay | Benign for live FIFO; script quiets player logs |
 | Close one window → all stop | Old: one `FileDrain` error aborted whole run | Rebuild; per-flow `output_dead` keeps others alive |
 | Close all windows → process hangs | Script waited only on `ffmpeg` | Current script polls players and exits when all closed |
@@ -294,7 +315,7 @@ rm -f /tmp/live_in*.ts /tmp/live_out*.ts
 |------|---------|--------|--------|
 | 1 Offline multi-file | Regular files | Regular files | `cmp` |
 | 2 Single FIFO live | FIFO ← `ffmpeg -re` | FIFO → `ffplay` | Playback |
-| 3 Multi-bitrate FIFO | 3 FIFOs ← 1M/10M/20M | 3 × `ffplay` | Playback + independent close |
+| 3 Multi-bitrate FIFO | 3 FIFOs ← 1M/10M/20M | 3 × `ffplay` | Playback + BlockCodec + independent close |
 
 ---
 
@@ -304,11 +325,11 @@ rm -f /tmp/live_in*.ts /tmp/live_out*.ts
 |------|------|
 | `apps/wg_multi_pipeline/main.c` | CLI: `--multi`, `--no-pace`, `--no-codec`; ignores `SIGPIPE` |
 | `apps/wg_multi_pipeline/pipeline.c` | Main loop, non-blocking FIFO ingress, relay/`output_dead` |
-| `apps/wg_multi_pipeline/block_codec.c` | Reversible encode/decode transform |
+| `apps/wg_multi_pipeline/block_codec.c` | Demo BlockCodec: reversible `+/-` (not encryption) |
 | `apps/wg_multi_pipeline/buffer_transfer.c` | Full-block pump between encode buffers |
 | `apps/wg_multi_pipeline/file_drain.c` | TS / packet write to file/FIFO |
 | `apps/wg_multi_pipeline/stream_config.h` | Packet/block sizes, buffer capacities |
-| `scripts/run_dual_fifo.sh` | Three-stream live demo (1M / 10M / 20M) |
+| `scripts/run_dual_fifo.sh` | Three-stream live: `--no-pace --multi` + BlockCodec |
 | `scripts/encode_multibitrate.sh` | Encode 720p `input_{1,10,20}m.ts` |
 | `src/flow_manager.c` | Multi-flow queueing and worker lifecycle |
 | `src/dispatcher.c` | Mixed queue → per-flow routing |

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Three-stream FIFO live demo — same structure as the old dual-stream script,
-# plus a third flow. Requires 720p input_1m/10m/20m.ts (not 4K).
+# Three-stream FIFO live demo — 1M / 10M / 20M through one --multi process.
+# Requires 720p input_1m/10m/20m.ts (see scripts/encode_multibitrate.sh).
+#
+# Pipeline: --no-pace --multi with BlockCodec encode/decode enabled
+# (reversible +/- transform — not encryption). ffmpeg -re provides pacing.
 #
 # Usage: ./scripts/run_dual_fifo.sh [dir_with_input_*m.ts]
 # Close one window → others keep playing. Close all three → demo exits.
@@ -54,8 +57,8 @@ ffplay -loglevel quiet -an \
 FF2_PID=$!
 sleep 1
 
-echo "=== 2/4 pipeline --multi (background) ==="
-"$BIN" --no-pace --no-codec --multi \
+echo "=== 2/4 pipeline --multi (background, BlockCodec encode/decode) ==="
+"$BIN" --no-pace --multi \
     "$IN0" "$OUT0" \
     "$IN1" "$OUT1" \
     "$IN2" "$OUT2" &
@@ -71,6 +74,7 @@ ffmpeg -loglevel quiet -re -i "$SRC_DIR/input_20m.ts" -c copy -f mpegts -y "$IN2
 FFM2_PID=$!
 
 echo "=== 4/4 streaming… (Ctrl+C or close all windows to stop) ==="
+echo "Path: multi-flow split → BlockCodec encode/decode → three ffplay windows."
 
 # Exit when all players are gone, or all pushers finished (natural end).
 while true; do
