@@ -60,6 +60,10 @@ echo -n flow-b | nc -u -p 4002 127.0.0.1 5000
 # outputs: /tmp/out_0.bin, /tmp/out_1.bin, ...
 ```
 
+The UDP server remains running after an idle timeout. `--idle-sec` closes and
+flushes only the idle flow's current segment; the next packet for that tuple
+starts a new segment.
+
 File demo uses `ingress_push(mgr, flow_id, data, len)` instead.
 
 ---

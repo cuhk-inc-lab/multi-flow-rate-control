@@ -130,6 +130,15 @@ DrainStatus FileDrain_write_packet(FileDrain *drain, const DataPacket *pkt,
     return DRAIN_OK;
 }
 
+DrainStatus FileDrain_flush(FileDrain *drain)
+{
+    if (drain == NULL || drain->fp == NULL) {
+        return DRAIN_ERR;
+    }
+
+    return fflush(drain->fp) == 0 ? DRAIN_OK : DRAIN_ERR;
+}
+
 void FileDrain_close(FileDrain *drain)
 {
     if (drain == NULL) {

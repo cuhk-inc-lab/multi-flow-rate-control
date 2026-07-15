@@ -92,8 +92,9 @@ make test    # runs test_flow_peer_map in run_tests.c
 `test_flow_peer_map` checks that different source IPs, or the same source with
 different destination ports, map to different slots.
 
-**End-to-end UDP pipeline:** not wired in `wg_multi_pipeline` yet. There is no
-`recvfrom` loop in the demo binary. Production / wg-obfs glue should call:
+**End-to-end UDP pipeline:** `wg_multi_pipeline --udp` binds a UDP socket,
+routes each received datagram by its 5-tuple, and runs the normal pipeline.
+For direct library integration, the equivalent ingress call is:
 
 ```c
 FlowTuple tuple;
@@ -102,6 +103,10 @@ ingress_push_tuple(mgr, peer_map, &tuple, payload, len);
 ```
 
 where `src` comes from `recvfrom` and `dst` is the local socket bind address.
+
+The UDP demo treats `--idle-sec` as a per-flow segment boundary: it drains and
+zero-pads a partial final codec block, then keeps the socket open for a later
+segment from the same tuple.
 
 The **multi-file demo** mocks UDP by assigning a fixed `flow_id` per input path
 (`ingress_push(mgr, flow_id, …)`), so the rest of the pipeline is the same as after

@@ -75,6 +75,9 @@ cmp a.txt out_a.txt && cmp b.bin out_b.bin && cmp c.ts out_c.ts
 ./build/wg_multi_pipeline --no-pace --udp 5000 /tmp/out_ --idle-sec 3
 ```
 
+In UDP mode, `--idle-sec` flushes an idle flow segment while the server keeps
+listening; a later packet for that flow begins a new segment.
+
 Automated 3-flow roundtrip: `make integration-test`.
 
 wg-obfs handoff: **[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)**.  

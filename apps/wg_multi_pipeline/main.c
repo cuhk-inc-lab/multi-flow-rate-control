@@ -20,7 +20,7 @@ static void print_usage(const char *prog)
             "--no-codec: relay mode — pointer-only post-pacing queue, fwrite at send time\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>0.bin, ...\n"
-            "     Stop after --idle-sec (default 3) with no packets.\n"
+            "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
             "\n"
             "Verify file mode: cmp <input.ts> <output.ts>\n",
             prog, prog, prog);

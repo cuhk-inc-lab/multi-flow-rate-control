@@ -45,7 +45,11 @@ typedef struct FlowStage {
     CircularBuffer     *receiver_out;
     int                 pipefd[2];
     bool                ingest_done;
-    uint64_t            packets_pushed;
+    bool                segment_input_drained;
+    bool                segment_closing;
+    uint64_t            segment_packet_limit;
+    _Atomic uint64_t    packets_pushed;
+    _Atomic int64_t     last_recv_ns;
     unsigned char       ingress_partial[PKG_SIZE];
     size_t              ingress_partial_len;
     unsigned char       pipe_partial[PKG_SIZE];
@@ -58,6 +62,8 @@ typedef struct FlowStage {
 } FlowStage;
 
 static int buffer_has_space(CircularBuffer *buf, size_t need);
+static int flow_packets_delivered(const FlowStage *st, const FlowManager *mgr);
+static int drain_pipe_to_post_multi(FlowStage *st);
 
 static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
                                             unsigned char *work, int *progress)
@@ -67,7 +73,8 @@ static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
     if (st == NULL || codec == NULL || work == NULL) {
         return WG_PIPE_ERR;
     }
-    if (!st->ingest_done || st->tail_valid_len != 0 ||
+    if (!st->ingest_done || !st->segment_input_drained ||
+        st->tail_valid_len != 0 ||
         st->post_multi_in->size == 0 ||
         st->post_multi_in->size >= DECODE_BLOCK) {
         return WG_PIPE_OK;
@@ -106,6 +113,8 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
     memset(stage, 0, sizeof(*stage));
     stage->flow_id = path->flow_id;
     stage->relay_mode = relay_mode;
+    atomic_init(&stage->packets_pushed, 0);
+    atomic_init(&stage->last_recv_ns, 0);
     stage->pipefd[0] = -1;
     stage->pipefd[1] = -1;
 
@@ -188,19 +197,83 @@ static int flow_queues_drained(const FlowManager *mgr, uint32_t flow_id)
             flow_manager_deferred_count(mgr, flow_id) == 0);
 }
 
-static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
+static void mark_segment_ending(FlowStage *st)
+{
+    if (st == NULL) {
+        return;
+    }
+
+    st->segment_packet_limit = atomic_load(&st->packets_pushed);
+    st->segment_input_drained = false;
+    st->ingest_done = true;
+}
+
+static int flow_packets_delivered(const FlowStage *st, const FlowManager *mgr)
 {
     uint64_t enq;
     uint64_t deq;
 
-    if (st == NULL || !st->ingest_done) {
+    if (st == NULL || mgr == NULL || !st->ingest_done ||
+        st->flow_id >= mgr->config.max_flows) {
         return 0;
     }
 
     enq = atomic_load(&mgr->flows[st->flow_id].metrics.enqueued_packets);
     deq = atomic_load(&mgr->flows[st->flow_id].metrics.dequeued_packets);
+    return enq >= st->segment_packet_limit && deq >= st->segment_packet_limit;
+}
 
-    if (enq < st->packets_pushed || deq < st->packets_pushed) {
+/*
+ * Once all packets accepted for this segment have reached the pipe, drain it
+ * one final time before padding a partial codec block. The second delivery
+ * check closes the race where a worker writes just after the first drain.
+ */
+static WgPipelineStatus finish_segment_input(FlowStage *st, const FlowManager *mgr,
+                                             int *progress)
+{
+    int dr;
+
+    if (st == NULL || mgr == NULL || st->relay_mode ||
+        !st->ingest_done || st->segment_input_drained) {
+        return WG_PIPE_OK;
+    }
+    if (!flow_packets_delivered(st, mgr)) {
+        return WG_PIPE_OK;
+    }
+
+    dr = drain_pipe_to_post_multi(st);
+    if (dr < 0) {
+        return WG_PIPE_ERR;
+    }
+    if (dr > 0 && progress != NULL) {
+        *progress = 1;
+    }
+    if (!flow_packets_delivered(st, mgr)) {
+        return WG_PIPE_OK;
+    }
+
+    if (st->pipe_partial_len > 0) {
+        if (Buffer_Write(st->post_multi_in, st->pipe_partial,
+                         st->pipe_partial_len) != CB_OK) {
+            return WG_PIPE_ERR;
+        }
+        st->pipe_partial_len = 0;
+        if (progress != NULL) {
+            *progress = 1;
+        }
+    }
+
+    st->segment_input_drained = true;
+    return WG_PIPE_OK;
+}
+
+static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
+{
+    if (st == NULL || !st->ingest_done) {
+        return 0;
+    }
+
+    if (!flow_packets_delivered(st, mgr)) {
         return 0;
     }
 
@@ -209,7 +282,9 @@ static int flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
                flow_queues_drained(mgr, st->flow_id);
     }
 
-    return Buffer_IsEmpty(st->post_multi_in) &&
+    return st->segment_input_drained &&
+           st->pipe_partial_len == 0 &&
+           Buffer_IsEmpty(st->post_multi_in) &&
            Buffer_IsEmpty(st->sending_out) &&
            Buffer_IsEmpty(st->receiver_in) &&
            Buffer_IsEmpty(st->receiver_out) &&
@@ -406,7 +481,7 @@ static WgPipelineStatus push_ingress_packet(FlowStage *st, FlowManager *mgr,
         return WG_PIPE_ERR;
     }
 
-    st->packets_pushed++;
+    atomic_fetch_add(&st->packets_pushed, 1);
     return WG_PIPE_OK;
 }
 
@@ -460,7 +535,7 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
                         return push_st;
                     }
                 }
-                st->ingest_done = true;
+                mark_segment_ending(st);
                 return WG_PIPE_OK;
             }
 
@@ -494,7 +569,7 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
             if (input_is_fifo(st)) {
                 return WG_PIPE_OK;
             }
-            st->ingest_done = true;
+            mark_segment_ending(st);
             return WG_PIPE_OK;
         }
 
@@ -724,7 +799,8 @@ static WgPipelineStatus process_flow_relay(FlowStage *st, int *progress)
     return WG_PIPE_OK;
 }
 
-static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
+static WgPipelineStatus flush_flow_tails(FlowStage *st, const FlowManager *mgr,
+                                         const Codec *codec)
 {
     unsigned char work[ENCODE_BLOCK];
     int           progress;
@@ -737,18 +813,8 @@ static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
         return process_flow_relay(st, NULL);
     }
 
-    for (;;) {
-        if (drain_pipe_to_post_multi(st) <= 0) {
-            break;
-        }
-    }
-
-    if (st->pipe_partial_len > 0) {
-        if (Buffer_Write(st->post_multi_in, st->pipe_partial,
-                         st->pipe_partial_len) != CB_OK) {
-            return WG_PIPE_ERR;
-        }
-        st->pipe_partial_len = 0;
+    if (finish_segment_input(st, mgr, &progress) != WG_PIPE_OK) {
+        return WG_PIPE_ERR;
     }
 
     for (;;) {
@@ -757,7 +823,8 @@ static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
             return WG_PIPE_ERR;
         }
 
-        if (st->tail_valid_len == 0 &&
+        if (st->segment_input_drained &&
+            st->tail_valid_len == 0 &&
             Buffer_IsEmpty(st->post_multi_in) &&
             Buffer_IsEmpty(st->sending_out) &&
             Buffer_IsEmpty(st->receiver_in) &&
@@ -859,6 +926,11 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
                     goto cleanup_running;
                 }
 
+                if (finish_segment_input(st, &mgr, &progress) != WG_PIPE_OK) {
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
+
                 if (process_flow_post_multi(st, codec, work, &progress) != WG_PIPE_OK) {
                     status = WG_PIPE_ERR;
                     goto cleanup_running;
@@ -920,7 +992,7 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     }
 
     for (i = 0; i < config->flow_count; i++) {
-        if (flush_flow_tails(&stages[i], relay_mode ? NULL : codec) != WG_PIPE_OK) {
+        if (flush_flow_tails(&stages[i], &mgr, relay_mode ? NULL : codec) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup_running;
         }
@@ -942,7 +1014,7 @@ cleanup_running:
                 flow_metrics_get_dequeue_bps(&mgr.flows[fid].metrics),
                 (unsigned long long)atomic_load(
                     &mgr.flows[fid].metrics.dequeued_packets),
-                (unsigned long long)stages[i].packets_pushed);
+                (unsigned long long)atomic_load(&stages[i].packets_pushed));
     }
     flow_manager_stop(&mgr);
 
@@ -969,23 +1041,85 @@ typedef struct UdpIngressCtx {
     struct sockaddr_storage  local;
     socklen_t                local_len;
     _Atomic int              running;
-    _Atomic int              any_recv;
-    _Atomic int64_t          last_recv_ns;
+    pthread_mutex_t          segment_mtx;
+    pthread_cond_t           segment_ready;
+    int                      segment_sync_ready;
 } UdpIngressCtx;
 
-static void udp_touch_recv(UdpIngressCtx *ctx)
+static void udp_touch_flow(FlowStage *st)
 {
     struct timespec now;
 
-    if (ctx == NULL) {
+    if (st == NULL) {
         return;
     }
 
-    atomic_store(&ctx->any_recv, 1);
     if (time_utils_now_mono(&now) == TU_OK) {
-        atomic_store(&ctx->last_recv_ns,
+        atomic_store(&st->last_recv_ns,
                      (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec);
     }
+}
+
+static void udp_close_idle_segments(UdpIngressCtx *ctx, int64_t now_ns,
+                                    unsigned idle_sec)
+{
+    uint32_t i;
+
+    if (ctx == NULL || idle_sec == 0 || now_ns <= 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->segment_mtx);
+    for (i = 0; i < ctx->flow_count; i++) {
+        FlowStage *st = &ctx->stages[i];
+        int64_t    last_ns = atomic_load(&st->last_recv_ns);
+
+        if (!st->segment_closing && last_ns > 0 &&
+            (now_ns - last_ns) >= (int64_t)idle_sec * 1000000000LL) {
+            st->segment_closing = true;
+            mark_segment_ending(st);
+        }
+    }
+    pthread_mutex_unlock(&ctx->segment_mtx);
+}
+
+static int udp_segment_flushed(const FlowStage *st, const FlowManager *mgr)
+{
+    return st != NULL && mgr != NULL && st->ingest_done &&
+           st->segment_input_drained && st->tail_valid_len == 0 &&
+           st->pipe_partial_len == 0 &&
+           Buffer_IsEmpty(st->post_multi_in) &&
+           Buffer_IsEmpty(st->sending_out) &&
+           Buffer_IsEmpty(st->receiver_in) &&
+           Buffer_IsEmpty(st->receiver_out) &&
+           flow_packets_delivered(st, mgr);
+}
+
+static WgPipelineStatus udp_reopen_flushed_segment(UdpIngressCtx *ctx, FlowStage *st,
+                                                    const FlowManager *mgr, int *progress)
+{
+    if (ctx == NULL || st == NULL || !udp_segment_flushed(st, mgr)) {
+        return WG_PIPE_OK;
+    }
+
+    pthread_mutex_lock(&ctx->segment_mtx);
+    if (st->segment_closing && udp_segment_flushed(st, mgr)) {
+        if (FileDrain_flush(&st->drain) != DRAIN_OK) {
+            pthread_mutex_unlock(&ctx->segment_mtx);
+            return WG_PIPE_ERR;
+        }
+        st->ingest_done = false;
+        st->segment_input_drained = false;
+        st->segment_packet_limit = 0;
+        atomic_store(&st->last_recv_ns, 0);
+        st->segment_closing = false;
+        pthread_cond_broadcast(&ctx->segment_ready);
+        if (progress != NULL) {
+            *progress = 1;
+        }
+    }
+    pthread_mutex_unlock(&ctx->segment_mtx);
+    return WG_PIPE_OK;
 }
 
 static void *udp_ingress_thread(void *arg)
@@ -1028,10 +1162,21 @@ static void *udp_ingress_thread(void *arg)
                 continue;
             }
 
-            if (ingress_push(ctx->mgr, flow_id, buf, (size_t)n) == INGRESS_PUSH_OK) {
-                ctx->stages[flow_id].packets_pushed++;
-                udp_touch_recv(ctx);
+            pthread_mutex_lock(&ctx->segment_mtx);
+            while (ctx->stages[flow_id].segment_closing &&
+                   atomic_load(&ctx->running)) {
+                pthread_cond_wait(&ctx->segment_ready, &ctx->segment_mtx);
             }
+            if (!atomic_load(&ctx->running)) {
+                pthread_mutex_unlock(&ctx->segment_mtx);
+                break;
+            }
+
+            if (ingress_push(ctx->mgr, flow_id, buf, (size_t)n) == INGRESS_PUSH_OK) {
+                atomic_fetch_add(&ctx->stages[flow_id].packets_pushed, 1);
+                udp_touch_flow(&ctx->stages[flow_id]);
+            }
+            pthread_mutex_unlock(&ctx->segment_mtx);
         }
     }
 
@@ -1089,6 +1234,7 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
         return WG_PIPE_ERR;
     }
 
+    memset(&udp_ctx, 0, sizeof(udp_ctx));
     stages = calloc(config->max_flows, sizeof(*stages));
     paths = calloc(config->max_flows, sizeof(*paths));
     out_paths = calloc(config->max_flows, sizeof(*out_paths));
@@ -1153,8 +1299,16 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
     udp_ctx.flow_count = config->max_flows;
     udp_ctx.local_len = sizeof(udp_ctx.local);
     atomic_store(&udp_ctx.running, 1);
-    atomic_store(&udp_ctx.any_recv, 0);
-    atomic_store(&udp_ctx.last_recv_ns, 0);
+    if (pthread_mutex_init(&udp_ctx.segment_mtx, NULL) != 0) {
+        status = WG_PIPE_ERR;
+        goto cleanup_mgr;
+    }
+    if (pthread_cond_init(&udp_ctx.segment_ready, NULL) != 0) {
+        pthread_mutex_destroy(&udp_ctx.segment_mtx);
+        status = WG_PIPE_ERR;
+        goto cleanup_mgr;
+    }
+    udp_ctx.segment_sync_ready = 1;
 
     if (getsockname(sock, (struct sockaddr *)&udp_ctx.local, &udp_ctx.local_len) != 0) {
         status = WG_PIPE_ERR;
@@ -1179,21 +1333,12 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
         int           progress = 0;
         struct timespec now;
         int64_t       now_ns = 0;
-        int64_t       last_ns;
 
         if (time_utils_now_mono(&now) == TU_OK) {
             now_ns = (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec;
         }
 
-        if (atomic_load(&udp_ctx.any_recv) && config->idle_sec > 0) {
-            last_ns = atomic_load(&udp_ctx.last_recv_ns);
-            if (last_ns > 0 &&
-                (now_ns - last_ns) >= (int64_t)config->idle_sec * 1000000000LL) {
-                for (i = 0; i < config->max_flows; i++) {
-                    stages[i].ingest_done = true;
-                }
-            }
-        }
+        udp_close_idle_segments(&udp_ctx, now_ns, config->idle_sec);
 
         for (i = 0; i < config->max_flows; i++) {
             FlowStage *st = &stages[i];
@@ -1207,28 +1352,19 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
                 goto cleanup_running;
             }
 
+            if (finish_segment_input(st, &mgr, &progress) != WG_PIPE_OK) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+
             if (process_flow_post_multi(st, codec, work, &progress) != WG_PIPE_OK) {
                 status = WG_PIPE_ERR;
                 goto cleanup_running;
             }
-        }
 
-        {
-            bool all_done = true;
-
-            for (i = 0; i < config->max_flows; i++) {
-                if (!stages[i].ingest_done) {
-                    all_done = false;
-                    break;
-                }
-                if (!flow_stage_quiescent(&stages[i], &mgr)) {
-                    all_done = false;
-                    break;
-                }
-            }
-
-            if (all_done) {
-                break;
+            if (udp_reopen_flushed_segment(&udp_ctx, st, &mgr, &progress) != WG_PIPE_OK) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
             }
         }
 
@@ -1243,15 +1379,13 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
         }
     }
 
-    for (i = 0; i < config->max_flows; i++) {
-        if (flush_flow_tails(&stages[i], codec) != WG_PIPE_OK) {
-            status = WG_PIPE_ERR;
-            goto cleanup_running;
-        }
-    }
-
 cleanup_running:
     atomic_store(&udp_ctx.running, 0);
+    if (udp_ctx.segment_sync_ready) {
+        pthread_mutex_lock(&udp_ctx.segment_mtx);
+        pthread_cond_broadcast(&udp_ctx.segment_ready);
+        pthread_mutex_unlock(&udp_ctx.segment_mtx);
+    }
     if (sock >= 0) {
         shutdown(sock, SHUT_RDWR);
     }
@@ -1267,7 +1401,7 @@ cleanup_running:
                 flow_metrics_get_dequeue_bps(&mgr.flows[i].metrics),
                 (unsigned long long)atomic_load(
                     &mgr.flows[i].metrics.dequeued_packets),
-                (unsigned long long)stages[i].packets_pushed,
+                (unsigned long long)atomic_load(&stages[i].packets_pushed),
                 out_paths[i]);
     }
     flow_manager_stop(&mgr);
@@ -1278,6 +1412,10 @@ cleanup_mgr:
 cleanup:
     if (sock >= 0) {
         close(sock);
+    }
+    if (udp_ctx.segment_sync_ready) {
+        pthread_cond_destroy(&udp_ctx.segment_ready);
+        pthread_mutex_destroy(&udp_ctx.segment_mtx);
     }
     flow_peer_map_destroy(peer_map);
     if (stages != NULL) {

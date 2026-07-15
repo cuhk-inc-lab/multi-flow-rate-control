@@ -25,6 +25,7 @@ DrainStatus FileDrain_flush_remainder(FileDrain *drain, CircularBuffer *buf,
                                       size_t *written);
 DrainStatus FileDrain_write_packet(FileDrain *drain, const DataPacket *pkt,
                                    size_t *written);
+DrainStatus FileDrain_flush(FileDrain *drain);
 void FileDrain_close(FileDrain *drain);
 
 #endif /* FILE_DRAIN_H */
