@@ -50,34 +50,47 @@ typedef struct FlowStage {
     size_t              ingress_partial_len;
     unsigned char       pipe_partial[PKG_SIZE];
     size_t              pipe_partial_len;
+    /*
+     * Valid-byte count for the final padded decode block. A nonzero value
+     * means its encoded form is still somewhere in the stage pipeline.
+     */
+    size_t              tail_valid_len;
 } FlowStage;
 
-static WgPipelineStatus passthrough_tail(CircularBuffer *src, CircularBuffer *dst)
-{
-    unsigned char *tmp;
-    size_t         n;
-    CB_Status      st;
+static int buffer_has_space(CircularBuffer *buf, size_t need);
 
-    if (src == NULL || dst == NULL || Buffer_IsEmpty(src)) {
+static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
+                                            unsigned char *work, int *progress)
+{
+    size_t n;
+
+    if (st == NULL || codec == NULL || work == NULL) {
+        return WG_PIPE_ERR;
+    }
+    if (!st->ingest_done || st->tail_valid_len != 0 ||
+        st->post_multi_in->size == 0 ||
+        st->post_multi_in->size >= DECODE_BLOCK) {
         return WG_PIPE_OK;
     }
 
-    n = src->size;
-    tmp = malloc(n);
-    if (tmp == NULL) {
+    if (!buffer_has_space(st->sending_out, ENCODE_BLOCK)) {
+        return WG_PIPE_OK;
+    }
+
+    n = st->post_multi_in->size;
+    if (Buffer_Read(st->post_multi_in, work, n) != CB_OK) {
         return WG_PIPE_ERR;
     }
 
-    st = Buffer_Read(src, tmp, n);
-    if (st != CB_OK) {
-        free(tmp);
+    memset(work + n, 0, DECODE_BLOCK - n);
+    Codec_encode(codec, work, ENCODE_BLOCK);
+    if (Buffer_Write(st->sending_out, work, ENCODE_BLOCK) != CB_OK) {
         return WG_PIPE_ERR;
     }
 
-    st = Buffer_Write(dst, tmp, n);
-    free(tmp);
-    if (st != CB_OK) {
-        return WG_PIPE_ERR;
+    st->tail_valid_len = n;
+    if (progress != NULL) {
+        *progress = 1;
     }
 
     return WG_PIPE_OK;
@@ -579,6 +592,8 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
     }
 
     while (st->receiver_in->size >= ENCODE_BLOCK) {
+        size_t decoded_len = DECODE_BLOCK;
+
         if (!buffer_has_space(st->receiver_out, DECODE_BLOCK)) {
             break;
         }
@@ -587,22 +602,22 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
             return WG_PIPE_ERR;
         }
         Codec_decode(codec, work, ENCODE_BLOCK);
-        if (Buffer_Write(st->receiver_out, work, DECODE_BLOCK) != CB_OK) {
+        if (st->tail_valid_len != 0) {
+            decoded_len = st->tail_valid_len;
+        }
+        if (Buffer_Write(st->receiver_out, work, decoded_len) != CB_OK) {
             return WG_PIPE_ERR;
+        }
+        if (st->tail_valid_len != 0) {
+            st->tail_valid_len = 0;
         }
         if (progress != NULL) {
             *progress = 1;
         }
     }
 
-    if (st->ingest_done && st->post_multi_in->size > 0 &&
-        st->post_multi_in->size < DECODE_BLOCK) {
-        if (passthrough_tail(st->post_multi_in, st->receiver_out) != WG_PIPE_OK) {
-            return WG_PIPE_ERR;
-        }
-        if (progress != NULL) {
-            *progress = 1;
-        }
+    if (enqueue_padded_tail(st, codec, work, progress) != WG_PIPE_OK) {
+        return WG_PIPE_ERR;
     }
 
     {
@@ -712,7 +727,7 @@ static WgPipelineStatus process_flow_relay(FlowStage *st, int *progress)
 static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
 {
     unsigned char work[ENCODE_BLOCK];
-    int           progress = 0;
+    int           progress;
 
     if (st == NULL) {
         return WG_PIPE_ERR;
@@ -736,7 +751,23 @@ static WgPipelineStatus flush_flow_tails(FlowStage *st, const Codec *codec)
         st->pipe_partial_len = 0;
     }
 
-    return process_flow_post_multi(st, codec, work, &progress);
+    for (;;) {
+        progress = 0;
+        if (process_flow_post_multi(st, codec, work, &progress) != WG_PIPE_OK) {
+            return WG_PIPE_ERR;
+        }
+
+        if (st->tail_valid_len == 0 &&
+            Buffer_IsEmpty(st->post_multi_in) &&
+            Buffer_IsEmpty(st->sending_out) &&
+            Buffer_IsEmpty(st->receiver_in) &&
+            Buffer_IsEmpty(st->receiver_out)) {
+            return WG_PIPE_OK;
+        }
+        if (!progress) {
+            return WG_PIPE_ERR;
+        }
+    }
 }
 
 WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
