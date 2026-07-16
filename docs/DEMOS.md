@@ -34,13 +34,16 @@ ingress (188-byte TS packets)
        B) --no-codec relay: DataPacket* queue → FileDrain_write_packet → output
 ```
 
-**BlockCodec is not encryption.** It is a reversible demo transform (per-byte
-`+/-` in `block_codec.c`) so you can exercise encode → transfer → decode. The
-output after decode should match the original payload for offline `cmp`.
+**BlockCodec and XOR FEC are not encryption.** BlockCodec is a reversible demo
+transform (per-byte `+/-` in `block_codec.c`). XOR FEC adds one parity TS packet
+for every four data TS packets; it can recover one identified missing shard when
+used with a packet-aware transport receiver. The local transfer demo is reliable,
+so both codec paths should match the original payload for offline `cmp`.
 
 | Path | When | What |
 |------|------|------|
-| Default (codec on) | Demo 1, Demo 3 live script, `make integration-test` | Full BlockCodec encode/decode |
+| Default (`--codec block`) | Demo 1, Demo 3 live script, `make integration-test` | Full BlockCodec encode/decode |
+| `--codec xor-fec` | File/FIFO/UDP demo | 4 data TS packets + 1 XOR parity packet |
 | `--no-codec` | Optional relay | Skip BlockCodec; pointer-only pass-through |
 
 | Concept | Value / location |
@@ -57,7 +60,9 @@ output after decode should match the original payload for offline `cmp`.
 | Flag | Meaning |
 |------|---------|
 | `--no-pace` | Disable timeline pacing (needed for `cmp`; live demos use it because `ffmpeg -re` already paces) |
-| `--no-codec` | Skip BlockCodec; relay only (not used by Demo 3 script) |
+| `--codec block` | Default existing `+/-` BlockCodec demo transform |
+| `--codec xor-fec` | Select XOR FEC (4 data packets + 1 parity packet) |
+| `--codec none` / `--no-codec` | Skip coding; relay only (not used by Demo 3 script) |
 | `--multi` | Multiple `input output` pairs (required for 2+ flows) |
 | (default) | Pacing **on** + BlockCodec **on** |
 

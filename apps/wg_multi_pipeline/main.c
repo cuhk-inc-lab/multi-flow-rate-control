@@ -1,4 +1,5 @@
 #include "pipeline.h"
+#include "wire_udp.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -9,27 +10,33 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--no-pace] [--no-codec] <input.ts> <output.ts>\n"
-            "  %s [--no-pace] [--no-codec] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
-            "  %s [--no-pace] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|none] <input.ts> <output.ts>\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
+            "  %s [--codec block|copy|xor-fec] [--rate-mbps N] --udp-send <host> <port> <input.ts>\n"
+            "  %s [--codec block|copy|xor-fec] --udp-recv <port> <output.ts> [--idle-sec N]\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
-            "         -> BlockCodec encode -> buffer transfer -> decode -> file\n"
+            "         -> selected codec encode -> buffer transfer -> decode -> file\n"
             "\n"
-            "--no-codec: relay mode — pointer-only post-pacing queue, fwrite at send time\n"
+            "Codecs: block (default, existing demo), copy (4-to-8 benchmark without arithmetic),\n"
+            "        xor-fec (4 data + 1 XOR parity),\n"
+            "        none (file/FIFO relay mode; --no-codec alias)\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
             "\n"
-            "Verify file mode: cmp <input.ts> <output.ts>\n",
-            prog, prog, prog);
+            "Wire UDP modes use group/shard headers and support cross-host transfer.\n"
+            "Verify output: cmp <input.ts> <output.ts>\n",
+            prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
 {
     int pacing = 1;
-    int codec = 1;
+    CodecKind codec_kind = CODEC_KIND_BLOCK;
+    double source_rate_mbps = 0.0;
     int argi = 1;
 
     /* Closing one ffplay must not kill the whole multi-flow process. */
@@ -40,15 +47,107 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    while (argi < argc &&
-           (strcmp(argv[argi], "--no-pace") == 0 ||
-            strcmp(argv[argi], "--no-codec") == 0)) {
+    while (argi < argc) {
         if (strcmp(argv[argi], "--no-pace") == 0) {
             pacing = 0;
+            argi++;
+        } else if (strcmp(argv[argi], "--no-codec") == 0) {
+            codec_kind = CODEC_KIND_NONE;
+            argi++;
+        } else if (strcmp(argv[argi], "--codec") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            if (strcmp(argv[argi + 1], "block") == 0) {
+                codec_kind = CODEC_KIND_BLOCK;
+            } else if (strcmp(argv[argi + 1], "copy") == 0) {
+                codec_kind = CODEC_KIND_COPY;
+            } else if (strcmp(argv[argi + 1], "xor-fec") == 0) {
+                codec_kind = CODEC_KIND_XOR_FEC;
+            } else if (strcmp(argv[argi + 1], "none") == 0) {
+                codec_kind = CODEC_KIND_NONE;
+            } else {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            argi += 2;
+        } else if (strcmp(argv[argi], "--rate-mbps") == 0) {
+            char *end = NULL;
+
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            source_rate_mbps = strtod(argv[argi + 1], &end);
+            if (end == argv[argi + 1] || source_rate_mbps <= 0.0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            argi += 2;
         } else {
-            codec = 0;
+            break;
         }
-        argi++;
+    }
+
+    if (argi < argc && strcmp(argv[argi], "--udp-send") == 0) {
+        WireUdpSendConfig cfg;
+        char *end = NULL;
+        long port;
+
+        if (codec_kind == CODEC_KIND_NONE || argc - argi != 4) {
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        port = strtol(argv[argi + 2], &end, 10);
+        if (end == argv[argi + 2] || port <= 0 || port > 65535) {
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        cfg = (WireUdpSendConfig){
+            .host = argv[argi + 1],
+            .port = (uint16_t)port,
+            .input_path = argv[argi + 3],
+            .codec_kind = codec_kind,
+            .source_rate_mbps = source_rate_mbps,
+        };
+        return wire_udp_send(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if (argi < argc && strcmp(argv[argi], "--udp-recv") == 0) {
+        WireUdpRecvConfig cfg;
+        unsigned idle_sec = 3u;
+        char *end = NULL;
+        long port;
+
+        if (codec_kind == CODEC_KIND_NONE ||
+            ((argc - argi != 3) && (argc - argi != 5))) {
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        port = strtol(argv[argi + 1], &end, 10);
+        if (end == argv[argi + 1] || port <= 0 || port > 65535) {
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        if (argc - argi == 5) {
+            if (strcmp(argv[argi + 3], "--idle-sec") != 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            idle_sec = (unsigned)strtoul(argv[argi + 4], NULL, 10);
+            if (idle_sec == 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+        }
+        cfg = (WireUdpRecvConfig){
+            .port = (uint16_t)port,
+            .output_path = argv[argi + 2],
+            .codec_kind = codec_kind,
+            .idle_sec = idle_sec,
+        };
+        return wire_udp_recv(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (argi < argc && strcmp(argv[argi], "--udp") == 0) {
@@ -59,7 +158,7 @@ int main(int argc, char **argv)
         char       *end = NULL;
         const char *out_prefix;
 
-        if (argc - argi < 3) {
+        if (codec_kind == CODEC_KIND_NONE || argc - argi < 3) {
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
@@ -103,7 +202,8 @@ int main(int argc, char **argv)
             .output_prefix = out_prefix,
             .max_flows = max_flows,
             .idle_sec = idle_sec,
-            .pacing_enabled = pacing
+            .pacing_enabled = pacing,
+            .codec_kind = codec_kind
         };
 
         if (wg_pipeline_run_udp(&cfg) != WG_PIPE_OK) {
@@ -155,7 +255,7 @@ int main(int argc, char **argv)
             .flows = paths,
             .flow_count = (uint32_t)pairs,
             .pacing_enabled = pacing,
-            .codec_enabled = codec
+            .codec_kind = codec_kind
         };
 
         if (wg_pipeline_run(&cfg) != WG_PIPE_OK) {

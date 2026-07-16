@@ -71,19 +71,23 @@ static int drain_pipe_to_post_multi(FlowStage *st);
 static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
                                             unsigned char *work, int *progress)
 {
+    size_t input_block_size;
+    size_t output_block_size;
     size_t n;
 
     if (st == NULL || codec == NULL || work == NULL) {
         return WG_PIPE_ERR;
     }
+    input_block_size = Codec_input_block_size(codec);
+    output_block_size = Codec_output_block_size(codec);
     if (!st->ingest_done || !st->segment_input_drained ||
         st->tail_valid_len != 0 ||
         st->post_multi_in->size == 0 ||
-        st->post_multi_in->size >= DECODE_BLOCK) {
+        st->post_multi_in->size >= input_block_size) {
         return WG_PIPE_OK;
     }
 
-    if (!buffer_has_space(st->sending_out, ENCODE_BLOCK)) {
+    if (!buffer_has_space(st->sending_out, output_block_size)) {
         return WG_PIPE_OK;
     }
 
@@ -92,9 +96,9 @@ static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
         return WG_PIPE_ERR;
     }
 
-    memset(work + n, 0, DECODE_BLOCK - n);
-    Codec_encode(codec, work, ENCODE_BLOCK);
-    if (Buffer_Write(st->sending_out, work, ENCODE_BLOCK) != CB_OK) {
+    memset(work + n, 0, input_block_size - n);
+    Codec_encode(codec, work, output_block_size);
+    if (Buffer_Write(st->sending_out, work, output_block_size) != CB_OK) {
         return WG_PIPE_ERR;
     }
 
@@ -673,16 +677,30 @@ static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
 static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *codec,
                                                 unsigned char *work, int *progress)
 {
-    while (st->post_multi_in->size >= DECODE_BLOCK) {
-        if (!buffer_has_space(st->sending_out, ENCODE_BLOCK)) {
+    size_t input_block_size;
+    size_t output_block_size;
+
+    if (st == NULL || codec == NULL || work == NULL) {
+        return WG_PIPE_ERR;
+    }
+
+    input_block_size = Codec_input_block_size(codec);
+    output_block_size = Codec_output_block_size(codec);
+    if (input_block_size == 0 || output_block_size == 0 ||
+        output_block_size > CODEC_MAX_ENCODE_BLOCK) {
+        return WG_PIPE_ERR;
+    }
+
+    while (st->post_multi_in->size >= input_block_size) {
+        if (!buffer_has_space(st->sending_out, output_block_size)) {
             break;
         }
 
-        if (Buffer_Read(st->post_multi_in, work, DECODE_BLOCK) != CB_OK) {
+        if (Buffer_Read(st->post_multi_in, work, input_block_size) != CB_OK) {
             return WG_PIPE_ERR;
         }
-        Codec_encode(codec, work, ENCODE_BLOCK);
-        if (Buffer_Write(st->sending_out, work, ENCODE_BLOCK) != CB_OK) {
+        Codec_encode(codec, work, output_block_size);
+        if (Buffer_Write(st->sending_out, work, output_block_size) != CB_OK) {
             return WG_PIPE_ERR;
         }
         if (progress != NULL) {
@@ -695,7 +713,7 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
         TransferStatus xfer;
 
         xfer = BufferTransfer_pump(st->sending_out, st->receiver_in,
-                                   ENCODE_BLOCK, &moved);
+                                   output_block_size, &moved);
         if (xfer == TRANSFER_OK) {
             if (progress != NULL) {
                 *progress = 1;
@@ -708,17 +726,17 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
         return WG_PIPE_ERR;
     }
 
-    while (st->receiver_in->size >= ENCODE_BLOCK) {
-        size_t decoded_len = DECODE_BLOCK;
+    while (st->receiver_in->size >= output_block_size) {
+        size_t decoded_len = input_block_size;
 
-        if (!buffer_has_space(st->receiver_out, DECODE_BLOCK)) {
+        if (!buffer_has_space(st->receiver_out, input_block_size)) {
             break;
         }
 
-        if (Buffer_Read(st->receiver_in, work, ENCODE_BLOCK) != CB_OK) {
+        if (Buffer_Read(st->receiver_in, work, output_block_size) != CB_OK) {
             return WG_PIPE_ERR;
         }
-        Codec_decode(codec, work, ENCODE_BLOCK);
+        Codec_decode(codec, work, output_block_size);
         if (st->tail_valid_len != 0) {
             decoded_len = st->tail_valid_len;
         }
@@ -852,7 +870,7 @@ static WgPipelineStatus process_flow_relay(FlowStage *st, int *progress)
 static WgPipelineStatus flush_flow_tails(FlowStage *st, const FlowManager *mgr,
                                          const Codec *codec)
 {
-    unsigned char work[ENCODE_BLOCK];
+    unsigned char work[CODEC_MAX_ENCODE_BLOCK];
     int           progress;
 
     if (st == NULL) {
@@ -894,16 +912,20 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     FlowStage        *stages = NULL;
     uint32_t          max_flow_id = 0;
     uint32_t          i;
-    const Codec      *codec = BlockCodec_get();
+    const Codec      *codec;
     WgPipelineStatus  status = WG_PIPE_OK;
-    unsigned char     work[ENCODE_BLOCK];
+    unsigned char     work[CODEC_MAX_ENCODE_BLOCK];
     bool              relay_mode = false;
 
     if (config == NULL || config->flows == NULL || config->flow_count == 0) {
         return WG_PIPE_ERR;
     }
 
-    relay_mode = config->codec_enabled == 0;
+    relay_mode = config->codec_kind == CODEC_KIND_NONE;
+    codec = relay_mode ? NULL : Codec_get(config->codec_kind);
+    if (!relay_mode && codec == NULL) {
+        return WG_PIPE_ERR;
+    }
 
     stages = calloc(config->flow_count, sizeof(*stages));
     if (stages == NULL) {
@@ -1281,14 +1303,18 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
     UdpIngressCtx     udp_ctx;
     pthread_t         udp_thread;
     uint32_t          i;
-    const Codec      *codec = BlockCodec_get();
+    const Codec      *codec;
     WgPipelineStatus  status = WG_PIPE_OK;
-    unsigned char     work[ENCODE_BLOCK];
+    unsigned char     work[CODEC_MAX_ENCODE_BLOCK];
     int               sock = -1;
     int               udp_started = 0;
 
     if (config == NULL || config->output_prefix == NULL ||
         config->max_flows == 0 || config->port == 0) {
+        return WG_PIPE_ERR;
+    }
+    codec = Codec_get(config->codec_kind);
+    if (codec == NULL) {
         return WG_PIPE_ERR;
     }
 

@@ -960,6 +960,26 @@ static void *complex_producer_thread(void *arg)
     return NULL;
 }
 
+static int wait_for_complex_dequeues(const FlowManager *mgr,
+                                     uint64_t expected0,
+                                     uint64_t expected1)
+{
+    const struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000000L };
+    unsigned int          attempt;
+
+    for (attempt = 0; attempt < 5000u; attempt++) {
+        uint64_t deq0 = atomic_load(&mgr->flows[0].metrics.dequeued_packets);
+        uint64_t deq1 = atomic_load(&mgr->flows[1].metrics.dequeued_packets);
+
+        if (deq0 == expected0 && deq1 == expected1) {
+            return 0;
+        }
+        time_utils_sleep_for(&delay);
+    }
+
+    return -1;
+}
+
 static int test_complex_multi_flow(void)
 {
     FlowManager mgr;
@@ -1021,6 +1041,18 @@ static int test_complex_multi_flow(void)
 
     pthread_join(t0, NULL);
     pthread_join(t1, NULL);
+
+    /*
+     * Joining producers means every packet was enqueued, not that the
+     * dispatcher and workers have emitted every packet. Wait for that drain
+     * condition before sampling dequeue metrics.
+     */
+    if (wait_for_complex_dequeues(&mgr, (uint64_t)count0, (uint64_t)count1) != 0) {
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(null_fd);
+        return 1;
+    }
 
     {
         uint64_t enq0 = atomic_load(&mgr.flows[0].metrics.enqueued_packets);

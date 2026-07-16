@@ -27,9 +27,20 @@ cmp c.ts  out_c.ts
 | Flag | Meaning |
 |------|---------|
 | `--no-pace` | Disable pacing; byte-exact for `cmp`; live scripts use this with `ffmpeg -re` |
-| `--no-codec` | Optional relay: skip BlockCodec; pointer-only post-worker queue |
+| `--codec block` | Default: existing reversible `+/-` BlockCodec demo transform |
+| `--codec xor-fec` | Systematic XOR FEC: 4 data TS packets + 1 parity packet |
+| `--codec none` / `--no-codec` | Optional relay: skip coding; pointer-only post-worker queue |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
+
+The local demo transfer does not drop packets. `xor-fec` therefore round-trips
+normally; `XorFecCodec_recover_one()` is the transport-facing helper for
+recovering one identified missing shard in a future network receiver.
+
+```bash
+./build/wg_multi_pipeline --no-pace --codec xor-fec input.ts output.ts
+cmp input.ts output.ts
+```
 
 **Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  
 (`scripts/run_dual_fifo.sh` uses `--no-pace --multi` with BlockCodec enabled).

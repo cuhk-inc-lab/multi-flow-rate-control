@@ -54,9 +54,23 @@ static void block_decode(const Codec *self, unsigned char *data, size_t len)
     memcpy(data, out, DECODE_BLOCK);
 }
 
+static size_t block_input_block_size(const Codec *self)
+{
+    (void)self;
+    return DECODE_BLOCK;
+}
+
+static size_t block_output_block_size(const Codec *self)
+{
+    (void)self;
+    return ENCODE_BLOCK;
+}
+
 static const CodecVTable block_codec_vtable = {
     .encode = block_encode,
     .decode = block_decode,
+    .input_block_size = block_input_block_size,
+    .output_block_size = block_output_block_size,
 };
 
 static const Codec block_codec = {

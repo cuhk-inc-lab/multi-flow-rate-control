@@ -84,6 +84,8 @@ Automated 3-flow roundtrip: `make integration-test`.
 wg-obfs handoff: **[docs/INTEGRATION_BOUNDARIES.md](docs/INTEGRATION_BOUNDARIES.md)**.  
 Demo walkthrough (offline + FIFO live): **[docs/DEMOS.md](docs/DEMOS.md)**.  
 Testing: **[tests/TESTING.md](tests/TESTING.md)**.
+Cross-VM TCP/UDP baseline and wire-codec benchmark:
+**[docs/VM_NETWORK_BENCHMARK.md](docs/VM_NETWORK_BENCHMARK.md)**.
 
 ## Build & test
 
