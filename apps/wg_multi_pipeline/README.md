@@ -53,13 +53,15 @@ make wg-demo
 ./build/wg_multi_pipeline --no-pace --udp 5000 /tmp/out_ --idle-sec 3
 echo -n flow-a | nc -u -p 4001 127.0.0.1 5000
 echo -n flow-b | nc -u -p 4002 127.0.0.1 5000
-# → /tmp/out_0.bin, /tmp/out_1.bin, ...
+# → /tmp/out_flow0_segment0.bin, /tmp/out_flow1_segment0.bin, ...
 ```
 
 `--idle-sec` is a **per-flow segment boundary**, not a server shutdown timer.
 After a flow is idle for the configured interval, the app drains its queued
 data, zero-pads a partial codec block if needed, and keeps listening for the
 next segment. New data for that flow after the timeout starts a new segment.
+Each completed segment is written to its own file, such as
+`/tmp/out_flow0_segment1.bin`.
 
 See [tests/TESTING.md](../../tests/TESTING.md) for full coverage.  
 Step-by-step demos (offline + FIFO live): [docs/DEMOS.md](../../docs/DEMOS.md).

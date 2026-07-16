@@ -57,12 +57,12 @@ make wg-demo
 # other terminal, different source ports → different flows:
 echo -n flow-a | nc -u -p 4001 127.0.0.1 5000
 echo -n flow-b | nc -u -p 4002 127.0.0.1 5000
-# outputs: /tmp/out_0.bin, /tmp/out_1.bin, ...
+# outputs: /tmp/out_flow0_segment0.bin, /tmp/out_flow1_segment0.bin, ...
 ```
 
 The UDP server remains running after an idle timeout. `--idle-sec` closes and
 flushes only the idle flow's current segment; the next packet for that tuple
-starts a new segment.
+starts a new segment in a new output file.
 
 File demo uses `ingress_push(mgr, flow_id, data, len)` instead.
 

@@ -76,7 +76,8 @@ cmp a.txt out_a.txt && cmp b.bin out_b.bin && cmp c.ts out_c.ts
 ```
 
 In UDP mode, `--idle-sec` flushes an idle flow segment while the server keeps
-listening; a later packet for that flow begins a new segment.
+listening; a later packet for that flow begins a new segment. Output paths use
+`<prefix>flow<id>_segment<id>.bin`.
 
 Automated 3-flow roundtrip: `make integration-test`.
 

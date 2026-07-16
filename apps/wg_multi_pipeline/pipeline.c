@@ -47,9 +47,12 @@ typedef struct FlowStage {
     bool                ingest_done;
     bool                segment_input_drained;
     bool                segment_closing;
+    bool                udp_segment_files;
     uint64_t            segment_packet_limit;
+    uint64_t            segment_id;
     _Atomic uint64_t    packets_pushed;
     _Atomic int64_t     last_recv_ns;
+    char                output_prefix[512];
     unsigned char       ingress_partial[PKG_SIZE];
     size_t              ingress_partial_len;
     unsigned char       pipe_partial[PKG_SIZE];
@@ -104,7 +107,7 @@ static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
 }
 
 static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path,
-                                        bool relay_mode)
+                                        bool relay_mode, bool defer_output_open)
 {
     if (stage == NULL || path == NULL || path->output_path == NULL) {
         return WG_PIPE_ERR;
@@ -145,11 +148,50 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
     }
 
   /* Output FIFO needs a reader (ffplay) before we return; input opens lazily. */
-    if (FileDrain_open(&stage->drain, path->output_path) != DRAIN_OK) {
+    if (!defer_output_open &&
+        FileDrain_open(&stage->drain, path->output_path) != DRAIN_OK) {
         return WG_PIPE_ERR;
     }
 
     return WG_PIPE_OK;
+}
+
+static WgPipelineStatus configure_udp_segment_output(FlowStage *stage,
+                                                      const char *output_prefix)
+{
+    if (stage == NULL || output_prefix == NULL ||
+        output_prefix[0] == '\0' ||
+        strlen(output_prefix) >= sizeof(stage->output_prefix)) {
+        return WG_PIPE_ERR;
+    }
+
+    strncpy(stage->output_prefix, output_prefix, sizeof(stage->output_prefix) - 1u);
+    stage->output_prefix[sizeof(stage->output_prefix) - 1u] = '\0';
+    stage->udp_segment_files = true;
+    return WG_PIPE_OK;
+}
+
+static WgPipelineStatus open_udp_segment_output(FlowStage *stage)
+{
+    char path[sizeof(stage->drain.path)];
+    int  n;
+
+    if (stage == NULL || !stage->udp_segment_files) {
+        return WG_PIPE_ERR;
+    }
+    if (stage->drain.fp != NULL) {
+        return WG_PIPE_OK;
+    }
+
+    n = snprintf(path, sizeof(path), "%sflow%u_segment%llu.bin",
+                 stage->output_prefix, stage->flow_id,
+                 (unsigned long long)stage->segment_id);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return WG_PIPE_ERR;
+    }
+
+    return FileDrain_open(&stage->drain, path) == DRAIN_OK ?
+           WG_PIPE_OK : WG_PIPE_ERR;
 }
 
 static void destroy_flow_stage(FlowStage *stage)
@@ -717,6 +759,14 @@ static WgPipelineStatus process_flow_post_multi(FlowStage *st, const Codec *code
             return WG_PIPE_OK;
         }
 
+        /*
+         * UDP segment files are opened by the ingress thread only after the
+         * first datagram of a segment arrives. An idle flow has no output yet.
+         */
+        if (st->udp_segment_files && st->drain.fp == NULL) {
+            return WG_PIPE_OK;
+        }
+
         for (;;) {
             drain_st = FileDrain_pull_once(&st->drain, st->receiver_out, PKG_SIZE, NULL);
             if (drain_st == DRAIN_OK) {
@@ -867,7 +917,7 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
     }
 
     for (i = 0; i < config->flow_count; i++) {
-        if (init_flow_stage(&stages[i], &config->flows[i], relay_mode) != WG_PIPE_OK) {
+        if (init_flow_stage(&stages[i], &config->flows[i], relay_mode, false) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }
@@ -1041,6 +1091,7 @@ typedef struct UdpIngressCtx {
     struct sockaddr_storage  local;
     socklen_t                local_len;
     _Atomic int              running;
+    _Atomic int              failed;
     pthread_mutex_t          segment_mtx;
     pthread_cond_t           segment_ready;
     int                      segment_sync_ready;
@@ -1108,6 +1159,8 @@ static WgPipelineStatus udp_reopen_flushed_segment(UdpIngressCtx *ctx, FlowStage
             pthread_mutex_unlock(&ctx->segment_mtx);
             return WG_PIPE_ERR;
         }
+        FileDrain_close(&st->drain);
+        st->segment_id++;
         st->ingest_done = false;
         st->segment_input_drained = false;
         st->segment_packet_limit = 0;
@@ -1172,6 +1225,12 @@ static void *udp_ingress_thread(void *arg)
                 break;
             }
 
+            if (open_udp_segment_output(&ctx->stages[flow_id]) != WG_PIPE_OK) {
+                atomic_store(&ctx->failed, 1);
+                pthread_mutex_unlock(&ctx->segment_mtx);
+                break;
+            }
+
             if (ingress_push(ctx->mgr, flow_id, buf, (size_t)n) == INGRESS_PUSH_OK) {
                 atomic_fetch_add(&ctx->stages[flow_id].packets_pushed, 1);
                 udp_touch_flow(&ctx->stages[flow_id]);
@@ -1218,7 +1277,6 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
     FlowManagerConfig mgr_cfg;
     FlowStage        *stages = NULL;
     WgFlowPath       *paths = NULL;
-    char            (*out_paths)[512] = NULL;
     FlowPeerMap      *peer_map = NULL;
     UdpIngressCtx     udp_ctx;
     pthread_t         udp_thread;
@@ -1237,26 +1295,21 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
     memset(&udp_ctx, 0, sizeof(udp_ctx));
     stages = calloc(config->max_flows, sizeof(*stages));
     paths = calloc(config->max_flows, sizeof(*paths));
-    out_paths = calloc(config->max_flows, sizeof(*out_paths));
-    if (stages == NULL || paths == NULL || out_paths == NULL) {
+    if (stages == NULL || paths == NULL) {
         status = WG_PIPE_ERR;
         goto cleanup;
     }
 
     for (i = 0; i < config->max_flows; i++) {
-        int n = snprintf(out_paths[i], sizeof(out_paths[i]), "%s%u.bin",
-                         config->output_prefix, i);
+        paths[i].flow_id = i;
+        paths[i].input_path = NULL;
+        paths[i].output_path = config->output_prefix;
 
-        if (n < 0 || (size_t)n >= sizeof(out_paths[i])) {
+        if (init_flow_stage(&stages[i], &paths[i], false, true) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }
-
-        paths[i].flow_id = i;
-        paths[i].input_path = NULL;
-        paths[i].output_path = out_paths[i];
-
-        if (init_flow_stage(&stages[i], &paths[i], false) != WG_PIPE_OK) {
+        if (configure_udp_segment_output(&stages[i], config->output_prefix) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }
@@ -1299,6 +1352,7 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
     udp_ctx.flow_count = config->max_flows;
     udp_ctx.local_len = sizeof(udp_ctx.local);
     atomic_store(&udp_ctx.running, 1);
+    atomic_store(&udp_ctx.failed, 0);
     if (pthread_mutex_init(&udp_ctx.segment_mtx, NULL) != 0) {
         status = WG_PIPE_ERR;
         goto cleanup_mgr;
@@ -1326,7 +1380,7 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
     }
     udp_started = 1;
 
-    fprintf(stderr, "UDP ingress on port %u, outputs %s0.bin …\n",
+    fprintf(stderr, "UDP ingress on port %u, outputs %sflow0_segment0.bin …\n",
             (unsigned)config->port, config->output_prefix);
 
     for (;;) {
@@ -1336,6 +1390,11 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
 
         if (time_utils_now_mono(&now) == TU_OK) {
             now_ns = (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec;
+        }
+
+        if (atomic_load(&udp_ctx.failed)) {
+            status = WG_PIPE_ERR;
+            goto cleanup_running;
         }
 
         udp_close_idle_segments(&udp_ctx, now_ns, config->idle_sec);
@@ -1395,14 +1454,13 @@ cleanup_running:
 
     for (i = 0; i < config->max_flows; i++) {
         fprintf(stderr,
-                "flow %u: enq_bps=%.0f deq_bps=%.0f packets=%llu pushed=%llu -> %s\n",
+                "flow %u: enq_bps=%.0f deq_bps=%.0f packets=%llu pushed=%llu\n",
                 i,
                 flow_metrics_get_enqueue_bps(&mgr.flows[i].metrics),
                 flow_metrics_get_dequeue_bps(&mgr.flows[i].metrics),
                 (unsigned long long)atomic_load(
                     &mgr.flows[i].metrics.dequeued_packets),
-                (unsigned long long)atomic_load(&stages[i].packets_pushed),
-                out_paths[i]);
+                (unsigned long long)atomic_load(&stages[i].packets_pushed));
     }
     flow_manager_stop(&mgr);
 
@@ -1425,7 +1483,6 @@ cleanup:
         free(stages);
     }
     free(paths);
-    free(out_paths);
 
     return status;
 }
