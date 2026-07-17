@@ -18,6 +18,7 @@ typedef struct WireUdpRecvConfig {
     const char *output_path;
     CodecKind   codec_kind;
     unsigned    idle_sec;
+    int         best_effort;
 } WireUdpRecvConfig;
 
 int wire_udp_send(const WireUdpSendConfig *config);

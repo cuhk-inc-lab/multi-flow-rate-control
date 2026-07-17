@@ -33,9 +33,8 @@ cmp c.ts  out_c.ts
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
-The local demo transfer does not drop packets. `xor-fec` therefore round-trips
-normally; `XorFecCodec_recover_one()` is the transport-facing helper for
-recovering one identified missing shard in a future network receiver.
+The local demo transfer does not drop packets. The wire UDP receiver recovers
+one missing XOR FEC shard automatically when it receives 4 of 5 shards.
 
 ```bash
 ./build/wg_multi_pipeline --no-pace --codec xor-fec input.ts output.ts
@@ -47,6 +46,15 @@ simulated loss, recovery, and decoded output):
 
 ```bash
 make fec-trace
+```
+
+**XOR FEC best-effort wire receive:** use this only for live media. After the
+end marker and `--idle-sec` timeout, unrecoverable groups output their received
+data shards in order and skip missing data shards; parity is not output.
+
+```bash
+./build/wg_multi_pipeline --codec xor-fec \
+  --udp-recv 9000 received.ts --idle-sec 1 --best-effort
 ```
 
 **Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  

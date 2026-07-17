@@ -44,6 +44,9 @@ following codecs:
 - `copy`: preserves the existing 4-input-packet to 8-output-packet block
   geometry without `+1/-1` arithmetic.
 - `block`: the existing `+1/-1` BlockCodec.
+- `xor-fec`: four data shards plus one XOR parity shard. The receiver restores
+  one missing shard; `--best-effort` writes available data shards from groups
+  that still cannot be recovered after the idle timeout.
 
 On VM2:
 

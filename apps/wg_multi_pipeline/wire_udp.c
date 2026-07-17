@@ -2,6 +2,7 @@
 
 #include "codec.h"
 #include "stream_config.h"
+#include "xor_fec_codec.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -398,31 +399,162 @@ static bool group_complete(const WireGroup *group)
     return group->received_mask == required;
 }
 
-static int flush_complete_groups(WireGroup groups[WIRE_GROUP_WINDOW],
-                                 uint64_t *next_block, const Codec *codec,
-                                 FILE *output, uint64_t *output_bytes)
+static unsigned group_received_count(const WireGroup *group)
+{
+    uint16_t mask;
+    unsigned count = 0;
+
+    if (group == NULL) {
+        return 0;
+    }
+
+    mask = group->received_mask;
+    while (mask != 0) {
+        count += mask & 1u;
+        mask >>= 1;
+    }
+    return count;
+}
+
+static int recover_xor_group(WireGroup *group, const Codec *codec,
+                             uint64_t *recovered_groups)
+{
+    unsigned char *shards[5];
+    bool present[5];
+    size_t shard;
+    int recovered;
+
+    if (group == NULL || codec != XorFecCodec_get() || group_complete(group)) {
+        return 0;
+    }
+    if (group->shard_count != 5u || group_received_count(group) < 4u) {
+        return 0;
+    }
+
+    for (shard = 0; shard < 5u; shard++) {
+        shards[shard] = group->data + shard * PKG_SIZE;
+        present[shard] = (group->received_mask & (uint16_t)(1u << shard)) != 0;
+    }
+    recovered = XorFecCodec_recover_one(shards, present);
+    if (recovered < 0) {
+        return -1;
+    }
+    if (recovered > 0) {
+        group->received_mask = 0x1fu;
+        if (recovered_groups != NULL) {
+            (*recovered_groups)++;
+        }
+    }
+
+    return 0;
+}
+
+static int write_decoded_group(WireGroup *group, const Codec *codec,
+                               FILE *output, uint64_t *output_bytes)
 {
     size_t input_size = Codec_input_block_size(codec);
     size_t output_size = Codec_output_block_size(codec);
 
+    if (group == NULL || group->valid_len == 0 || group->valid_len > input_size ||
+        group->shard_count * PKG_SIZE != output_size) {
+        return -1;
+    }
+    Codec_decode(codec, group->data, output_size);
+    if (fwrite(group->data, 1, group->valid_len, output) != group->valid_len) {
+        return -1;
+    }
+    *output_bytes += group->valid_len;
+    group->in_use = false;
+    return 0;
+}
+
+static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
+                                    uint64_t *next_block, const Codec *codec,
+                                    FILE *output, uint64_t *output_bytes,
+                                    uint64_t *recovered_groups)
+{
     for (;;) {
         WireGroup *group = find_group(groups, *next_block);
 
-        if (group == NULL || !group_complete(group)) {
+        if (group == NULL) {
             return 0;
         }
-        if (group->valid_len == 0 || group->valid_len > input_size ||
-            group->shard_count * PKG_SIZE != output_size) {
+        if (recover_xor_group(group, codec, recovered_groups) != 0) {
             return -1;
         }
-        Codec_decode(codec, group->data, output_size);
-        if (fwrite(group->data, 1, group->valid_len, output) != group->valid_len) {
+        if (!group_complete(group)) {
+            return 0;
+        }
+        if (write_decoded_group(group, codec, output, output_bytes) != 0) {
             return -1;
         }
-        *output_bytes += group->valid_len;
-        group->in_use = false;
         (*next_block)++;
     }
+}
+
+static int write_best_effort_xor_group(WireGroup *group, FILE *output,
+                                       uint64_t *output_bytes,
+                                       uint64_t *missing_data_shards)
+{
+    size_t remaining;
+    size_t shard;
+
+    if (group == NULL || group->shard_count != 5u ||
+        group->valid_len == 0 || group->valid_len > DECODE_BLOCK) {
+        return -1;
+    }
+
+    remaining = group->valid_len;
+    for (shard = 0; shard < PACKAGES_PER_DECODE_BLOCK && remaining > 0; shard++) {
+        size_t shard_len = remaining > PKG_SIZE ? PKG_SIZE : remaining;
+
+        if ((group->received_mask & (uint16_t)(1u << shard)) != 0) {
+            if (fwrite(group->data + shard * PKG_SIZE, 1, shard_len, output) != shard_len) {
+                return -1;
+            }
+            *output_bytes += shard_len;
+        } else if (missing_data_shards != NULL) {
+            (*missing_data_shards)++;
+        }
+        remaining -= shard_len;
+    }
+
+    group->in_use = false;
+    return 0;
+}
+
+static int flush_best_effort_xor_groups(WireGroup groups[WIRE_GROUP_WINDOW],
+                                        uint64_t *next_block,
+                                        uint64_t end_block_count,
+                                        const Codec *codec, FILE *output,
+                                        uint64_t *output_bytes,
+                                        uint64_t *recovered_groups,
+                                        uint64_t *dropped_groups,
+                                        uint64_t *missing_data_shards)
+{
+    while (*next_block < end_block_count) {
+        WireGroup *group = find_group(groups, *next_block);
+
+        if (group == NULL) {
+            (*dropped_groups)++;
+            (*next_block)++;
+            continue;
+        }
+        if (recover_xor_group(group, codec, recovered_groups) != 0) {
+            return -1;
+        }
+        if (group_complete(group)) {
+            if (write_decoded_group(group, codec, output, output_bytes) != 0) {
+                return -1;
+            }
+        } else if (write_best_effort_xor_group(group, output, output_bytes,
+                                                missing_data_shards) != 0) {
+            return -1;
+        }
+        (*next_block)++;
+    }
+
+    return 0;
 }
 
 int wire_udp_recv(const WireUdpRecvConfig *config)
@@ -442,6 +574,8 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     uint64_t malformed_datagrams = 0;
     uint64_t dropped_groups = 0;
     uint64_t missing_groups = 0;
+    uint64_t recovered_groups = 0;
+    uint64_t missing_data_shards = 0;
     bool end_seen = false;
     double last_receive;
     FILE *output = NULL;
@@ -454,6 +588,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
     codec = Codec_get(config->codec_kind);
     if (codec == NULL) {
+        return -1;
+    }
+    if (config->best_effort && codec != XorFecCodec_get()) {
         return -1;
     }
     input_size = Codec_input_block_size(codec);
@@ -488,6 +625,14 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         if (polled == 0) {
             if (end_seen &&
                 monotonic_seconds() - last_receive >= (double)config->idle_sec) {
+                if (config->best_effort &&
+                    flush_best_effort_xor_groups(groups, &next_block,
+                                                 end_block_count, codec, output,
+                                                 &output_bytes, &recovered_groups,
+                                                 &dropped_groups,
+                                                 &missing_data_shards) != 0) {
+                    goto cleanup;
+                }
                 break;
             }
             continue;
@@ -566,8 +711,8 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             group->received_mask |= bit;
             received_datagrams++;
 
-            if (flush_complete_groups(groups, &next_block, codec, output,
-                                      &output_bytes) != 0) {
+            if (flush_recoverable_groups(groups, &next_block, codec, output,
+                                         &output_bytes, &recovered_groups) != 0) {
                 goto cleanup;
             }
             if (end_seen && next_block == end_block_count) {
@@ -592,13 +737,16 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
     fprintf(stderr,
             "udp-recv: output_bytes=%llu datagrams=%llu duplicates=%llu late=%llu "
-            "malformed=%llu dropped_groups=%llu\n",
+            "malformed=%llu recovered_groups=%llu dropped_groups=%llu "
+            "missing_data_shards=%llu\n",
             (unsigned long long)output_bytes,
             (unsigned long long)received_datagrams,
             (unsigned long long)duplicate_datagrams,
             (unsigned long long)late_datagrams,
             (unsigned long long)malformed_datagrams,
-            (unsigned long long)dropped_groups);
+            (unsigned long long)recovered_groups,
+            (unsigned long long)dropped_groups,
+            (unsigned long long)missing_data_shards);
     result = 0;
 
 cleanup:

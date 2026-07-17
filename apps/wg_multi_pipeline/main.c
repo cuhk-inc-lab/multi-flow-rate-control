@@ -14,7 +14,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec] [--rate-mbps N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec] --udp-recv <port> <output.ts> [--idle-sec N]\n"
+            "  %s [--codec block|copy|xor-fec] --udp-recv <port> <output.ts> [--idle-sec N] [--best-effort]\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
@@ -117,11 +117,12 @@ int main(int argc, char **argv)
     if (argi < argc && strcmp(argv[argi], "--udp-recv") == 0) {
         WireUdpRecvConfig cfg;
         unsigned idle_sec = 3u;
+        int best_effort = 0;
         char *end = NULL;
         long port;
+        const char *output_path;
 
-        if (codec_kind == CODEC_KIND_NONE ||
-            ((argc - argi != 3) && (argc - argi != 5))) {
+        if (codec_kind == CODEC_KIND_NONE || argc - argi < 3) {
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
@@ -130,22 +131,34 @@ int main(int argc, char **argv)
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
-        if (argc - argi == 5) {
-            if (strcmp(argv[argi + 3], "--idle-sec") != 0) {
-                print_usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            idle_sec = (unsigned)strtoul(argv[argi + 4], NULL, 10);
-            if (idle_sec == 0) {
+        output_path = argv[argi + 2];
+        argi += 3;
+        while (argi < argc) {
+            if (strcmp(argv[argi], "--idle-sec") == 0) {
+                if (argi + 1 >= argc) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                idle_sec = (unsigned)strtoul(argv[argi + 1], NULL, 10);
+                if (idle_sec == 0) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                argi += 2;
+            } else if (strcmp(argv[argi], "--best-effort") == 0) {
+                best_effort = 1;
+                argi++;
+            } else {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
         }
         cfg = (WireUdpRecvConfig){
             .port = (uint16_t)port,
-            .output_path = argv[argi + 2],
+            .output_path = output_path,
             .codec_kind = codec_kind,
             .idle_sec = idle_sec,
+            .best_effort = best_effort,
         };
         return wire_udp_recv(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
