@@ -4,7 +4,7 @@
 #
 # Pipeline: --no-pace --codec <method> --multi. ffmpeg -re provides pacing.
 #
-# Usage: ./scripts/run_dual_fifo.sh [--codec block|copy|xor-fec|none] [dir_with_input_*m.ts]
+# Usage: ./scripts/run_dual_fifo.sh [--codec block|copy|xor-fec|rs-fec|none] [dir_with_input_*m.ts]
 # Close one window → others keep playing. Close all three → demo exits.
 set -euo pipefail
 
@@ -16,11 +16,12 @@ BIN="$REPO/build/wg_multi_pipeline"
 
 usage() {
     cat <<EOF
-Usage: $0 [--codec block|copy|xor-fec|none] [dir_with_input_*m.ts]
+Usage: $0 [--codec block|copy|xor-fec|rs-fec|none] [dir_with_input_*m.ts]
 
   block    Existing reversible +/- BlockCodec demo transform (default)
   copy     Systematic copy codec
   xor-fec  Four data TS packets plus one XOR parity packet
+  rs-fec   Reed-Solomon: four data TS packets plus two parity packets
   none     Pointer-only relay; no codec
 EOF
 }
@@ -55,7 +56,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$CODEC" in
-block|copy|xor-fec|none) ;;
+block|copy|xor-fec|rs-fec|none) ;;
 *)
     echo "Unsupported codec: $CODEC" >&2
     usage >&2

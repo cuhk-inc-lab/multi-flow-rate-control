@@ -61,11 +61,60 @@ static size_t xor_fec_output_block_size(const Codec *self)
     return XOR_FEC_ENCODE_BLOCK;
 }
 
+static size_t xor_fec_data_shards(const Codec *self)
+{
+    (void)self;
+    return PACKAGES_PER_DECODE_BLOCK;
+}
+
+static size_t xor_fec_parity_shards(const Codec *self)
+{
+    (void)self;
+    return XOR_FEC_PARITY_SHARDS;
+}
+
+static int xor_fec_is_systematic(const Codec *self)
+{
+    (void)self;
+    return 1;
+}
+
+static CodecRecoverStatus xor_fec_recover(const Codec *self,
+                                          unsigned char *shards,
+                                          uint16_t present_mask)
+{
+    unsigned char *shard_ptrs[XOR_FEC_SHARD_COUNT];
+    bool present[XOR_FEC_SHARD_COUNT];
+    size_t shard;
+    int recovered;
+
+    (void)self;
+
+    if (shards == NULL || (present_mask & (uint16_t)~0x1fu) != 0) {
+        return CODEC_RECOVER_ERR;
+    }
+
+    for (shard = 0; shard < XOR_FEC_SHARD_COUNT; shard++) {
+        shard_ptrs[shard] = shards + shard * PKG_SIZE;
+        present[shard] = (present_mask & (uint16_t)(1u << shard)) != 0;
+    }
+
+    recovered = XorFecCodec_recover_one(shard_ptrs, present);
+    if (recovered < 0) {
+        return CODEC_RECOVER_UNAVAILABLE;
+    }
+    return CODEC_RECOVER_OK;
+}
+
 static const CodecVTable xor_fec_codec_vtable = {
     .encode = xor_fec_encode,
     .decode = xor_fec_decode,
     .input_block_size = xor_fec_input_block_size,
     .output_block_size = xor_fec_output_block_size,
+    .data_shards = xor_fec_data_shards,
+    .parity_shards = xor_fec_parity_shards,
+    .is_systematic = xor_fec_is_systematic,
+    .recover = xor_fec_recover,
 };
 
 static const Codec xor_fec_codec = {

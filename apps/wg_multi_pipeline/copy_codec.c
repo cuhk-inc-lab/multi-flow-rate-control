@@ -41,11 +41,32 @@ static size_t copy_output_block_size(const Codec *self)
     return ENCODE_BLOCK;
 }
 
+static size_t copy_data_shards(const Codec *self)
+{
+    (void)self;
+    return PACKAGES_PER_DECODE_BLOCK;
+}
+
+static size_t copy_parity_shards(const Codec *self)
+{
+    (void)self;
+    return PACKAGES_PER_ENCODE_BLOCK - PACKAGES_PER_DECODE_BLOCK;
+}
+
+static int copy_is_systematic(const Codec *self)
+{
+    (void)self;
+    return 1;
+}
+
 static const CodecVTable copy_codec_vtable = {
     .encode = copy_encode,
     .decode = copy_decode,
     .input_block_size = copy_input_block_size,
     .output_block_size = copy_output_block_size,
+    .data_shards = copy_data_shards,
+    .parity_shards = copy_parity_shards,
+    .is_systematic = copy_is_systematic,
 };
 
 static const Codec copy_codec = {

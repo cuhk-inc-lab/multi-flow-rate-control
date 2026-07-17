@@ -34,16 +34,18 @@ ingress (188-byte TS packets)
        B) --no-codec relay: DataPacket* queue → FileDrain_write_packet → output
 ```
 
-**BlockCodec and XOR FEC are not encryption.** BlockCodec is a reversible demo
-transform (per-byte `+/-` in `block_codec.c`). XOR FEC adds one parity TS packet
-for every four data TS packets; it can recover one identified missing shard when
-used with a packet-aware transport receiver. The local transfer demo is reliable,
-so both codec paths should match the original payload for offline `cmp`.
+**BlockCodec, XOR FEC, and RS FEC are not encryption.** BlockCodec is a reversible
+demo transform (per-byte `+/-` in `block_codec.c`). XOR FEC adds one parity TS
+packet for every four data TS packets; RS FEC adds two parity packets. Their
+packet-aware transport receiver can recover one and two missing shards,
+respectively. The local transfer demo is reliable, so both codec paths should
+match the original payload for offline `cmp`.
 
 | Path | When | What |
 |------|------|------|
 | Default (`--codec block`) | Demo 1, Demo 3 live script, `make integration-test` | Full BlockCodec encode/decode |
 | `--codec xor-fec` | File/FIFO/UDP demo | 4 data TS packets + 1 XOR parity packet |
+| `--codec rs-fec` | File/FIFO/UDP demo | RS(4,2): 4 data TS packets + 2 parity packets |
 | `--no-codec` | Optional relay | Skip BlockCodec; pointer-only pass-through |
 
 | Concept | Value / location |
@@ -62,6 +64,7 @@ so both codec paths should match the original payload for offline `cmp`.
 | `--no-pace` | Disable timeline pacing (needed for `cmp`; live demos use it because `ffmpeg -re` already paces) |
 | `--codec block` | Default existing `+/-` BlockCodec demo transform |
 | `--codec xor-fec` | Select XOR FEC (4 data packets + 1 parity packet) |
+| `--codec rs-fec` | Select RS(4,2) FEC (4 data packets + 2 parity packets) |
 | `--codec none` / `--no-codec` | Skip coding; relay only (not used by Demo 3 script) |
 | `--multi` | Multiple `input output` pairs (required for 2+ flows) |
 | (default) | Pacing **on** + BlockCodec **on** |
@@ -233,14 +236,15 @@ make wg-demo
 
 # Select another method:
 ./scripts/run_dual_fifo.sh --codec xor-fec
-# Available: block (default), copy, xor-fec, none
+./scripts/run_dual_fifo.sh --codec rs-fec
+# Available: block (default), copy, xor-fec, rs-fec, none
 ```
 
 What the script does:
 
 1. Opens **three** `ffplay` windows (`1Mbps` / `10Mbps` / `20Mbps`)
 2. Starts `./build/wg_multi_pipeline --no-pace --codec <method> --multi …`
-   (`block` by default; select `copy`, `xor-fec`, or `none` with the script)
+   (`block` by default; select `copy`, `xor-fec`, `rs-fec`, or `none` with the script)
 3. Pushes all three files with `ffmpeg -re` (realtime)
 
 **Per-flow path in this demo:**

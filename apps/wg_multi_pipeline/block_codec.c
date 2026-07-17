@@ -66,11 +66,32 @@ static size_t block_output_block_size(const Codec *self)
     return ENCODE_BLOCK;
 }
 
+static size_t block_data_shards(const Codec *self)
+{
+    (void)self;
+    return PACKAGES_PER_DECODE_BLOCK;
+}
+
+static size_t block_parity_shards(const Codec *self)
+{
+    (void)self;
+    return PACKAGES_PER_ENCODE_BLOCK - PACKAGES_PER_DECODE_BLOCK;
+}
+
+static int block_is_systematic(const Codec *self)
+{
+    (void)self;
+    return 0;
+}
+
 static const CodecVTable block_codec_vtable = {
     .encode = block_encode,
     .decode = block_decode,
     .input_block_size = block_input_block_size,
     .output_block_size = block_output_block_size,
+    .data_shards = block_data_shards,
+    .parity_shards = block_parity_shards,
+    .is_systematic = block_is_systematic,
 };
 
 static const Codec block_codec = {

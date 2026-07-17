@@ -10,18 +10,18 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|none] <input.ts> <output.ts>\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
-            "  %s [--codec block|copy|xor-fec] [--rate-mbps N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec] --udp-recv <port> <output.ts> [--idle-sec N] [--best-effort]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] <input.ts> <output.ts>\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] --udp-send <host> <port> <input.ts>\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts> [--idle-sec N] [--best-effort]\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
             "         -> selected codec encode -> buffer transfer -> decode -> file\n"
             "\n"
             "Codecs: block (default, existing demo), copy (4-to-8 benchmark without arithmetic),\n"
-            "        xor-fec (4 data + 1 XOR parity),\n"
+            "        xor-fec (4 data + 1 XOR parity), rs-fec (RS 4 data + 2 parity),\n"
             "        none (file/FIFO relay mode; --no-codec alias)\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
@@ -65,6 +65,8 @@ int main(int argc, char **argv)
                 codec_kind = CODEC_KIND_COPY;
             } else if (strcmp(argv[argi + 1], "xor-fec") == 0) {
                 codec_kind = CODEC_KIND_XOR_FEC;
+            } else if (strcmp(argv[argi + 1], "rs-fec") == 0) {
+                codec_kind = CODEC_KIND_RS_FEC;
             } else if (strcmp(argv[argi + 1], "none") == 0) {
                 codec_kind = CODEC_KIND_NONE;
             } else {

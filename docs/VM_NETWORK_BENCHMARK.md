@@ -47,6 +47,9 @@ following codecs:
 - `xor-fec`: four data shards plus one XOR parity shard. The receiver restores
   one missing shard; `--best-effort` writes available data shards from groups
   that still cannot be recovered after the idle timeout.
+- `rs-fec`: RS(4,2), with four data shards and two parity shards. The receiver
+  restores up to two missing shards when at least four shards arrive; its
+  systematic `--best-effort` behavior is the same as `xor-fec`.
 
 On VM2:
 

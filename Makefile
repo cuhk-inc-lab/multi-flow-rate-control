@@ -1,6 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -O2
 LDFLAGS = -pthread
+RS_LDFLAGS = -lerasurecode_rs_vand
 
 CB_DIR   = ../buffer-management-module
 CB_INC   = $(CB_DIR)/include
@@ -44,6 +45,7 @@ WG_APP_SRCS = \
 	$(WG_DIR)/block_codec.c \
 	$(WG_DIR)/copy_codec.c \
 	$(WG_DIR)/xor_fec_codec.c \
+	$(WG_DIR)/rs_fec_codec.c \
 	$(WG_DIR)/wire_udp.c \
 	$(WG_DIR)/file_drain.c
 
@@ -55,6 +57,7 @@ WG_OBJS = \
 	$(OBJ_DIR)/wg_block_codec.o \
 	$(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_fec_codec.o \
 	$(OBJ_DIR)/wg_wire_udp.o \
 	$(OBJ_DIR)/wg_file_drain.o
 
@@ -92,6 +95,7 @@ integration-test wg-demo-test: $(WG_BIN) $(WG_CODEC_TEST_BIN)
 	cmp $(WG_TEST_IN2) $(WG_TEST_OUT2)
 	sh $(TEST_DIR)/wire_loopback_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_xor_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
+	sh $(TEST_DIR)/wire_rs_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
@@ -123,17 +127,18 @@ $(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -c $< -o $@
 
 $(WG_BIN): $(WG_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(WG_DIR) $(WG_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $(WG_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(WG_CODEC_TEST_BIN): $(TEST_DIR)/wg_codec_tests.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
-	$(OBJ_DIR)/wg_xor_fec_codec.o | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS)
+	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(FEC_TRACE_BIN): $(TEST_DIR)/fec_trace.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o \
-	$(OBJ_DIR)/wg_copy_codec.o $(OBJ_DIR)/wg_xor_fec_codec.o | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS)
+	$(OBJ_DIR)/wg_copy_codec.o $(OBJ_DIR)/wg_xor_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_fec_codec.o | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 clean:
 	rm -rf $(OBJ_DIR)

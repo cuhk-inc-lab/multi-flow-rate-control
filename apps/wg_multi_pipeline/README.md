@@ -29,12 +29,14 @@ cmp c.ts  out_c.ts
 | `--no-pace` | Disable pacing; byte-exact for `cmp`; live scripts use this with `ffmpeg -re` |
 | `--codec block` | Default: existing reversible `+/-` BlockCodec demo transform |
 | `--codec xor-fec` | Systematic XOR FEC: 4 data TS packets + 1 parity packet |
+| `--codec rs-fec` | Systematic Reed-Solomon FEC: 4 data TS packets + 2 parity packets |
 | `--codec none` / `--no-codec` | Optional relay: skip coding; pointer-only post-worker queue |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
 The local demo transfer does not drop packets. The wire UDP receiver recovers
-one missing XOR FEC shard automatically when it receives 4 of 5 shards.
+one missing XOR FEC shard automatically when it receives 4 of 5 shards. With
+`rs-fec`, it recovers up to two missing shards when any 4 of 6 shards arrive.
 
 ```bash
 ./build/wg_multi_pipeline --no-pace --codec xor-fec input.ts output.ts
@@ -48,13 +50,20 @@ simulated loss, recovery, and decoded output):
 make fec-trace
 ```
 
-**XOR FEC best-effort wire receive:** use this only for live media. After the
+**Systematic FEC best-effort wire receive:** use this only for live media. After the
 end marker and `--idle-sec` timeout, unrecoverable groups output their received
 data shards in order and skip missing data shards; parity is not output.
 
 ```bash
 ./build/wg_multi_pipeline --codec xor-fec \
   --udp-recv 9000 received.ts --idle-sec 1 --best-effort
+```
+
+`rs-fec` uses the BSD-licensed native Vandermonde backend provided by
+`liberasurecode-dev`; install it before building on Debian/Ubuntu:
+
+```bash
+sudo apt-get install liberasurecode-dev
 ```
 
 **Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  

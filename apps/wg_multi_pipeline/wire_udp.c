@@ -2,7 +2,6 @@
 
 #include "codec.h"
 #include "stream_config.h"
-#include "xor_fec_codec.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -250,7 +249,8 @@ int wire_udp_send(const WireUdpSendConfig *config)
         return -1;
     }
     shard_count = (uint16_t)(output_size / PKG_SIZE);
-    if (shard_count == 0 || shard_count > WIRE_MAX_SHARDS) {
+    if (shard_count == 0 || shard_count > WIRE_MAX_SHARDS ||
+        shard_count != Codec_data_shards(codec) + Codec_parity_shards(codec)) {
         return -1;
     }
 
@@ -416,34 +416,32 @@ static unsigned group_received_count(const WireGroup *group)
     return count;
 }
 
-static int recover_xor_group(WireGroup *group, const Codec *codec,
-                             uint64_t *recovered_groups)
+static int recover_group(WireGroup *group, const Codec *codec,
+                         uint64_t *recovered_groups)
 {
-    unsigned char *shards[5];
-    bool present[5];
-    size_t shard;
-    int recovered;
+    size_t data_shards;
+    CodecRecoverStatus status;
 
-    if (group == NULL || codec != XorFecCodec_get() || group_complete(group)) {
-        return 0;
-    }
-    if (group->shard_count != 5u || group_received_count(group) < 4u) {
+    if (group == NULL || codec == NULL || group_complete(group)) {
         return 0;
     }
 
-    for (shard = 0; shard < 5u; shard++) {
-        shards[shard] = group->data + shard * PKG_SIZE;
-        present[shard] = (group->received_mask & (uint16_t)(1u << shard)) != 0;
+    data_shards = Codec_data_shards(codec);
+    if (data_shards == 0 || group_received_count(group) < data_shards) {
+        return 0;
     }
-    recovered = XorFecCodec_recover_one(shards, present);
-    if (recovered < 0) {
+
+    status = Codec_recover(codec, group->data, group->received_mask);
+    if (status == CODEC_RECOVER_UNAVAILABLE) {
+        return 0;
+    }
+    if (status != CODEC_RECOVER_OK) {
         return -1;
     }
-    if (recovered > 0) {
-        group->received_mask = 0x1fu;
-        if (recovered_groups != NULL) {
-            (*recovered_groups)++;
-        }
+
+    group->received_mask = (uint16_t)((1u << group->shard_count) - 1u);
+    if (recovered_groups != NULL) {
+        (*recovered_groups)++;
     }
 
     return 0;
@@ -479,7 +477,7 @@ static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
         if (group == NULL) {
             return 0;
         }
-        if (recover_xor_group(group, codec, recovered_groups) != 0) {
+        if (recover_group(group, codec, recovered_groups) != 0) {
             return -1;
         }
         if (!group_complete(group)) {
@@ -492,20 +490,28 @@ static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
     }
 }
 
-static int write_best_effort_xor_group(WireGroup *group, FILE *output,
-                                       uint64_t *output_bytes,
-                                       uint64_t *missing_data_shards)
+static int write_best_effort_group(WireGroup *group, const Codec *codec,
+                                   FILE *output, uint64_t *output_bytes,
+                                   uint64_t *missing_data_shards)
 {
+    size_t data_shards;
     size_t remaining;
     size_t shard;
 
-    if (group == NULL || group->shard_count != 5u ||
-        group->valid_len == 0 || group->valid_len > DECODE_BLOCK) {
+    if (group == NULL || codec == NULL || !Codec_is_systematic(codec) ||
+        group->valid_len == 0 ||
+        group->valid_len > Codec_input_block_size(codec)) {
+        return -1;
+    }
+
+    data_shards = Codec_data_shards(codec);
+    if (data_shards == 0 || group->shard_count !=
+        Codec_data_shards(codec) + Codec_parity_shards(codec)) {
         return -1;
     }
 
     remaining = group->valid_len;
-    for (shard = 0; shard < PACKAGES_PER_DECODE_BLOCK && remaining > 0; shard++) {
+    for (shard = 0; shard < data_shards && remaining > 0; shard++) {
         size_t shard_len = remaining > PKG_SIZE ? PKG_SIZE : remaining;
 
         if ((group->received_mask & (uint16_t)(1u << shard)) != 0) {
@@ -523,14 +529,14 @@ static int write_best_effort_xor_group(WireGroup *group, FILE *output,
     return 0;
 }
 
-static int flush_best_effort_xor_groups(WireGroup groups[WIRE_GROUP_WINDOW],
-                                        uint64_t *next_block,
-                                        uint64_t end_block_count,
-                                        const Codec *codec, FILE *output,
-                                        uint64_t *output_bytes,
-                                        uint64_t *recovered_groups,
-                                        uint64_t *dropped_groups,
-                                        uint64_t *missing_data_shards)
+static int flush_best_effort_groups(WireGroup groups[WIRE_GROUP_WINDOW],
+                                    uint64_t *next_block,
+                                    uint64_t end_block_count,
+                                    const Codec *codec, FILE *output,
+                                    uint64_t *output_bytes,
+                                    uint64_t *recovered_groups,
+                                    uint64_t *dropped_groups,
+                                    uint64_t *missing_data_shards)
 {
     while (*next_block < end_block_count) {
         WireGroup *group = find_group(groups, *next_block);
@@ -540,15 +546,15 @@ static int flush_best_effort_xor_groups(WireGroup groups[WIRE_GROUP_WINDOW],
             (*next_block)++;
             continue;
         }
-        if (recover_xor_group(group, codec, recovered_groups) != 0) {
+        if (recover_group(group, codec, recovered_groups) != 0) {
             return -1;
         }
         if (group_complete(group)) {
             if (write_decoded_group(group, codec, output, output_bytes) != 0) {
                 return -1;
             }
-        } else if (write_best_effort_xor_group(group, output, output_bytes,
-                                                missing_data_shards) != 0) {
+        } else if (write_best_effort_group(group, codec, output, output_bytes,
+                                           missing_data_shards) != 0) {
             return -1;
         }
         (*next_block)++;
@@ -590,7 +596,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     if (codec == NULL) {
         return -1;
     }
-    if (config->best_effort && codec != XorFecCodec_get()) {
+    if (config->best_effort && !Codec_is_systematic(codec)) {
         return -1;
     }
     input_size = Codec_input_block_size(codec);
@@ -600,6 +606,10 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         return -1;
     }
     expected_shards = (uint16_t)(output_size / PKG_SIZE);
+    if (expected_shards == 0 || expected_shards > WIRE_MAX_SHARDS ||
+        expected_shards != Codec_data_shards(codec) + Codec_parity_shards(codec)) {
+        return -1;
+    }
 
     output = fopen(config->output_path, "wb");
     if (output == NULL) {
@@ -626,11 +636,11 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             if (end_seen &&
                 monotonic_seconds() - last_receive >= (double)config->idle_sec) {
                 if (config->best_effort &&
-                    flush_best_effort_xor_groups(groups, &next_block,
-                                                 end_block_count, codec, output,
-                                                 &output_bytes, &recovered_groups,
-                                                 &dropped_groups,
-                                                 &missing_data_shards) != 0) {
+                    flush_best_effort_groups(groups, &next_block,
+                                             end_block_count, codec, output,
+                                             &output_bytes, &recovered_groups,
+                                             &dropped_groups,
+                                             &missing_data_shards) != 0) {
                     goto cleanup;
                 }
                 break;
