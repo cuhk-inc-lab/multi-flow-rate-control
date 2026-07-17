@@ -34,6 +34,7 @@ LIB      = $(OBJ_DIR)/libmulti_flow.a
 TEST_BIN = $(OBJ_DIR)/run_tests
 WG_BIN    = $(OBJ_DIR)/wg_multi_pipeline
 WG_CODEC_TEST_BIN = $(OBJ_DIR)/wg_codec_tests
+FEC_TRACE_BIN = $(OBJ_DIR)/fec_trace
 
 WG_APP_SRCS = \
 	$(WG_DIR)/main.c \
@@ -64,11 +65,14 @@ WG_TEST_OUT0 = $(OBJ_DIR)/wg_test_out0.ts
 WG_TEST_OUT1 = $(OBJ_DIR)/wg_test_out1.ts
 WG_TEST_OUT2 = $(OBJ_DIR)/wg_test_out2.ts
 
-.PHONY: all test check wg-demo integration-test sanitize tsan clean
+.PHONY: all test check wg-demo integration-test fec-trace sanitize tsan clean
 
 all: $(LIB)
 
 wg-demo: $(WG_BIN)
+
+fec-trace: $(FEC_TRACE_BIN)
+	./$(FEC_TRACE_BIN)
 
 test check: $(TEST_BIN)
 	./$(TEST_BIN)
@@ -123,6 +127,11 @@ $(WG_BIN): $(WG_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
 $(WG_CODEC_TEST_BIN): $(TEST_DIR)/wg_codec_tests.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS)
+
+$(FEC_TRACE_BIN): $(TEST_DIR)/fec_trace.c \
+	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o \
+	$(OBJ_DIR)/wg_copy_codec.o $(OBJ_DIR)/wg_xor_fec_codec.o | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS)
 
 clean:

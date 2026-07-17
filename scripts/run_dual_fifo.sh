@@ -2,16 +2,66 @@
 # Three-stream FIFO live demo — 1M / 10M / 20M through one --multi process.
 # Requires 720p input_1m/10m/20m.ts (see scripts/encode_multibitrate.sh).
 #
-# Pipeline: --no-pace --multi with BlockCodec encode/decode enabled
-# (reversible +/- transform — not encryption). ffmpeg -re provides pacing.
+# Pipeline: --no-pace --codec <method> --multi. ffmpeg -re provides pacing.
 #
-# Usage: ./scripts/run_dual_fifo.sh [dir_with_input_*m.ts]
+# Usage: ./scripts/run_dual_fifo.sh [--codec block|copy|xor-fec|none] [dir_with_input_*m.ts]
 # Close one window → others keep playing. Close all three → demo exits.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SRC_DIR="${1:-$REPO}"
+SRC_DIR="$REPO"
+SRC_DIR_SET=0
+CODEC="block"
 BIN="$REPO/build/wg_multi_pipeline"
+
+usage() {
+    cat <<EOF
+Usage: $0 [--codec block|copy|xor-fec|none] [dir_with_input_*m.ts]
+
+  block    Existing reversible +/- BlockCodec demo transform (default)
+  copy     Systematic copy codec
+  xor-fec  Four data TS packets plus one XOR parity packet
+  none     Pointer-only relay; no codec
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --codec)
+        [[ $# -ge 2 ]] || { usage >&2; exit 1; }
+        CODEC="$2"
+        shift 2
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    -*)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    *)
+        if [[ "$SRC_DIR_SET" -ne 0 ]]; then
+            echo "Only one input directory may be supplied." >&2
+            usage >&2
+            exit 1
+        fi
+        SRC_DIR="$1"
+        SRC_DIR_SET=1
+        shift
+        ;;
+    esac
+done
+
+case "$CODEC" in
+block|copy|xor-fec|none) ;;
+*)
+    echo "Unsupported codec: $CODEC" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
 
 IN0=/tmp/live_in0.ts
 IN1=/tmp/live_in1.ts
@@ -57,8 +107,8 @@ ffplay -loglevel quiet -an \
 FF2_PID=$!
 sleep 1
 
-echo "=== 2/4 pipeline --multi (background, BlockCodec encode/decode) ==="
-"$BIN" --no-pace --multi \
+echo "=== 2/4 pipeline --multi (background, codec: $CODEC) ==="
+"$BIN" --no-pace --codec "$CODEC" --multi \
     "$IN0" "$OUT0" \
     "$IN1" "$OUT1" \
     "$IN2" "$OUT2" &
@@ -74,7 +124,7 @@ ffmpeg -loglevel quiet -re -i "$SRC_DIR/input_20m.ts" -c copy -f mpegts -y "$IN2
 FFM2_PID=$!
 
 echo "=== 4/4 streaming… (Ctrl+C or close all windows to stop) ==="
-echo "Path: multi-flow split → BlockCodec encode/decode → three ffplay windows."
+echo "Path: multi-flow split → $CODEC encode/decode → three ffplay windows."
 
 # Exit when all players are gone, or all pushers finished (natural end).
 while true; do

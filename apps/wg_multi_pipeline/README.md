@@ -42,6 +42,13 @@ recovering one identified missing shard in a future network receiver.
 cmp input.ts output.ts
 ```
 
+**Visual XOR FEC trace** (data `A` / `B` / `C` / `D`, generated parity, one
+simulated loss, recovery, and decoded output):
+
+```bash
+make fec-trace
+```
+
 **Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  
 (`scripts/run_dual_fifo.sh` uses `--no-pace --multi` with BlockCodec enabled).
 

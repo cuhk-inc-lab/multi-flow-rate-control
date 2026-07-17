@@ -230,20 +230,24 @@ killall ffmpeg ffplay wg_multi_pipeline 2>/dev/null
 cd /path/to/multi-flow-rate-control
 make wg-demo
 ./scripts/run_dual_fifo.sh
+
+# Select another method:
+./scripts/run_dual_fifo.sh --codec xor-fec
+# Available: block (default), copy, xor-fec, none
 ```
 
 What the script does:
 
 1. Opens **three** `ffplay` windows (`1Mbps` / `10Mbps` / `20Mbps`)
-2. Starts `./build/wg_multi_pipeline --no-pace --multi …`
-   (BlockCodec **on**: reversible per-byte `+/-` encode/decode — **not** crypto)
+2. Starts `./build/wg_multi_pipeline --no-pace --codec <method> --multi …`
+   (`block` by default; select `copy`, `xor-fec`, or `none` with the script)
 3. Pushes all three files with `ffmpeg -re` (realtime)
 
 **Per-flow path in this demo:**
 
 ```
 FIFO in → multi-flow split → paced-disabled worker → pipe
-       → BlockCodec encode → buffer transfer → BlockCodec decode
+       → selected codec encode → buffer transfer → selected codec decode
        → FIFO out → ffplay
 ```
 
@@ -256,12 +260,12 @@ Behaviour:
 | Let files finish | Natural end when all `ffmpeg -re` exits |
 | `Ctrl+C` | Cleanup trap stops everything |
 
-Why `--no-pace` (codec stays **enabled**):
+Why `--no-pace` (the selected codec stays **enabled**, except `none`):
 
 - `ffmpeg -re` already paces realtime; pipeline pacing on top causes stutter under 3-flow load
-- BlockCodec remains so each flow exercises encode → transfer → decode before display
+- The selected codec remains so each flow exercises encode → transfer → decode before display
 
-Optional: add `--no-codec` for pointer-only relay (no BlockCodec).
+Use `--codec none` for pointer-only relay (equivalent to `--no-codec`).
 
 ### Manual (same idea)
 
