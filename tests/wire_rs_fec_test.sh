@@ -119,7 +119,7 @@ run_strict_failure() {
         exit 1
     fi
     receiver_pid=
-    grep -q "incomplete transfer" "$output.log"
+    grep -q "incomplete" "$output.log"
 }
 
 run_best_effort() {

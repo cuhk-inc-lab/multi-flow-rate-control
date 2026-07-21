@@ -5,6 +5,7 @@
 #include "codec.h"
 #include "file_drain.h"
 #include "stream_config.h"
+#include "wire_udp.h"
 
 #include "circular_buffer.h"
 #include "flow_context.h"
@@ -62,6 +63,9 @@ typedef struct FlowStage {
      * means its encoded form is still somewhere in the stage pipeline.
      */
     size_t              tail_valid_len;
+    bool                wire_send_mode;
+    bool                wire_tail_sent;
+    bool                wire_end_sent;
 } FlowStage;
 
 static int buffer_has_space(CircularBuffer *buf, size_t need);
@@ -160,6 +164,160 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
     return WG_PIPE_OK;
 }
 
+static WgPipelineStatus init_wire_flow_stage(FlowStage *stage, uint32_t flow_id,
+                                             const char *input_path)
+{
+    if (stage == NULL || input_path == NULL) {
+        return WG_PIPE_ERR;
+    }
+
+    memset(stage, 0, sizeof(*stage));
+    stage->flow_id = flow_id;
+    stage->wire_send_mode = true;
+    atomic_init(&stage->packets_pushed, 0);
+    atomic_init(&stage->last_recv_ns, 0);
+    stage->pipefd[0] = -1;
+    stage->pipefd[1] = -1;
+    strncpy(stage->input_path, input_path, sizeof(stage->input_path) - 1u);
+    stage->input_path[sizeof(stage->input_path) - 1u] = '\0';
+
+    if (pipe(stage->pipefd) != 0) {
+        return WG_PIPE_ERR;
+    }
+
+    if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
+                    BUFFER_OVERFLOW_POLICY) != CB_OK) {
+        return WG_PIPE_ERR;
+    }
+
+    return WG_PIPE_OK;
+}
+
+static uint64_t wire_realtime_nanoseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static WgPipelineStatus send_wire_tail_block(FlowStage *st, const Codec *codec,
+                                             WireUdpTx *tx, unsigned char *work,
+                                             int *progress)
+{
+    size_t input_block_size;
+    size_t output_block_size;
+    size_t n;
+    uint64_t encode_begin_ns;
+    uint64_t encode_end_ns;
+
+    if (st == NULL || codec == NULL || tx == NULL || work == NULL) {
+        return WG_PIPE_ERR;
+    }
+    input_block_size = Codec_input_block_size(codec);
+    output_block_size = Codec_output_block_size(codec);
+    if (!st->ingest_done || !st->segment_input_drained || st->wire_tail_sent ||
+        st->post_multi_in->size == 0 ||
+        st->post_multi_in->size >= input_block_size) {
+        return WG_PIPE_OK;
+    }
+    if (!wire_udp_tx_ready(tx)) {
+        return WG_PIPE_OK;
+    }
+
+    n = st->post_multi_in->size;
+    if (Buffer_Read(st->post_multi_in, work, n) != CB_OK) {
+        return WG_PIPE_ERR;
+    }
+    memset(work + n, 0, input_block_size - n);
+    encode_begin_ns = wire_realtime_nanoseconds();
+    Codec_encode(codec, work, output_block_size);
+    encode_end_ns = wire_realtime_nanoseconds();
+    if (wire_udp_tx_send_block(tx, codec, work, n, encode_begin_ns,
+                               encode_end_ns) != 0) {
+        return WG_PIPE_ERR;
+    }
+    st->wire_tail_sent = true;
+    if (progress != NULL) {
+        *progress = 1;
+    }
+    return WG_PIPE_OK;
+}
+
+static WgPipelineStatus process_flow_wire_send(FlowStage *st, const Codec *codec,
+                                               WireUdpTx *tx, unsigned char *work,
+                                               int *progress)
+{
+    size_t input_block_size;
+    size_t output_block_size;
+
+    if (st == NULL || codec == NULL || tx == NULL || work == NULL) {
+        return WG_PIPE_ERR;
+    }
+
+    input_block_size = Codec_input_block_size(codec);
+    output_block_size = Codec_output_block_size(codec);
+    if (input_block_size == 0 || output_block_size == 0 ||
+        output_block_size > CODEC_MAX_ENCODE_BLOCK) {
+        return WG_PIPE_ERR;
+    }
+
+    while (st->post_multi_in->size >= input_block_size) {
+        uint64_t encode_begin_ns;
+        uint64_t encode_end_ns;
+
+        if (!wire_udp_tx_ready(tx)) {
+            break;
+        }
+        if (Buffer_Read(st->post_multi_in, work, input_block_size) != CB_OK) {
+            return WG_PIPE_ERR;
+        }
+        encode_begin_ns = wire_realtime_nanoseconds();
+        Codec_encode(codec, work, output_block_size);
+        encode_end_ns = wire_realtime_nanoseconds();
+        if (wire_udp_tx_send_block(tx, codec, work, input_block_size,
+                                   encode_begin_ns, encode_end_ns) != 0) {
+            return WG_PIPE_ERR;
+        }
+        if (progress != NULL) {
+            *progress = 1;
+        }
+    }
+
+    return send_wire_tail_block(st, codec, tx, work, progress);
+}
+
+static int flow_queues_drained(const FlowManager *mgr, uint32_t flow_id)
+{
+    if (mgr == NULL || flow_id >= mgr->config.max_flows) {
+        return 0;
+    }
+
+    return mixed_queue_is_empty(&mgr->mixed) &&
+           flow_buffer_is_empty(&mgr->flows[flow_id].queue) &&
+           (mgr->deferred == NULL ||
+            flow_manager_deferred_count(mgr, flow_id) == 0);
+}
+
+static int wire_flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr)
+{
+    if (st == NULL || !st->wire_send_mode || !st->ingest_done) {
+        return 0;
+    }
+
+    if (!flow_packets_delivered(st, mgr)) {
+        return 0;
+    }
+
+    return st->segment_input_drained &&
+           st->pipe_partial_len == 0 &&
+           Buffer_IsEmpty(st->post_multi_in) &&
+           (st->wire_tail_sent || st->post_multi_in->size == 0) &&
+           flow_queues_drained(mgr, st->flow_id);
+}
+
 static WgPipelineStatus configure_udp_segment_output(FlowStage *stage,
                                                       const char *output_prefix)
 {
@@ -214,6 +372,16 @@ static void destroy_flow_stage(FlowStage *stage)
     if (stage->relay_mode) {
         flow_buffer_shutdown(&stage->post_multi_pkts);
         flow_buffer_destroy(&stage->post_multi_pkts);
+    } else if (stage->wire_send_mode) {
+        Buffer_Destroy(&stage->post_multi_in);
+        if (stage->pipefd[0] >= 0) {
+            close(stage->pipefd[0]);
+            stage->pipefd[0] = -1;
+        }
+        if (stage->pipefd[1] >= 0) {
+            close(stage->pipefd[1]);
+            stage->pipefd[1] = -1;
+        }
     } else {
         Buffer_Destroy(&stage->post_multi_in);
         Buffer_Destroy(&stage->sending_out);
@@ -229,18 +397,6 @@ static void destroy_flow_stage(FlowStage *stage)
             stage->pipefd[1] = -1;
         }
     }
-}
-
-static int flow_queues_drained(const FlowManager *mgr, uint32_t flow_id)
-{
-    if (mgr == NULL || flow_id >= mgr->config.max_flows) {
-        return 0;
-    }
-
-    return mixed_queue_is_empty(&mgr->mixed) &&
-           flow_buffer_is_empty(&mgr->flows[flow_id].queue) &&
-           (mgr->deferred == NULL ||
-            flow_manager_deferred_count(mgr, flow_id) == 0);
 }
 
 static void mark_segment_ending(FlowStage *st)
@@ -1509,6 +1665,186 @@ cleanup:
         free(stages);
     }
     free(paths);
+
+    return status;
+}
+
+WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *config)
+{
+    FlowManager       mgr;
+    FlowManagerConfig mgr_cfg;
+    FlowStage        *stages = NULL;
+    WireUdpTx        *txs = NULL;
+    uint32_t          max_flow_id = 0;
+    uint32_t          i;
+    const Codec      *codec;
+    WgPipelineStatus  status = WG_PIPE_OK;
+    unsigned char     work[CODEC_MAX_ENCODE_BLOCK];
+
+    if (config == NULL || config->flows == NULL || config->flow_count == 0 ||
+        config->codec_kind == CODEC_KIND_NONE) {
+        return WG_PIPE_ERR;
+    }
+
+    codec = Codec_get(config->codec_kind);
+    if (codec == NULL) {
+        return WG_PIPE_ERR;
+    }
+
+    stages = calloc(config->flow_count, sizeof(*stages));
+    txs = calloc(config->flow_count, sizeof(*txs));
+    if (stages == NULL || txs == NULL) {
+        status = WG_PIPE_ERR;
+        goto cleanup;
+    }
+
+    for (i = 0; i < config->flow_count; i++) {
+        if (config->flows[i].flow_id > max_flow_id) {
+            max_flow_id = config->flows[i].flow_id;
+        }
+    }
+
+    for (i = 0; i < config->flow_count; i++) {
+        const WgWireFlowPath *path = &config->flows[i];
+
+        if (init_wire_flow_stage(&stages[i], path->flow_id,
+                                 path->input_path) != WG_PIPE_OK) {
+            status = WG_PIPE_ERR;
+            goto cleanup;
+        }
+        if (wire_udp_tx_init(&txs[i], path->host, path->port, path->flow_id,
+                             path->source_rate_mbps) != 0) {
+            status = WG_PIPE_ERR;
+            goto cleanup;
+        }
+    }
+
+    mgr_cfg = (FlowManagerConfig){
+        .max_flows = max_flow_id + 1u,
+        .per_flow_queue_capacity = MF_QUEUE_CAPACITY,
+        .mixed_queue_capacity = MF_MIXED_CAPACITY,
+        .default_output_fd = -1,
+        .output_fds = NULL,
+        .encode_scratch_cap = 0
+    };
+
+    if (flow_manager_init(&mgr, &mgr_cfg) != FM_OK) {
+        status = WG_PIPE_ERR;
+        goto cleanup;
+    }
+
+    for (i = 0; i < config->flow_count; i++) {
+        uint32_t fid = config->flows[i].flow_id;
+
+        mgr.flows[fid].output_fd = stages[i].pipefd[1];
+        flow_context_set_pacing(&mgr.flows[fid], config->pacing_enabled);
+    }
+
+    if (flow_manager_start(&mgr) != FM_OK) {
+        status = WG_PIPE_ERR;
+        goto cleanup_mgr;
+    }
+
+    fprintf(stderr,
+            "wire-multi-send: %u flows via FlowManager -> wire UDP\n",
+            config->flow_count);
+
+    for (;;) {
+        int progress = 0;
+
+        for (i = 0; i < config->flow_count; i++) {
+            FlowStage *st = &stages[i];
+            int        dr;
+
+            dr = drain_pipe_to_post_multi(st);
+            if (dr > 0) {
+                progress = 1;
+            } else if (dr < 0) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+
+            if (finish_segment_input(st, &mgr, &progress) != WG_PIPE_OK) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+
+            if (process_flow_wire_send(st, codec, &txs[i], work, &progress) !=
+                WG_PIPE_OK) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+
+            if (!st->ingest_done) {
+                WgPipelineStatus ingest_st = WG_PIPE_OK;
+
+                if (flow_can_accept_ingress(st, &mgr)) {
+                    ingest_st = pump_file_ingress(st, &mgr);
+                }
+                if (ingest_st == WG_PIPE_OK) {
+                    if (flow_can_accept_ingress(st, &mgr)) {
+                        progress = 1;
+                    }
+                } else {
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
+            }
+        }
+
+        {
+            bool all_done = true;
+
+            for (i = 0; i < config->flow_count; i++) {
+                if (!wire_flow_stage_quiescent(&stages[i], &mgr)) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) {
+                break;
+            }
+        }
+
+        if (!progress) {
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000L};
+
+            nanosleep(&delay, NULL);
+        }
+    }
+
+    for (i = 0; i < config->flow_count; i++) {
+        if (!stages[i].wire_end_sent) {
+            if (wire_udp_tx_send_end(&txs[i], codec) != 0) {
+                status = WG_PIPE_ERR;
+                goto cleanup_running;
+            }
+            stages[i].wire_end_sent = true;
+            fprintf(stderr,
+                    "wire-multi-send: flow_id=%u blocks=%llu source_bytes=%llu\n",
+                    config->flows[i].flow_id,
+                    (unsigned long long)txs[i].block_id,
+                    (unsigned long long)txs[i].source_bytes);
+        }
+    }
+
+cleanup_running:
+    flow_manager_stop(&mgr);
+cleanup_mgr:
+    flow_manager_destroy(&mgr);
+cleanup:
+    if (txs != NULL) {
+        for (i = 0; i < config->flow_count; i++) {
+            wire_udp_tx_destroy(&txs[i]);
+        }
+        free(txs);
+    }
+    if (stages != NULL) {
+        for (i = 0; i < config->flow_count; i++) {
+            destroy_flow_stage(&stages[i]);
+        }
+        free(stages);
+    }
 
     return status;
 }

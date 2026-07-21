@@ -32,8 +32,6 @@ static void block_encode(const Codec *self, unsigned char *data, size_t len)
 
 static void block_decode(const Codec *self, unsigned char *data, size_t len)
 {
-    unsigned char out[DECODE_BLOCK];
-
     (void)self;
 
     if (len != ENCODE_BLOCK) {
@@ -47,11 +45,9 @@ static void block_decode(const Codec *self, unsigned char *data, size_t len)
         size_t        j;
 
         for (j = 0; j < PKG_SIZE; j++) {
-            out[off_out + j] = (unsigned char)(data[off_enc1 + j] - sub1);
+            data[off_out + j] = (unsigned char)(data[off_enc1 + j] - sub1);
         }
     }
-
-    memcpy(data, out, DECODE_BLOCK);
 }
 
 static size_t block_input_block_size(const Codec *self)

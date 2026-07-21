@@ -1,6 +1,6 @@
 #include "buffer_transfer.h"
 
-#include <stdlib.h>
+#include <string.h>
 
 static size_t min_size(size_t a, size_t b)
 {
@@ -12,10 +12,6 @@ TransferStatus BufferTransfer_pump(CircularBuffer *src, CircularBuffer *dst,
 {
     size_t        avail;
     size_t        n;
-    unsigned char *tmp;
-    CB_Status     rd;
-    CB_Status     wr;
-
     if (src == NULL || dst == NULL) {
         return TRANSFER_ERR;
     }
@@ -54,21 +50,38 @@ TransferStatus BufferTransfer_pump(CircularBuffer *src, CircularBuffer *dst,
         }
     }
 
-    tmp = malloc(n);
-    if (tmp == NULL) {
-        return TRANSFER_ERR;
-    }
+    {
+        size_t remaining = n;
 
-    rd = Buffer_Read(src, tmp, n);
-    if (rd != CB_OK) {
-        free(tmp);
-        return TRANSFER_ERR;
-    }
+        while (remaining > 0) {
+            size_t src_chunk = src->head->capacity - src->head_offset;
+            size_t dst_chunk = dst->tail->capacity - dst->tail_offset;
+            size_t chunk = min_size(remaining, min_size(src_chunk, dst_chunk));
 
-    wr = Buffer_Write(dst, tmp, n);
-    free(tmp);
-    if (wr != CB_OK) {
-        return TRANSFER_ERR;
+            memcpy(dst->tail->data + dst->tail_offset,
+                   src->head->data + src->head_offset,
+                   chunk);
+
+            src->head_offset += chunk;
+            if (src->head_offset == src->head->capacity) {
+                src->head = src->head->next;
+                src->head_offset = 0;
+            }
+            dst->tail_offset += chunk;
+            if (dst->tail_offset == dst->tail->capacity) {
+                dst->tail = dst->tail->next;
+                dst->tail_offset = 0;
+            }
+
+            src->size -= chunk;
+            dst->size += chunk;
+            remaining -= chunk;
+        }
+
+        if (src->size == 0) {
+            src->head = src->tail;
+            src->head_offset = src->tail_offset;
+        }
     }
 
     if (moved != NULL) {

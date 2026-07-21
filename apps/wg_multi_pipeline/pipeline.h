@@ -32,7 +32,23 @@ typedef struct WgUdpConfig {
     CodecKind   codec_kind;
 } WgUdpConfig;
 
+typedef struct WgWireFlowPath {
+    uint32_t    flow_id;
+    const char *input_path;
+    const char *host;
+    uint16_t    port;
+    double      source_rate_mbps;
+} WgWireFlowPath;
+
+typedef struct WgWireMultiSendConfig {
+    const WgWireFlowPath *flows;
+    uint32_t              flow_count;
+    int                   pacing_enabled;
+    CodecKind             codec_kind;
+} WgWireMultiSendConfig;
+
 WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config);
 WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config);
+WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *config);
 
 #endif /* WG_PIPELINE_H */

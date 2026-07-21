@@ -94,6 +94,7 @@ integration-test wg-demo-test: $(WG_BIN) $(WG_CODEC_TEST_BIN)
 	cmp $(WG_TEST_IN1) $(WG_TEST_OUT1)
 	cmp $(WG_TEST_IN2) $(WG_TEST_OUT2)
 	sh $(TEST_DIR)/wire_loopback_test.sh ./$(WG_BIN) $(OBJ_DIR)
+	sh $(TEST_DIR)/wire_multi_flow_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_xor_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_rs_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 

@@ -258,6 +258,114 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
     return sent == (ssize_t)length ? 0 : -1;
 }
 
+int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,
+                     uint32_t flow_id, double source_rate_mbps)
+{
+    if (tx == NULL || host == NULL || port == 0 || source_rate_mbps < 0.0) {
+        return -1;
+    }
+
+    memset(tx, 0, sizeof(*tx));
+    tx->sock = -1;
+    tx->sock = open_sender_socket(host, port, &tx->address, &tx->address_len);
+    if (tx->sock < 0) {
+        return -1;
+    }
+    tx->flow_id = flow_id;
+    tx->source_rate_mbps = source_rate_mbps;
+    tx->started = monotonic_seconds();
+    return 0;
+}
+
+void wire_udp_tx_destroy(WireUdpTx *tx)
+{
+    if (tx != NULL && tx->sock >= 0) {
+        close(tx->sock);
+        tx->sock = -1;
+    }
+}
+
+bool wire_udp_tx_ready(const WireUdpTx *tx)
+{
+    double target;
+
+    if (tx == NULL || tx->sock < 0) {
+        return false;
+    }
+    if (tx->source_rate_mbps <= 0.0) {
+        return true;
+    }
+    target = tx->started + ((double)tx->source_bytes * 8.0) /
+                           (tx->source_rate_mbps * 1000000.0);
+    return monotonic_seconds() >= target;
+}
+
+int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
+                           const unsigned char *encoded_block,
+                           size_t valid_len, uint64_t encode_begin_ns,
+                           uint64_t encode_end_ns)
+{
+    size_t output_size;
+    size_t input_size;
+    uint16_t shard_count;
+    uint16_t shard;
+
+    if (tx == NULL || codec == NULL || encoded_block == NULL || tx->sock < 0) {
+        return -1;
+    }
+    input_size = Codec_input_block_size(codec);
+    output_size = Codec_output_block_size(codec);
+    if (input_size == 0 || output_size == 0 || output_size > CODEC_MAX_ENCODE_BLOCK ||
+        output_size % PKG_SIZE != 0 || valid_len == 0 || valid_len > input_size) {
+        return -1;
+    }
+    shard_count = (uint16_t)(output_size / PKG_SIZE);
+    for (shard = 0; shard < shard_count; shard++) {
+        WireHeader header = {
+            .type = WIRE_TYPE_DATA,
+            .flow_id = tx->flow_id,
+            .block_id = tx->block_id,
+            .shard_index = shard,
+            .shard_count = shard_count,
+            .valid_len = (uint16_t)valid_len,
+            .payload_len = PKG_SIZE,
+            .encode_begin_ns = encode_begin_ns,
+            .encode_end_ns = encode_end_ns,
+        };
+
+        if (send_wire_datagram(tx->sock, (const struct sockaddr *)&tx->address,
+                               tx->address_len, &header,
+                               encoded_block + (size_t)shard * PKG_SIZE) != 0) {
+            return -1;
+        }
+    }
+    tx->source_bytes += valid_len;
+    tx->block_id++;
+    return 0;
+}
+
+int wire_udp_tx_send_end(WireUdpTx *tx, const Codec *codec)
+{
+    size_t output_size;
+    WireHeader end;
+
+    if (tx == NULL || codec == NULL || tx->sock < 0) {
+        return -1;
+    }
+    output_size = Codec_output_block_size(codec);
+    if (output_size == 0 || output_size % PKG_SIZE != 0) {
+        return -1;
+    }
+    end = (WireHeader){
+        .type = WIRE_TYPE_END,
+        .flow_id = tx->flow_id,
+        .block_id = tx->block_id,
+        .shard_count = (uint16_t)(output_size / PKG_SIZE),
+    };
+    return send_wire_datagram(tx->sock, (const struct sockaddr *)&tx->address,
+                              tx->address_len, &end, NULL);
+}
+
 int wire_udp_send(const WireUdpSendConfig *config)
 {
     const Codec *codec;
@@ -328,7 +436,7 @@ int wire_udp_send(const WireUdpSendConfig *config)
         for (shard = 0; shard < shard_count; shard++) {
             header = (WireHeader){
                 .type = WIRE_TYPE_DATA,
-                .flow_id = 0,
+                .flow_id = config->flow_id,
                 .block_id = block_id,
                 .shard_index = shard,
                 .shard_count = shard_count,
@@ -351,7 +459,7 @@ int wire_udp_send(const WireUdpSendConfig *config)
     {
         WireHeader end = {
             .type = WIRE_TYPE_END,
-            .flow_id = 0,
+            .flow_id = config->flow_id,
             .block_id = block_id,
             .shard_count = shard_count,
         };
@@ -768,36 +876,301 @@ static int flush_best_effort_groups(WireGroup groups[WIRE_GROUP_WINDOW],
     return 0;
 }
 
+#define WIRE_MAX_FLOWS MF_MAX_FLOWS
+
+typedef struct WireFlowKey {
+    struct sockaddr_storage addr;
+    socklen_t               addr_len;
+    uint32_t                flow_id;
+} WireFlowKey;
+
+typedef struct WireFlowCtx {
+    bool         active;
+    bool         complete;
+    WireFlowKey  key;
+    WireGroup    groups[WIRE_GROUP_WINDOW];
+    uint64_t     next_block;
+    uint64_t     end_block_count;
+    bool         end_seen;
+    FILE        *output;
+    char         output_path[512];
+    uint64_t     output_bytes;
+    uint64_t     received_datagrams;
+    uint64_t     duplicate_datagrams;
+    uint64_t     late_datagrams;
+    uint64_t     malformed_datagrams;
+    uint64_t     dropped_groups;
+    uint64_t     recovered_groups;
+    uint64_t     missing_data_shards;
+    LatencyStats latency_stats;
+} WireFlowCtx;
+
+static int wire_flow_key_equal(const WireFlowKey *left, const WireFlowKey *right)
+{
+    if (left == NULL || right == NULL) {
+        return 0;
+    }
+    if (left->flow_id != right->flow_id || left->addr_len != right->addr_len) {
+        return 0;
+    }
+    return memcmp(&left->addr, &right->addr, left->addr_len) == 0;
+}
+
+static void wire_flow_key_from_peer(WireFlowKey *key,
+                                    const struct sockaddr_storage *addr,
+                                    socklen_t addr_len, uint32_t flow_id)
+{
+    if (key == NULL || addr == NULL) {
+        return;
+    }
+    memset(key, 0, sizeof(*key));
+    if (addr_len > sizeof(key->addr)) {
+        addr_len = (socklen_t)sizeof(key->addr);
+    }
+    memcpy(&key->addr, addr, addr_len);
+    key->addr_len = addr_len;
+    key->flow_id = flow_id;
+}
+
+static int wire_flow_format_peer_tag(const WireFlowKey *key, char *out, size_t out_len)
+{
+    char host[INET6_ADDRSTRLEN];
+    unsigned port = 0;
+
+    if (key == NULL || out == NULL || out_len == 0) {
+        return -1;
+    }
+
+    if (key->addr.ss_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)&key->addr;
+
+        if (inet_ntop(AF_INET, &ipv4->sin_addr, host, sizeof(host)) == NULL) {
+            return -1;
+        }
+        port = ntohs(ipv4->sin_port);
+    } else if (key->addr.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)&key->addr;
+
+        if (inet_ntop(AF_INET6, &ipv6->sin6_addr, host, sizeof(host)) == NULL) {
+            return -1;
+        }
+        port = ntohs(ipv6->sin6_port);
+    } else {
+        snprintf(host, sizeof(host), "unknown");
+    }
+
+    if (snprintf(out, out_len, "src_%s_p%u_flow_%u", host, port, key->flow_id) < 0 ||
+        strlen(out) >= out_len) {
+        return -1;
+    }
+    return 0;
+}
+
+static int wire_flow_output_path(const char *prefix, const WireFlowKey *key,
+                                 char *out, size_t out_len)
+{
+    char tag[128];
+
+    if (prefix == NULL || key == NULL || out == NULL) {
+        return -1;
+    }
+    if (wire_flow_format_peer_tag(key, tag, sizeof(tag)) != 0) {
+        return -1;
+    }
+    if (snprintf(out, out_len, "%s%s.ts", prefix, tag) < 0 || strlen(out) >= out_len) {
+        return -1;
+    }
+    return 0;
+}
+
+static WireFlowCtx *wire_flow_find(WireFlowCtx flows[], size_t max_flows,
+                                   const WireFlowKey *key)
+{
+    size_t index;
+
+    for (index = 0; index < max_flows; index++) {
+        if (flows[index].active &&
+            wire_flow_key_equal(&flows[index].key, key)) {
+            return &flows[index];
+        }
+    }
+    return NULL;
+}
+
+static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
+                                    const WireFlowKey *key,
+                                    const char *output_path)
+{
+    size_t index;
+
+    for (index = 0; index < max_flows; index++) {
+        if (!flows[index].active) {
+            memset(&flows[index], 0, sizeof(flows[index]));
+            flows[index].active = true;
+            flows[index].key = *key;
+            if (output_path != NULL) {
+                strncpy(flows[index].output_path, output_path,
+                        sizeof(flows[index].output_path) - 1u);
+                flows[index].output_path[sizeof(flows[index].output_path) - 1u] =
+                    '\0';
+                flows[index].output = fopen(output_path, "wb");
+                if (flows[index].output == NULL) {
+                    flows[index].active = false;
+                    return NULL;
+                }
+            }
+            return &flows[index];
+        }
+    }
+    return NULL;
+}
+
+static void wire_flow_close(WireFlowCtx *flow)
+{
+    if (flow == NULL || !flow->active) {
+        return;
+    }
+    free(flow->latency_stats.samples);
+    flow->latency_stats.samples = NULL;
+    if (flow->output != NULL) {
+        fclose(flow->output);
+        flow->output = NULL;
+    }
+    flow->active = false;
+}
+
+static int wire_flow_process_datagram(WireFlowCtx *flow, const WireHeader *header,
+                                      const unsigned char *payload,
+                                      size_t input_size, uint16_t expected_shards,
+                                      const Codec *codec, int best_effort)
+{
+    WireGroup *group;
+    uint16_t   bit;
+
+    if (flow == NULL || header == NULL || codec == NULL || flow->complete) {
+        return 0;
+    }
+
+    if (header->type == WIRE_TYPE_END) {
+        if (header->shard_count != expected_shards || header->payload_len != 0 ||
+            (flow->end_seen && header->block_id != flow->end_block_count)) {
+            flow->malformed_datagrams++;
+            return 0;
+        }
+        flow->end_seen = true;
+        flow->end_block_count = header->block_id;
+        if (flow->next_block == flow->end_block_count) {
+            flow->complete = true;
+        } else if (best_effort) {
+            if (flush_best_effort_groups(flow->groups, &flow->next_block,
+                                         flow->end_block_count, codec,
+                                         flow->output, &flow->output_bytes,
+                                         &flow->recovered_groups,
+                                         &flow->dropped_groups,
+                                         &flow->missing_data_shards,
+                                         &flow->latency_stats) != 0) {
+                return -1;
+            }
+            flow->complete = true;
+        }
+        return 0;
+    }
+
+    if (header->type != WIRE_TYPE_DATA || header->shard_count != expected_shards ||
+        header->shard_index >= expected_shards ||
+        header->valid_len == 0 || header->valid_len > input_size ||
+        header->payload_len != PKG_SIZE) {
+        flow->malformed_datagrams++;
+        return 0;
+    }
+    if (header->block_id < flow->next_block) {
+        flow->late_datagrams++;
+        return 0;
+    }
+
+    group = find_group(flow->groups, header->block_id);
+    if (group == NULL) {
+        group = allocate_group(flow->groups, header->block_id, header->shard_count,
+                               header->valid_len, header->encode_begin_ns,
+                               header->encode_end_ns);
+        if (group == NULL) {
+            flow->dropped_groups++;
+            return 0;
+        }
+    }
+    if (group->shard_count != header->shard_count ||
+        group->valid_len != header->valid_len ||
+        group->encode_begin_ns != header->encode_begin_ns ||
+        group->encode_end_ns != header->encode_end_ns) {
+        flow->malformed_datagrams++;
+        return 0;
+    }
+    bit = (uint16_t)(1u << header->shard_index);
+    if ((group->received_mask & bit) != 0) {
+        flow->duplicate_datagrams++;
+        return 0;
+    }
+    memcpy(group->data + (size_t)header->shard_index * PKG_SIZE, payload, PKG_SIZE);
+    group->received_mask |= bit;
+    flow->received_datagrams++;
+
+    if (flush_recoverable_groups(flow->groups, &flow->next_block, codec,
+                                 flow->output, &flow->output_bytes,
+                                 &flow->recovered_groups,
+                                 &flow->latency_stats) != 0) {
+        return -1;
+    }
+    if (flow->end_seen && flow->next_block == flow->end_block_count) {
+        flow->complete = true;
+    }
+    return 0;
+}
+
+static bool wire_flows_all_complete(const WireFlowCtx flows[], size_t max_flows)
+{
+    size_t index;
+    bool   saw_active = false;
+
+    for (index = 0; index < max_flows; index++) {
+        if (!flows[index].active) {
+            continue;
+        }
+        saw_active = true;
+        if (!flows[index].complete) {
+            return false;
+        }
+    }
+    return saw_active;
+}
+
 int wire_udp_recv(const WireUdpRecvConfig *config)
 {
     const Codec *codec;
-    WireGroup groups[WIRE_GROUP_WINDOW] = {0};
+    WireFlowCtx  flows[WIRE_MAX_FLOWS] = {0};
     unsigned char datagram[WIRE_HEADER_SIZE + PKG_SIZE];
-    size_t input_size;
-    size_t output_size;
-    uint16_t expected_shards;
-    uint64_t next_block = 0;
-    uint64_t end_block_count = 0;
-    uint64_t output_bytes = 0;
-    uint64_t received_datagrams = 0;
-    uint64_t duplicate_datagrams = 0;
-    uint64_t late_datagrams = 0;
-    uint64_t malformed_datagrams = 0;
-    uint64_t dropped_groups = 0;
-    uint64_t missing_groups = 0;
-    uint64_t recovered_groups = 0;
-    uint64_t missing_data_shards = 0;
-    LatencyStats latency_stats = {0};
-    bool end_seen = false;
-    double last_receive;
-    FILE *output = NULL;
-    int sock = -1;
-    int result = -1;
+    size_t        input_size;
+    size_t        output_size;
+    uint16_t      expected_shards;
+    size_t        max_flows;
+    int           multi_mode;
+    double        last_receive;
+    int           sock = -1;
+    int           result = -1;
+    size_t        fi;
 
     if (config == NULL || config->output_path == NULL || config->port == 0 ||
         config->codec_kind == CODEC_KIND_NONE || config->idle_sec == 0) {
         return -1;
     }
+
+    max_flows = config->max_flows;
+    if (max_flows == 0) {
+        max_flows = 1;
+    } else if (max_flows > WIRE_MAX_FLOWS) {
+        max_flows = WIRE_MAX_FLOWS;
+    }
+    multi_mode = max_flows > 1;
+
     codec = Codec_get(config->codec_kind);
     if (codec == NULL) {
         return -1;
@@ -817,20 +1190,30 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         return -1;
     }
 
-    output = fopen(config->output_path, "wb");
-    if (output == NULL) {
-        goto cleanup;
-    }
     sock = open_receiver_socket(config->port);
     if (sock < 0) {
         goto cleanup;
     }
 
-    fprintf(stderr, "udp-recv: listening on UDP port %u\n", (unsigned)config->port);
+    if (!multi_mode) {
+        WireFlowKey  key = {0};
+        WireFlowCtx *flow;
+
+        flow = wire_flow_alloc(flows, 1, &key, config->output_path);
+        if (flow == NULL) {
+            goto cleanup;
+        }
+    }
+
+    fprintf(stderr,
+            "udp-recv: listening on UDP port %u (max_flows=%zu%s)\n",
+            (unsigned)config->port, max_flows,
+            multi_mode ? ", prefix mode" : "");
+
     last_receive = monotonic_seconds();
     for (;;) {
         struct pollfd poll_fd = {.fd = sock, .events = POLLIN};
-        int polled = poll(&poll_fd, 1, 1000);
+        int           polled = poll(&poll_fd, 1, 1000);
 
         if (polled < 0 && errno == EINTR) {
             continue;
@@ -839,18 +1222,35 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             goto cleanup;
         }
         if (polled == 0) {
-            if (end_seen &&
-                monotonic_seconds() - last_receive >= (double)config->idle_sec) {
-                if (config->best_effort &&
-                    flush_best_effort_groups(groups, &next_block,
-                                             end_block_count, codec, output,
-                                             &output_bytes, &recovered_groups,
-                                             &dropped_groups,
-                                             &missing_data_shards,
-                                             &latency_stats) != 0) {
-                    goto cleanup;
+            bool saw_flow = false;
+
+            for (fi = 0; fi < max_flows; fi++) {
+                if (flows[fi].active) {
+                    saw_flow = true;
+                    break;
                 }
-                break;
+            }
+            if (saw_flow &&
+                monotonic_seconds() - last_receive >= (double)config->idle_sec) {
+                if (multi_mode) {
+                    if (wire_flows_all_complete(flows, max_flows)) {
+                        break;
+                    }
+                } else if (flows[0].end_seen) {
+                    if (config->best_effort && !flows[0].complete) {
+                        if (flush_best_effort_groups(
+                                flows[0].groups, &flows[0].next_block,
+                                flows[0].end_block_count, codec, flows[0].output,
+                                &flows[0].output_bytes, &flows[0].recovered_groups,
+                                &flows[0].dropped_groups,
+                                &flows[0].missing_data_shards,
+                                &flows[0].latency_stats) != 0) {
+                            goto cleanup;
+                        }
+                        flows[0].complete = true;
+                    }
+                    break;
+                }
             }
             continue;
         }
@@ -859,122 +1259,119 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         }
 
         {
-            ssize_t received;
-            WireHeader header;
-            WireGroup *group;
-            uint16_t bit;
+            ssize_t                 received;
+            struct sockaddr_storage peer_addr;
+            socklen_t               peer_len = (socklen_t)sizeof(peer_addr);
+            WireHeader              header;
+            WireFlowKey             key;
+            WireFlowCtx            *flow;
 
             do {
-                received = recvfrom(sock, datagram, sizeof(datagram), 0, NULL, NULL);
+                received = recvfrom(sock, datagram, sizeof(datagram), 0,
+                                    (struct sockaddr *)&peer_addr, &peer_len);
             } while (received < 0 && errno == EINTR);
             if (received < 0) {
                 goto cleanup;
             }
             last_receive = monotonic_seconds();
             if (wire_header_decode(&header, datagram, (size_t)received) != 0) {
-                malformed_datagrams++;
                 continue;
             }
-
-            if (header.type == WIRE_TYPE_END) {
-                if (header.flow_id != 0 || header.shard_count != expected_shards ||
-                    header.payload_len != 0 || (end_seen && header.block_id != end_block_count)) {
-                    malformed_datagrams++;
-                    continue;
-                }
-                end_seen = true;
-                end_block_count = header.block_id;
-                if (next_block == end_block_count) {
-                    break;
-                }
-                continue;
-            }
-
-            if (header.type != WIRE_TYPE_DATA || header.flow_id != 0 ||
-                header.shard_count != expected_shards ||
-                header.shard_index >= expected_shards ||
-                header.valid_len == 0 || header.valid_len > input_size ||
-                header.payload_len != PKG_SIZE ||
+            if (header.type == WIRE_TYPE_DATA &&
                 (size_t)received != WIRE_HEADER_SIZE + header.payload_len) {
-                malformed_datagrams++;
-                continue;
-            }
-            if (header.block_id < next_block) {
-                late_datagrams++;
                 continue;
             }
 
-            group = find_group(groups, header.block_id);
-            if (group == NULL) {
-                group = allocate_group(groups, header.block_id, header.shard_count,
-                                       header.valid_len, header.encode_begin_ns,
-                                       header.encode_end_ns);
-                if (group == NULL) {
-                    dropped_groups++;
-                    continue;
+            wire_flow_key_from_peer(&key, &peer_addr, peer_len, header.flow_id);
+            flow = wire_flow_find(flows, max_flows, &key);
+            if (flow == NULL) {
+                if (multi_mode) {
+                    char path[512];
+
+                    if (wire_flow_output_path(config->output_path, &key, path,
+                                                sizeof(path)) != 0) {
+                        continue;
+                    }
+                    flow = wire_flow_alloc(flows, max_flows, &key, path);
+                    if (flow == NULL) {
+                        fprintf(stderr,
+                                "udp-recv: flow table full, dropping flow_id=%u\n",
+                                header.flow_id);
+                        continue;
+                    }
+                    fprintf(stderr, "udp-recv: opened flow %u -> %s\n",
+                            header.flow_id, path);
+                } else {
+                    flow = &flows[0];
+                    flow->key = key;
                 }
             }
-            if (group->shard_count != header.shard_count ||
-                group->valid_len != header.valid_len ||
-                group->encode_begin_ns != header.encode_begin_ns ||
-                group->encode_end_ns != header.encode_end_ns) {
-                malformed_datagrams++;
-                continue;
-            }
-            bit = (uint16_t)(1u << header.shard_index);
-            if ((group->received_mask & bit) != 0) {
-                duplicate_datagrams++;
-                continue;
-            }
-            memcpy(group->data + (size_t)header.shard_index * PKG_SIZE,
-                   datagram + WIRE_HEADER_SIZE, PKG_SIZE);
-            group->received_mask |= bit;
-            received_datagrams++;
 
-            if (flush_recoverable_groups(groups, &next_block, codec, output,
-                                         &output_bytes, &recovered_groups,
-                                         &latency_stats) != 0) {
+            if (wire_flow_process_datagram(flow, &header,
+                                           datagram + WIRE_HEADER_SIZE, input_size,
+                                           expected_shards, codec,
+                                           config->best_effort) != 0) {
                 goto cleanup;
             }
-            if (end_seen && next_block == end_block_count) {
+
+            if (!multi_mode && flow->complete) {
+                break;
+            }
+            if (multi_mode && wire_flows_all_complete(flows, max_flows)) {
                 break;
             }
         }
     }
 
-    if (!end_seen || next_block != end_block_count) {
-        if (end_seen && end_block_count > next_block) {
-            missing_groups = end_block_count - next_block;
-        }
-        fprintf(stderr, "udp-recv: incomplete transfer: received_blocks=%llu expected_blocks=%llu\n",
-                (unsigned long long)next_block,
-                (unsigned long long)(end_seen ? end_block_count : 0));
-        fprintf(stderr, "udp-recv: missing_groups=%llu\n",
-                (unsigned long long)missing_groups);
-        goto cleanup;
-    }
-    if (fflush(output) != 0) {
-        goto cleanup;
-    }
-    fprintf(stderr,
-            "udp-recv: output_bytes=%llu datagrams=%llu duplicates=%llu late=%llu "
-            "malformed=%llu recovered_groups=%llu dropped_groups=%llu "
-            "missing_data_shards=%llu\n",
-            (unsigned long long)output_bytes,
-            (unsigned long long)received_datagrams,
-            (unsigned long long)duplicate_datagrams,
-            (unsigned long long)late_datagrams,
-            (unsigned long long)malformed_datagrams,
-            (unsigned long long)recovered_groups,
-            (unsigned long long)dropped_groups,
-            (unsigned long long)missing_data_shards);
-    latency_stats_print(&latency_stats);
     result = 0;
+    for (fi = 0; fi < max_flows; fi++) {
+        WireFlowCtx *flow = &flows[fi];
+        uint64_t     missing_groups = 0;
+
+        if (!flow->active) {
+            continue;
+        }
+
+        if (!flow->end_seen || flow->next_block != flow->end_block_count) {
+            if (flow->end_seen && flow->end_block_count > flow->next_block) {
+                missing_groups = flow->end_block_count - flow->next_block;
+            }
+            fprintf(stderr,
+                    "udp-recv: flow %u incomplete: received_blocks=%llu "
+                    "expected_blocks=%llu missing_groups=%llu\n",
+                    flow->key.flow_id, (unsigned long long)flow->next_block,
+                    (unsigned long long)(flow->end_seen ? flow->end_block_count : 0),
+                    (unsigned long long)missing_groups);
+            result = -1;
+            continue;
+        }
+        if (flow->output != NULL && fflush(flow->output) != 0) {
+            result = -1;
+            continue;
+        }
+        fprintf(stderr,
+                "udp-recv: flow %u output=%s output_bytes=%llu datagrams=%llu "
+                "duplicates=%llu late=%llu malformed=%llu recovered_groups=%llu "
+                "dropped_groups=%llu missing_data_shards=%llu\n",
+                flow->key.flow_id, flow->output_path,
+                (unsigned long long)flow->output_bytes,
+                (unsigned long long)flow->received_datagrams,
+                (unsigned long long)flow->duplicate_datagrams,
+                (unsigned long long)flow->late_datagrams,
+                (unsigned long long)flow->malformed_datagrams,
+                (unsigned long long)flow->recovered_groups,
+                (unsigned long long)flow->dropped_groups,
+                (unsigned long long)flow->missing_data_shards);
+        latency_stats_print(&flow->latency_stats);
+    }
+
+    if (!multi_mode && !flows[0].active) {
+        result = -1;
+    }
 
 cleanup:
-    free(latency_stats.samples);
-    if (output != NULL) {
-        fclose(output);
+    for (fi = 0; fi < max_flows; fi++) {
+        wire_flow_close(&flows[fi]);
     }
     if (sock >= 0) {
         close(sock);
