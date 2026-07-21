@@ -120,6 +120,46 @@ next segment. New data for that flow after the timeout starts a new segment.
 Each completed segment is written to its own file, such as
 `/tmp/out_flow0_segment1.bin`.
 
+## Cross-VM wire multi-flow (single sender/receiver process)
+
+Use wire multi-flow to transfer multiple concurrent streams with one app
+process per VM.
+
+Sender uses `--udp-send-multi` + repeated `--flow` specs, receiver uses
+`--udp-recv <port> <out_prefix> --max-flows N`.
+
+`--flow` spec format:
+
+`<flow_id>:<receiver_ip>:<port>:<input_path>[:rate_mbps]`
+
+Example: 2 flows (Node1 -> Node4) with `copy` codec.
+
+Node4 (receiver):
+
+```bash
+./build/wg_multi_pipeline --codec copy --lock-memory \
+  --udp-recv 9000 /tmp/out_multi_ --idle-sec 5 --max-flows 2
+```
+
+Node1 (sender):
+
+```bash
+./build/wg_multi_pipeline --codec copy --udp-send-multi \
+  --flow "0:10.10.34.2:9000:input0.ts:32" \
+  --flow "1:10.10.34.2:9000:input1.ts:32"
+```
+
+Output file naming (receiver writes one file per flow):
+
+`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<flow_id>.ts`
+
+Because the UDP sender source port may vary, use wildcard when validating:
+
+```bash
+cmp input0.ts /tmp/out_multi_src_*_flow_0.ts
+cmp input1.ts /tmp/out_multi_src_*_flow_1.ts
+```
+
 See [tests/TESTING.md](../../tests/TESTING.md) for full coverage.  
 Step-by-step demos (offline + FIFO live): [docs/DEMOS.md](../../docs/DEMOS.md).
 

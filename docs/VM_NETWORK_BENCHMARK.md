@@ -78,6 +78,49 @@ Repeat with `--codec block` and a separate output file/port. Increase
 missing/dropped groups. Repeat the highest passing rate several times before
 reporting it as reliable.
 
+### Multi-flow across VMs (single sender/receiver process)
+
+To run multiple concurrent streams without starting multiple app processes,
+use the wire multi-flow mode:
+
+- Sender (VM1): `--udp-send-multi` with repeated `--flow` specs
+- Receiver (VM2): `--udp-recv <port> <out_prefix> --max-flows N`
+
+Each `--flow` spec format is:
+
+`<flow_id>:<receiver_ip>:<port>:<input_path>[:rate_mbps]`
+
+`flow_id` must match the slot index you expect on the receiver side (the
+receiver output includes `flow_id`). The receiver writes one output file per
+flow keyed by the sender peer (IP+port) and `flow_id`, for example:
+
+`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<flow_id>.ts`
+
+Example: 2 flows (VM1 -> VM2) with `copy` codec.
+
+On VM2 (receiver):
+
+```bash
+./build/wg_multi_pipeline --codec copy \
+  --udp-recv 9000 /tmp/out_multi_ --idle-sec 5 --max-flows 2
+```
+
+On VM1 (sender):
+
+```bash
+./build/wg_multi_pipeline --codec copy --udp-send-multi \
+  --flow "0:VM2_IP:9000:input0.ts:32" \
+  --flow "1:VM2_IP:9000:input1.ts:32"
+```
+
+After the receiver exits, locate and validate outputs (wildcard is used
+because the sender source port may vary across flows):
+
+```bash
+cmp input0.ts /tmp/out_multi_src_*_flow_0.ts
+cmp input1.ts /tmp/out_multi_src_*_flow_1.ts
+```
+
 ### Automated codec/rate matrix
 
 Run this script on VM1 after VM1 can use key-based SSH to VM4. It starts a
