@@ -32,6 +32,9 @@ run_case() {
     wait "$receiver_pid"
     receiver_pid=
     cmp "$input" "$output"
+    grep -q '^latency end_to_end: samples=[1-9]' "$base/wire_${codec}_receiver.log"
+    grep -q '^latency end_to_end_jitter: samples=[1-9]' \
+        "$base/wire_${codec}_receiver.log"
 }
 
 run_case copy "$copy_port" "$copy_output"

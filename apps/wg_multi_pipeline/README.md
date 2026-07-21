@@ -66,6 +66,28 @@ data shards in order and skip missing data shards; parity is not output.
 sudo apt-get install liberasurecode-dev
 ```
 
+## Per-block latency and jitter
+
+Wire sender/receiver transfers record per-block timestamps automatically. The
+receiver prints encode, transfer, decode, end-to-end, and end-to-end jitter
+statistics (`avg`, `p50`, `p95`, `p99`, and `max`) after a complete transfer.
+
+For a cross-host run, synchronize the sender and receiver clocks first (for
+example with Chrony). The measurements are:
+
+```text
+encode       = sender Codec_encode() end - start
+transfer     = receiver decode-ready - sender encode end
+decode       = receiver Codec_decode() end - start
+end-to-end   = receiver decode end - sender encode start
+jitter       = absolute difference between consecutive end-to-end delays
+```
+
+`transfer` and `end-to-end` include the network path, kernel forwarding,
+receiver reassembly, and any FEC recovery. Receiver-side timestamps are
+ignored when a block lacks a valid sender timestamp, which is useful for
+hand-crafted protocol tests.
+
 **Live multi-bitrate FIFO demo:** see [docs/DEMOS.md](../../docs/DEMOS.md) Demo 3  
 (`scripts/run_dual_fifo.sh` uses `--no-pace --multi` with BlockCodec enabled).
 

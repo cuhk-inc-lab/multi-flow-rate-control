@@ -59,11 +59,11 @@ while time.monotonic() < deadline:
             break
         continue
     packet, _ = sock.recvfrom(2048)
-    if len(packet) < 28:
+    if len(packet) < 44:
         continue
     _, version, packet_type, _, _, _, shard_index, _, _, _ = \
         struct.unpack("!IBBHIQHHHH", packet[:28])
-    if version != 1:
+    if version != 2:
         continue
     if packet_type == 1 and shard_index in dropped:
         continue
@@ -119,7 +119,7 @@ run_strict_failure() {
         exit 1
     fi
     receiver_pid=
-    rg -q "incomplete transfer" "$output.log"
+    grep -q "incomplete transfer" "$output.log"
 }
 
 run_best_effort() {
@@ -139,7 +139,7 @@ PY
     wait "$receiver_pid"
     receiver_pid=
     cmp "$expected" "$output"
-    rg -q "missing_data_shards=2" "$output.log"
+    grep -q "missing_data_shards=2" "$output.log"
 }
 
 run_full

@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -17,10 +18,10 @@
 #include <unistd.h>
 
 #define WIRE_MAGIC          0x57475031u /* WGP1 */
-#define WIRE_VERSION        1u
+#define WIRE_VERSION        2u
 #define WIRE_TYPE_DATA      1u
 #define WIRE_TYPE_END       2u
-#define WIRE_HEADER_SIZE    28u
+#define WIRE_HEADER_SIZE    44u
 #define WIRE_GROUP_WINDOW   128u
 #define WIRE_MAX_SHARDS     (CODEC_MAX_ENCODE_BLOCK / PKG_SIZE)
 
@@ -32,6 +33,9 @@ typedef struct WireHeader {
     uint16_t shard_count;
     uint16_t valid_len;
     uint16_t payload_len;
+    /* Sender CLOCK_REALTIME timestamps; synchronize peers before comparing. */
+    uint64_t encode_begin_ns;
+    uint64_t encode_end_ns;
 } WireHeader;
 
 typedef struct WireGroup {
@@ -40,8 +44,29 @@ typedef struct WireGroup {
     uint16_t      shard_count;
     uint16_t      valid_len;
     uint16_t      received_mask;
+    uint64_t      encode_begin_ns;
+    uint64_t      encode_end_ns;
+    bool          timing_valid;
     unsigned char data[CODEC_MAX_ENCODE_BLOCK];
 } WireGroup;
+
+typedef struct LatencySample {
+    uint64_t encode_ns;
+    uint64_t transfer_ns;
+    uint64_t decode_ns;
+    uint64_t end_to_end_ns;
+    uint64_t jitter_ns;
+} LatencySample;
+
+typedef struct LatencyStats {
+    LatencySample *samples;
+    size_t         count;
+    size_t         capacity;
+    uint64_t       invalid_samples;
+    bool           have_previous_delay;
+    uint64_t       previous_delay_ns;
+    bool           disabled;
+} LatencyStats;
 
 static uint64_t host_to_be64(uint64_t value)
 {
@@ -85,6 +110,10 @@ static void wire_header_encode(unsigned char out[WIRE_HEADER_SIZE],
     memcpy(out + 24, &value16, sizeof(value16));
     value16 = htons(header->payload_len);
     memcpy(out + 26, &value16, sizeof(value16));
+    value64 = host_to_be64(header->encode_begin_ns);
+    memcpy(out + 28, &value64, sizeof(value64));
+    value64 = host_to_be64(header->encode_end_ns);
+    memcpy(out + 36, &value64, sizeof(value64));
 }
 
 static int wire_header_decode(WireHeader *header,
@@ -116,7 +145,21 @@ static int wire_header_decode(WireHeader *header,
     header->valid_len = ntohs(value16);
     memcpy(&value16, data + 26, sizeof(value16));
     header->payload_len = ntohs(value16);
+    memcpy(&value64, data + 28, sizeof(value64));
+    header->encode_begin_ns = be64_to_host(value64);
+    memcpy(&value64, data + 36, sizeof(value64));
+    header->encode_end_ns = be64_to_host(value64);
     return 0;
+}
+
+static uint64_t realtime_nanoseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
 }
 
 static double monotonic_seconds(void)
@@ -266,6 +309,8 @@ int wire_udp_send(const WireUdpSendConfig *config)
     started = monotonic_seconds();
     for (;;) {
         WireHeader header;
+        uint64_t encode_begin_ns;
+        uint64_t encode_end_ns;
         size_t n = fread(block, 1, input_size, input);
         uint16_t shard;
 
@@ -277,7 +322,9 @@ int wire_udp_send(const WireUdpSendConfig *config)
         }
 
         memset(block + n, 0, input_size - n);
+        encode_begin_ns = realtime_nanoseconds();
         Codec_encode(codec, block, output_size);
+        encode_end_ns = realtime_nanoseconds();
         for (shard = 0; shard < shard_count; shard++) {
             header = (WireHeader){
                 .type = WIRE_TYPE_DATA,
@@ -287,6 +334,8 @@ int wire_udp_send(const WireUdpSendConfig *config)
                 .shard_count = shard_count,
                 .valid_len = (uint16_t)n,
                 .payload_len = PKG_SIZE,
+                .encode_begin_ns = encode_begin_ns,
+                .encode_end_ns = encode_end_ns,
             };
             if (send_wire_datagram(sock, (struct sockaddr *)&address, address_len,
                                    &header, block + (size_t)shard * PKG_SIZE) != 0) {
@@ -370,7 +419,9 @@ static WireGroup *find_group(WireGroup groups[WIRE_GROUP_WINDOW], uint64_t block
 
 static WireGroup *allocate_group(WireGroup groups[WIRE_GROUP_WINDOW],
                                  uint64_t block_id, uint16_t shard_count,
-                                 uint16_t valid_len)
+                                 uint16_t valid_len,
+                                 uint64_t encode_begin_ns,
+                                 uint64_t encode_end_ns)
 {
     size_t index;
 
@@ -381,6 +432,10 @@ static WireGroup *allocate_group(WireGroup groups[WIRE_GROUP_WINDOW],
                 .block_id = block_id,
                 .shard_count = shard_count,
                 .valid_len = valid_len,
+                .encode_begin_ns = encode_begin_ns,
+                .encode_end_ns = encode_end_ns,
+                .timing_valid = encode_begin_ns != 0 &&
+                                encode_end_ns >= encode_begin_ns,
             };
             return &groups[index];
         }
@@ -447,17 +502,163 @@ static int recover_group(WireGroup *group, const Codec *codec,
     return 0;
 }
 
+static int compare_u64(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+
+    return (a > b) - (a < b);
+}
+
+static uint64_t latency_sample_value(const LatencySample *sample, unsigned field)
+{
+    switch (field) {
+    case 0:
+        return sample->encode_ns;
+    case 1:
+        return sample->transfer_ns;
+    case 2:
+        return sample->decode_ns;
+    case 3:
+        return sample->end_to_end_ns;
+    default:
+        return sample->jitter_ns;
+    }
+}
+
+static void latency_stats_add(LatencyStats *stats, uint64_t encode_begin_ns,
+                              uint64_t encode_end_ns, uint64_t ready_ns,
+                              uint64_t decode_done_ns)
+{
+    LatencySample *resized;
+    LatencySample *sample;
+
+    if (stats == NULL || stats->disabled) {
+        return;
+    }
+    if (encode_begin_ns == 0 || encode_end_ns < encode_begin_ns ||
+        ready_ns < encode_end_ns || decode_done_ns < ready_ns) {
+        stats->invalid_samples++;
+        return;
+    }
+    if (stats->count == stats->capacity) {
+        size_t new_capacity = stats->capacity == 0 ? 1024u : stats->capacity * 2u;
+
+        if (new_capacity <= stats->capacity ||
+            new_capacity > SIZE_MAX / sizeof(*stats->samples)) {
+            stats->disabled = true;
+            return;
+        }
+        resized = realloc(stats->samples, new_capacity * sizeof(*stats->samples));
+        if (resized == NULL) {
+            stats->disabled = true;
+            return;
+        }
+        stats->samples = resized;
+        stats->capacity = new_capacity;
+    }
+
+    sample = &stats->samples[stats->count++];
+    sample->encode_ns = encode_end_ns - encode_begin_ns;
+    sample->transfer_ns = ready_ns - encode_end_ns;
+    sample->decode_ns = decode_done_ns - ready_ns;
+    sample->end_to_end_ns = decode_done_ns - encode_begin_ns;
+    sample->jitter_ns = UINT64_MAX;
+    if (stats->have_previous_delay) {
+        sample->jitter_ns = sample->end_to_end_ns >= stats->previous_delay_ns
+                                ? sample->end_to_end_ns - stats->previous_delay_ns
+                                : stats->previous_delay_ns - sample->end_to_end_ns;
+    }
+    stats->previous_delay_ns = sample->end_to_end_ns;
+    stats->have_previous_delay = true;
+}
+
+static void latency_stats_print_metric(const LatencyStats *stats,
+                                       const char *name, unsigned field)
+{
+    uint64_t *values;
+    uint64_t minimum = UINT64_MAX;
+    uint64_t maximum = 0;
+    long double total = 0.0;
+    size_t count = 0;
+    size_t index;
+
+    if (stats == NULL || stats->count == 0) {
+        return;
+    }
+    values = malloc(stats->count * sizeof(*values));
+    if (values == NULL) {
+        fprintf(stderr, "latency %s: unable to allocate percentile samples\n", name);
+        return;
+    }
+    for (index = 0; index < stats->count; index++) {
+        uint64_t value = latency_sample_value(&stats->samples[index], field);
+
+        if (value == UINT64_MAX) {
+            continue;
+        }
+        values[count++] = value;
+        total += (long double)value;
+        if (value < minimum) {
+            minimum = value;
+        }
+        if (value > maximum) {
+            maximum = value;
+        }
+    }
+    if (count == 0) {
+        free(values);
+        return;
+    }
+    qsort(values, count, sizeof(*values), compare_u64);
+    fprintf(stderr,
+            "latency %s: samples=%zu avg_us=%.3Lf min_us=%.3f p50_us=%.3f "
+            "p95_us=%.3f p99_us=%.3f max_us=%.3f\n",
+            name, count, total / (long double)count / 1000.0L,
+            (double)minimum / 1000.0,
+            (double)values[(count - 1u) * 50u / 100u] / 1000.0,
+            (double)values[(count - 1u) * 95u / 100u] / 1000.0,
+            (double)values[(count - 1u) * 99u / 100u] / 1000.0,
+            (double)maximum / 1000.0);
+    free(values);
+}
+
+static void latency_stats_print(const LatencyStats *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+    fprintf(stderr, "latency: completed_blocks=%zu invalid_samples=%" PRIu64
+                    " collection=%s\n",
+            stats->count, stats->invalid_samples,
+            stats->disabled ? "disabled" : "enabled");
+    latency_stats_print_metric(stats, "encode", 0);
+    latency_stats_print_metric(stats, "transfer", 1);
+    latency_stats_print_metric(stats, "decode", 2);
+    latency_stats_print_metric(stats, "end_to_end", 3);
+    latency_stats_print_metric(stats, "end_to_end_jitter", 4);
+}
+
 static int write_decoded_group(WireGroup *group, const Codec *codec,
-                               FILE *output, uint64_t *output_bytes)
+                               FILE *output, uint64_t *output_bytes,
+                               LatencyStats *latency_stats)
 {
     size_t input_size = Codec_input_block_size(codec);
     size_t output_size = Codec_output_block_size(codec);
+    uint64_t decode_ready_ns;
+    uint64_t decode_done_ns;
 
     if (group == NULL || group->valid_len == 0 || group->valid_len > input_size ||
         group->shard_count * PKG_SIZE != output_size) {
         return -1;
     }
+    decode_ready_ns = realtime_nanoseconds();
     Codec_decode(codec, group->data, output_size);
+    decode_done_ns = realtime_nanoseconds();
+    if (group->timing_valid) {
+        latency_stats_add(latency_stats, group->encode_begin_ns,
+                          group->encode_end_ns, decode_ready_ns, decode_done_ns);
+    }
     if (fwrite(group->data, 1, group->valid_len, output) != group->valid_len) {
         return -1;
     }
@@ -469,7 +670,8 @@ static int write_decoded_group(WireGroup *group, const Codec *codec,
 static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
                                     uint64_t *next_block, const Codec *codec,
                                     FILE *output, uint64_t *output_bytes,
-                                    uint64_t *recovered_groups)
+                                    uint64_t *recovered_groups,
+                                    LatencyStats *latency_stats)
 {
     for (;;) {
         WireGroup *group = find_group(groups, *next_block);
@@ -483,7 +685,8 @@ static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
         if (!group_complete(group)) {
             return 0;
         }
-        if (write_decoded_group(group, codec, output, output_bytes) != 0) {
+        if (write_decoded_group(group, codec, output, output_bytes,
+                                latency_stats) != 0) {
             return -1;
         }
         (*next_block)++;
@@ -536,7 +739,8 @@ static int flush_best_effort_groups(WireGroup groups[WIRE_GROUP_WINDOW],
                                     uint64_t *output_bytes,
                                     uint64_t *recovered_groups,
                                     uint64_t *dropped_groups,
-                                    uint64_t *missing_data_shards)
+                                    uint64_t *missing_data_shards,
+                                    LatencyStats *latency_stats)
 {
     while (*next_block < end_block_count) {
         WireGroup *group = find_group(groups, *next_block);
@@ -550,7 +754,8 @@ static int flush_best_effort_groups(WireGroup groups[WIRE_GROUP_WINDOW],
             return -1;
         }
         if (group_complete(group)) {
-            if (write_decoded_group(group, codec, output, output_bytes) != 0) {
+            if (write_decoded_group(group, codec, output, output_bytes,
+                                    latency_stats) != 0) {
                 return -1;
             }
         } else if (write_best_effort_group(group, codec, output, output_bytes,
@@ -582,6 +787,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     uint64_t missing_groups = 0;
     uint64_t recovered_groups = 0;
     uint64_t missing_data_shards = 0;
+    LatencyStats latency_stats = {0};
     bool end_seen = false;
     double last_receive;
     FILE *output = NULL;
@@ -640,7 +846,8 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                                              end_block_count, codec, output,
                                              &output_bytes, &recovered_groups,
                                              &dropped_groups,
-                                             &missing_data_shards) != 0) {
+                                             &missing_data_shards,
+                                             &latency_stats) != 0) {
                     goto cleanup;
                 }
                 break;
@@ -700,14 +907,17 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             group = find_group(groups, header.block_id);
             if (group == NULL) {
                 group = allocate_group(groups, header.block_id, header.shard_count,
-                                       header.valid_len);
+                                       header.valid_len, header.encode_begin_ns,
+                                       header.encode_end_ns);
                 if (group == NULL) {
                     dropped_groups++;
                     continue;
                 }
             }
             if (group->shard_count != header.shard_count ||
-                group->valid_len != header.valid_len) {
+                group->valid_len != header.valid_len ||
+                group->encode_begin_ns != header.encode_begin_ns ||
+                group->encode_end_ns != header.encode_end_ns) {
                 malformed_datagrams++;
                 continue;
             }
@@ -722,7 +932,8 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             received_datagrams++;
 
             if (flush_recoverable_groups(groups, &next_block, codec, output,
-                                         &output_bytes, &recovered_groups) != 0) {
+                                         &output_bytes, &recovered_groups,
+                                         &latency_stats) != 0) {
                 goto cleanup;
             }
             if (end_seen && next_block == end_block_count) {
@@ -757,9 +968,11 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             (unsigned long long)recovered_groups,
             (unsigned long long)dropped_groups,
             (unsigned long long)missing_data_shards);
+    latency_stats_print(&latency_stats);
     result = 0;
 
 cleanup:
+    free(latency_stats.samples);
     if (output != NULL) {
         fclose(output);
     }

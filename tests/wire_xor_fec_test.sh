@@ -39,9 +39,9 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 target = ("127.0.0.1", port)
 
 def header(kind, block, index, valid, payload):
-    return struct.pack("!IBBHIQHHHH",
-                       0x57475031, 1, kind, 0, 0, block,
-                       index, 5, valid, payload)
+    return struct.pack("!IBBHIQHHHHQQ",
+                       0x57475031, 2, kind, 0, 0, block,
+                       index, 5, valid, payload, 0, 0)
 
 if mode == "recover":
     shards = ((0, b"A" * 188), (1, b"B" * 188),
