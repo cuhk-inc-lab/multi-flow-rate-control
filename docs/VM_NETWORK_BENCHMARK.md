@@ -78,6 +78,21 @@ Repeat with `--codec block` and a separate output file/port. Increase
 missing/dropped groups. Repeat the highest passing rate several times before
 reporting it as reliable.
 
+### Automated codec/rate matrix
+
+Run this script on VM1 after VM1 can use key-based SSH to VM4. It starts a
+fresh receiver on VM4 for every codec/rate pair, verifies the output hash, and
+writes CSV and Markdown tables containing throughput, delay, and jitter
+statistics under `build/wire-matrix-*`.
+
+```bash
+CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" \
+  ./scripts/run_wire_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP input.ts
+```
+
+Both endpoints must run the same wire protocol version. Synchronize VM1 and
+VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
+
 ## 4. Report
 
 Keep TCP and loss-free UDP `iperf3` results separate from application results.
