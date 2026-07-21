@@ -17,99 +17,143 @@ static int lock_process_memory(void)
     return 0;
 }
 
+static int parse_u32_token(const char *text, uint32_t *out)
+{
+    char         *end = NULL;
+    unsigned long value;
+
+    if (text == NULL || out == NULL) {
+        return -1;
+    }
+    value = strtoul(text, &end, 10);
+    if (end == text || *end != '\0') {
+        return -1;
+    }
+    *out = (uint32_t)value;
+    return 0;
+}
+
 static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
                                 char **host_out, char **input_out,
-                                double default_rate_mbps)
+                                double default_rate_mbps,
+                                int *has_explicit_flow_id)
 {
-    const char *cursor = spec;
-    char       *end = NULL;
-    size_t      host_len;
-    size_t      input_len;
+    char       *copy = NULL;
+    char       *save = NULL;
+    char       *token;
+    char       *parts[5];
+    size_t      count = 0;
+    uint32_t    parsed_flow_id = 0;
     long        port;
-    unsigned long flow_id;
-    const char *port_start;
-    const char *input_start;
-    const char *rate_start;
+    char       *end = NULL;
+    int         explicit_flow_id = 0;
+    const char *host_text;
+    const char *port_text;
+    const char *input_text;
+    const char *rate_text = NULL;
 
-    if (spec == NULL || path == NULL || host_out == NULL || input_out == NULL) {
+    if (spec == NULL || path == NULL || host_out == NULL || input_out == NULL ||
+        has_explicit_flow_id == NULL) {
         return -1;
     }
 
     *host_out = NULL;
     *input_out = NULL;
+    *has_explicit_flow_id = 0;
     memset(path, 0, sizeof(*path));
     path->source_rate_mbps = default_rate_mbps;
 
-    flow_id = strtoul(cursor, &end, 10);
-    if (end == cursor || *end != ':') {
+    copy = strdup(spec);
+    if (copy == NULL) {
         return -1;
     }
-    path->flow_id = (uint32_t)flow_id;
-    cursor = end + 1;
 
-    port_start = strchr(cursor, ':');
-    if (port_start == NULL) {
+    for (token = strtok_r(copy, ":", &save);
+         token != NULL && count < (sizeof(parts) / sizeof(parts[0]));
+         token = strtok_r(NULL, ":", &save)) {
+        parts[count++] = token;
+    }
+    if (token != NULL || count < 3 || count > 5) {
+        free(copy);
         return -1;
     }
-    host_len = (size_t)(port_start - cursor);
-    if (host_len == 0) {
-        return -1;
-    }
-    *host_out = strndup(cursor, host_len);
-    if (*host_out == NULL) {
-        return -1;
-    }
-    path->host = *host_out;
-    cursor = port_start + 1;
 
-    port = strtol(cursor, &end, 10);
-    if (end == cursor || *end != ':') {
-        free(*host_out);
-        *host_out = NULL;
+    if ((count == 4 || count == 5) && parse_u32_token(parts[0], &parsed_flow_id) == 0) {
+        explicit_flow_id = 1;
+        path->flow_id = parsed_flow_id;
+        host_text = parts[1];
+        port_text = parts[2];
+        input_text = parts[3];
+        if (count == 5) {
+            rate_text = parts[4];
+        }
+    } else {
+        host_text = parts[0];
+        port_text = parts[1];
+        input_text = parts[2];
+        if (count == 4) {
+            rate_text = parts[3];
+        }
+    }
+
+    if (host_text == NULL || host_text[0] == '\0' ||
+        input_text == NULL || input_text[0] == '\0') {
+        free(copy);
+        return -1;
+    }
+
+    port = strtol(port_text, &end, 10);
+    if (end == port_text || *end != '\0') {
+        free(copy);
         return -1;
     }
     if (port <= 0 || port > 65535) {
-        free(*host_out);
-        *host_out = NULL;
+        free(copy);
         return -1;
     }
+    *host_out = strdup(host_text);
+    *input_out = strdup(input_text);
+    if (*host_out == NULL || *input_out == NULL) {
+        free(*host_out);
+        free(*input_out);
+        *host_out = NULL;
+        *input_out = NULL;
+        free(copy);
+        return -1;
+    }
+
+    path->host = *host_out;
     path->port = (uint16_t)port;
-    cursor = end + 1;
-
-    input_start = strchr(cursor, ':');
-    if (input_start == NULL) {
-        input_len = strlen(cursor);
-        rate_start = NULL;
-    } else {
-        input_len = (size_t)(input_start - cursor);
-        rate_start = input_start + 1;
-    }
-    if (input_len == 0) {
-        free(*host_out);
-        *host_out = NULL;
-        return -1;
-    }
-    *input_out = strndup(cursor, input_len);
-    if (*input_out == NULL) {
-        free(*host_out);
-        *host_out = NULL;
-        return -1;
-    }
     path->input_path = *input_out;
+    if (rate_text != NULL) {
+        double rate = strtod(rate_text, &end);
 
-    if (rate_start != NULL && *rate_start != '\0') {
-        double rate = strtod(rate_start, &end);
-
-        if (end == rate_start || *end != '\0' || rate <= 0.0) {
+        if (end == rate_text || *end != '\0' || rate <= 0.0) {
             free(*host_out);
             free(*input_out);
             *host_out = NULL;
             *input_out = NULL;
+            free(copy);
             return -1;
         }
         path->source_rate_mbps = rate;
     }
 
+    *has_explicit_flow_id = explicit_flow_id;
+    free(copy);
+    return 0;
+}
+
+static int wire_flow_id_used(const WgWireFlowPath *paths, uint32_t flow_count,
+                             uint32_t flow_id)
+{
+    uint32_t i;
+
+    for (i = 0; i < flow_count; i++) {
+        if (paths[i].flow_id == flow_id) {
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -121,7 +165,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <id:host:port:input[:rate-mbps]> ...\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]> ...\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
@@ -256,6 +300,7 @@ int main(int argc, char **argv)
         char          **inputs = NULL;
         uint32_t        flow_count = 0;
         uint32_t        flow_cap = 0;
+        uint32_t        next_auto_flow_id = 0;
         WgPipelineStatus status;
 
         if (codec_kind == CODEC_KIND_NONE) {
@@ -268,15 +313,35 @@ int main(int argc, char **argv)
             WgWireFlowPath path;
             char          *host = NULL;
             char          *input = NULL;
+            int            has_explicit_flow_id = 0;
 
             if (argi + 1 >= argc) {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
             if (parse_wire_flow_spec(argv[argi + 1], &path, &host, &input,
-                                     source_rate_mbps) != 0) {
+                                     source_rate_mbps,
+                                     &has_explicit_flow_id) != 0) {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
+            }
+
+            if (has_explicit_flow_id) {
+                if (wire_flow_id_used(paths, flow_count, path.flow_id)) {
+                    fprintf(stderr, "duplicate flow_id in --flow specs: %u\n",
+                            path.flow_id);
+                    free(host);
+                    free(input);
+                    free(paths);
+                    free(hosts);
+                    free(inputs);
+                    return EXIT_FAILURE;
+                }
+            } else {
+                while (wire_flow_id_used(paths, flow_count, next_auto_flow_id)) {
+                    next_auto_flow_id++;
+                }
+                path.flow_id = next_auto_flow_id++;
             }
 
             if (flow_count == flow_cap) {

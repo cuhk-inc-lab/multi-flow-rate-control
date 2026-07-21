@@ -1,6 +1,7 @@
 #include "wire_udp.h"
 
 #include "codec.h"
+#include "flow_peer_map.h"
 #include "stream_config.h"
 
 #include <arpa/inet.h>
@@ -1147,12 +1148,15 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
 {
     const Codec *codec;
     WireFlowCtx  flows[WIRE_MAX_FLOWS] = {0};
+    FlowPeerMap *flow_map = NULL;
     unsigned char datagram[WIRE_HEADER_SIZE + PKG_SIZE];
     size_t        input_size;
     size_t        output_size;
     uint16_t      expected_shards;
     size_t        max_flows;
     int           multi_mode;
+    struct sockaddr_storage local_addr;
+    socklen_t     local_len = (socklen_t)sizeof(local_addr);
     double        last_receive;
     int           sock = -1;
     int           result = -1;
@@ -1192,6 +1196,12 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
 
     sock = open_receiver_socket(config->port);
     if (sock < 0) {
+        goto cleanup;
+    }
+    if (getsockname(sock, (struct sockaddr *)&local_addr, &local_len) != 0) {
+        goto cleanup;
+    }
+    if (flow_peer_map_init(&flow_map, (uint32_t)max_flows) != FPM_OK) {
         goto cleanup;
     }
 
@@ -1262,6 +1272,8 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             ssize_t                 received;
             struct sockaddr_storage peer_addr;
             socklen_t               peer_len = (socklen_t)sizeof(peer_addr);
+            FlowTuple               tuple;
+            uint32_t                mapped_flow_id;
             WireHeader              header;
             WireFlowKey             key;
             WireFlowCtx            *flow;
@@ -1274,6 +1286,16 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                 goto cleanup;
             }
             last_receive = monotonic_seconds();
+            if (flow_tuple_set(&tuple,
+                               (struct sockaddr *)&peer_addr, peer_len,
+                               (struct sockaddr *)&local_addr, local_len,
+                               IPPROTO_UDP) != 0) {
+                continue;
+            }
+            mapped_flow_id = flow_peer_map_lookup(flow_map, &tuple);
+            if (mapped_flow_id == (uint32_t)-1) {
+                continue;
+            }
             if (wire_header_decode(&header, datagram, (size_t)received) != 0) {
                 continue;
             }
@@ -1282,7 +1304,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                 continue;
             }
 
-            wire_flow_key_from_peer(&key, &peer_addr, peer_len, header.flow_id);
+            wire_flow_key_from_peer(&key, &peer_addr, peer_len, mapped_flow_id);
             flow = wire_flow_find(flows, max_flows, &key);
             if (flow == NULL) {
                 if (multi_mode) {
@@ -1295,12 +1317,12 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     flow = wire_flow_alloc(flows, max_flows, &key, path);
                     if (flow == NULL) {
                         fprintf(stderr,
-                                "udp-recv: flow table full, dropping flow_id=%u\n",
-                                header.flow_id);
+                                "udp-recv: flow table full, dropping mapped_flow=%u wire_flow=%u\n",
+                                mapped_flow_id, header.flow_id);
                         continue;
                     }
-                    fprintf(stderr, "udp-recv: opened flow %u -> %s\n",
-                            header.flow_id, path);
+                    fprintf(stderr, "udp-recv: opened flow %u (wire flow %u) -> %s\n",
+                            mapped_flow_id, header.flow_id, path);
                 } else {
                     flow = &flows[0];
                     flow->key = key;
@@ -1370,6 +1392,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
 
 cleanup:
+    if (flow_map != NULL) {
+        flow_peer_map_destroy(flow_map);
+    }
     for (fi = 0; fi < max_flows; fi++) {
         wire_flow_close(&flows[fi]);
     }
