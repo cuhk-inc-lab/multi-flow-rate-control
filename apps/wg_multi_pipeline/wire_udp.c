@@ -1243,10 +1243,17 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             if (saw_flow &&
                 monotonic_seconds() - last_receive >= (double)config->idle_sec) {
                 if (multi_mode) {
-                    if (wire_flows_all_complete(flows, max_flows)) {
-                        break;
-                    }
-                } else if (flows[0].end_seen) {
+                    /*
+                     * Multi-flow receives can stall forever if some peers never
+                     * send END (path loss, sender crash). After idle_sec with no
+                     * packets, stop and report incomplete flows below.
+                     */
+                    fprintf(stderr,
+                            "udp-recv: idle for %u s; ending multi-flow receive\n",
+                            config->idle_sec);
+                    break;
+                }
+                if (flows[0].end_seen) {
                     if (config->best_effort && !flows[0].complete) {
                         if (flush_best_effort_groups(
                                 flows[0].groups, &flows[0].next_block,
@@ -1261,6 +1268,13 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     }
                     break;
                 }
+            }
+            if (!saw_flow &&
+                monotonic_seconds() - last_receive >= (double)config->idle_sec) {
+                fprintf(stderr,
+                        "udp-recv: no datagrams for %u s; ending receive\n",
+                        config->idle_sec);
+                break;
             }
             continue;
         }

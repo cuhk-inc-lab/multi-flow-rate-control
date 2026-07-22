@@ -33,6 +33,7 @@ local_work="$result_dir/payloads"
 bin_rel="./build/wg_multi_pipeline"
 remote_run_id="iperf-like-$timestamp"
 ssh_cmd_timeout=${SSH_CMD_TIMEOUT:-20}
+recv_wait_sec=${RECV_WAIT_SEC:-45}
 
 node2_ssh=${NODE2_SSH:-}
 node3_ssh=${NODE3_SSH:-}
@@ -414,13 +415,31 @@ echo "  Node2 sender pid=$n2_send_pid"
 echo "== waiting for senders =="
 wait "$local_send_pid"
 local_send_rc=$?
+echo "  Node1 sender exit=$local_send_rc"
 ssh_run "$node2_ssh" "while kill -0 $n2_send_pid 2>/dev/null; do sleep 0.5; done" || true
+echo "  Node2 sender finished"
 
-echo "== waiting for receivers =="
-for pair in "$node4_ssh:$n4_recv_pid" "$node2_ssh:$n2_recv_pid" "$node3_ssh:$n3_recv_pid"; do
-    host=${pair%%:*}
-    pid=${pair##*:}
-    ssh_run "$host" "while kill -0 $pid 2>/dev/null; do sleep 0.5; done" || true
+echo "== waiting for receivers (max ${recv_wait_sec}s) =="
+deadline=$(( $(date +%s) + recv_wait_sec ))
+for pair in "n4:$node4_ssh:$n4_recv_pid" "n2:$node2_ssh:$n2_recv_pid" "n3:$node3_ssh:$n3_recv_pid"; do
+    name=${pair%%:*}
+    rest=${pair#*:}
+    host=${rest%%:*}
+    pid=${rest##*:}
+    echo "  waiting on $name pid=$pid ..."
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if ! ssh_run "$host" "kill -0 $pid 2>/dev/null"; then
+            echo "  $name receiver exited"
+            break
+        fi
+        sleep 0.5
+    done
+    if ssh_run "$host" "kill -0 $pid 2>/dev/null"; then
+        echo "  $name receiver still running after ${recv_wait_sec}s; sending SIGTERM"
+        ssh_run "$host" "kill $pid 2>/dev/null || true"
+        sleep 1
+        ssh_run "$host" "kill -9 $pid 2>/dev/null || true"
+    fi
 done
 
 echo "== stopping monitors =="
