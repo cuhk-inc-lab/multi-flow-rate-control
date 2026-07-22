@@ -619,8 +619,33 @@ static int drain_pipe_to_post_multi(FlowStage *st)
 
     for (;;) {
         if (st->pipe_partial_len > 0) {
-            size_t need = PKG_SIZE - st->pipe_partial_len;
+            size_t need;
 
+            /*
+             * A full PKG may already be stashed here when Buffer_Write
+             * previously returned CB_ERR_FULL. Flush it before reading more;
+             * read(..., 0) would return 0 and look like EOF.
+             */
+            if (st->pipe_partial_len >= PKG_SIZE) {
+                if (!post_multi_has_space(st, PKG_SIZE)) {
+                    break;
+                }
+                wr = Buffer_Write(st->post_multi_in, st->pipe_partial, PKG_SIZE);
+                if (wr == CB_ERR_FULL) {
+                    break;
+                }
+                if (wr != CB_OK) {
+                    if (saved_flags >= 0) {
+                        (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
+                    }
+                    return -1;
+                }
+                st->pipe_partial_len = 0;
+                total += (int)PKG_SIZE;
+                continue;
+            }
+
+            need = PKG_SIZE - st->pipe_partial_len;
             if (!post_multi_has_space(st, PKG_SIZE)) {
                 /* Backpressure: leave partial in place until encode/send drains. */
                 break;
