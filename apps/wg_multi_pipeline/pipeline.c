@@ -58,6 +58,7 @@ typedef struct FlowStage {
     size_t              ingress_partial_len;
     unsigned char       pipe_partial[PKG_SIZE];
     size_t              pipe_partial_len;
+    uint64_t            pipe_bytes_read;
     /*
      * Valid-byte count for the final padded decode block. A nonzero value
      * means its encoded form is still somewhere in the stage pipeline.
@@ -70,7 +71,9 @@ typedef struct FlowStage {
 
 static int buffer_has_space(CircularBuffer *buf, size_t need);
 static int flow_packets_delivered(const FlowStage *st, const FlowManager *mgr);
+static int flow_pipe_bytes_caught_up(const FlowStage *st, const FlowManager *mgr);
 static int drain_pipe_to_post_multi(FlowStage *st);
+static int drain_pkts_to_post_multi(FlowStage *st);
 
 static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
                                             unsigned char *work, int *progress)
@@ -181,12 +184,17 @@ static WgPipelineStatus init_wire_flow_stage(FlowStage *stage, uint32_t flow_id,
     strncpy(stage->input_path, input_path, sizeof(stage->input_path) - 1u);
     stage->input_path[sizeof(stage->input_path) - 1u] = '\0';
 
-    if (pipe(stage->pipefd) != 0) {
+    /*
+     * Use a packet queue (same as relay mode) instead of a byte pipe so
+     * paced wire send cannot mis-assemble partial 188-byte reads.
+     */
+    if (flow_buffer_init(&stage->post_multi_pkts, MF_QUEUE_CAPACITY) != FB_OK) {
         return WG_PIPE_ERR;
     }
 
     if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
                     BUFFER_OVERFLOW_POLICY) != CB_OK) {
+        flow_buffer_destroy(&stage->post_multi_pkts);
         return WG_PIPE_ERR;
     }
 
@@ -307,12 +315,14 @@ static int wire_flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr
         return 0;
     }
 
-    if (!flow_packets_delivered(st, mgr)) {
+    if (!flow_packets_delivered(st, mgr) ||
+        !flow_pipe_bytes_caught_up(st, mgr)) {
         return 0;
     }
 
     return st->segment_input_drained &&
            st->pipe_partial_len == 0 &&
+           flow_buffer_is_empty(&st->post_multi_pkts) &&
            Buffer_IsEmpty(st->post_multi_in) &&
            (st->wire_tail_sent || st->post_multi_in->size == 0) &&
            flow_queues_drained(mgr, st->flow_id);
@@ -373,6 +383,8 @@ static void destroy_flow_stage(FlowStage *stage)
         flow_buffer_shutdown(&stage->post_multi_pkts);
         flow_buffer_destroy(&stage->post_multi_pkts);
     } else if (stage->wire_send_mode) {
+        flow_buffer_shutdown(&stage->post_multi_pkts);
+        flow_buffer_destroy(&stage->post_multi_pkts);
         Buffer_Destroy(&stage->post_multi_in);
         if (stage->pipefd[0] >= 0) {
             close(stage->pipefd[0]);
@@ -425,6 +437,17 @@ static int flow_packets_delivered(const FlowStage *st, const FlowManager *mgr)
     return enq >= st->segment_packet_limit && deq >= st->segment_packet_limit;
 }
 
+static int flow_pipe_bytes_caught_up(const FlowStage *st, const FlowManager *mgr)
+{
+    uint64_t deq_bytes;
+
+    if (st == NULL || mgr == NULL || st->flow_id >= mgr->config.max_flows) {
+        return 0;
+    }
+    deq_bytes = atomic_load(&mgr->flows[st->flow_id].metrics.dequeued_bytes);
+    return st->pipe_bytes_read >= deq_bytes;
+}
+
 /*
  * Once all packets accepted for this segment have reached the pipe, drain it
  * one final time before padding a partial codec block. The second delivery
@@ -434,44 +457,72 @@ static WgPipelineStatus finish_segment_input(FlowStage *st, const FlowManager *m
                                              int *progress)
 {
     int dr;
+    int pass;
 
     if (st == NULL || mgr == NULL || st->relay_mode ||
         !st->ingest_done || st->segment_input_drained) {
         return WG_PIPE_OK;
     }
-    if (!flow_packets_delivered(st, mgr)) {
-        return WG_PIPE_OK;
-    }
 
-    dr = drain_pipe_to_post_multi(st);
-    if (dr < 0) {
-        return WG_PIPE_ERR;
-    }
-    if (dr > 0 && progress != NULL) {
-        *progress = 1;
-    }
-    if (!flow_packets_delivered(st, mgr)) {
-        return WG_PIPE_OK;
-    }
+    for (pass = 0; pass < 2; pass++) {
+        if (!flow_packets_delivered(st, mgr) ||
+            !flow_pipe_bytes_caught_up(st, mgr)) {
+            return WG_PIPE_OK;
+        }
 
-    if (st->pipe_partial_len > 0) {
-        CB_Status wr = Buffer_Write(st->post_multi_in, st->pipe_partial,
-                                    st->pipe_partial_len);
-
-        if (wr == CB_ERR_FULL) {
-            /* Wait for encode/send to free post_multi space. */
+        if (st->wire_send_mode) {
+            dr = drain_pkts_to_post_multi(st);
+        } else {
+            dr = drain_pipe_to_post_multi(st);
+        }
+        if (dr == -2) {
             if (progress != NULL) {
                 *progress = 1;
             }
             return WG_PIPE_OK;
         }
-        if (wr != CB_OK) {
+        if (dr < 0) {
             return WG_PIPE_ERR;
         }
-        st->pipe_partial_len = 0;
-        if (progress != NULL) {
-            *progress = 1;
+        if (dr > 0) {
+            if (progress != NULL) {
+                *progress = 1;
+            }
+            pass = -1;
+            continue;
         }
+
+        if (st->pipe_partial_len > 0) {
+            CB_Status wr = Buffer_Write(st->post_multi_in, st->pipe_partial,
+                                        st->pipe_partial_len);
+
+            if (wr == CB_ERR_FULL) {
+                if (progress != NULL) {
+                    *progress = 1;
+                }
+                return WG_PIPE_OK;
+            }
+            if (wr != CB_OK) {
+                return WG_PIPE_ERR;
+            }
+            st->pipe_partial_len = 0;
+            if (progress != NULL) {
+                *progress = 1;
+            }
+            pass = -1;
+            continue;
+        }
+
+        if (st->wire_send_mode && !flow_buffer_is_empty(&st->post_multi_pkts)) {
+            return WG_PIPE_OK;
+        }
+    }
+
+    if (!flow_packets_delivered(st, mgr) ||
+        !flow_pipe_bytes_caught_up(st, mgr) ||
+        st->pipe_partial_len > 0 ||
+        (st->wire_send_mode && !flow_buffer_is_empty(&st->post_multi_pkts))) {
+        return WG_PIPE_OK;
     }
 
     st->segment_input_drained = true;
@@ -592,12 +643,92 @@ static ssize_t read_input_nb(FlowStage *st, unsigned char *buf, size_t len)
 
 static int post_multi_has_space(const FlowStage *st, size_t nbytes)
 {
+    size_t high_water;
+
     if (st == NULL || st->post_multi_in == NULL) {
+        return 0;
+    }
+    high_water = DECODE_BLOCK * 8u;
+    if (st->post_multi_in->size >= high_water) {
         return 0;
     }
     return st->post_multi_in->capacity - st->post_multi_in->size >= nbytes;
 }
 
+/*
+ * Move whole packets from the wire ingress queue into post_multi.
+ * Returns: >=0 bytes, -1 error, -2 backpressure.
+ */
+static int drain_pkts_to_post_multi(FlowStage *st)
+{
+    int total = 0;
+    int blocked = 0;
+
+    if (st == NULL || st->post_multi_in == NULL) {
+        return -1;
+    }
+
+    for (;;) {
+        DataPacket      *pkt = NULL;
+        FlowBufferStatus fb_st;
+        size_t           len;
+
+        if (!post_multi_has_space(st, PKG_SIZE)) {
+            blocked = 1;
+            break;
+        }
+
+        fb_st = flow_buffer_try_dequeue(&st->post_multi_pkts, &pkt);
+        if (fb_st == FB_ERR_EMPTY) {
+            break;
+        }
+        if (fb_st != FB_OK || pkt == NULL) {
+            return -1;
+        }
+
+        len = pkt->payload_len;
+        if (len == 0) {
+            packet_free(pkt);
+            continue;
+        }
+        if (pkt->payload == NULL || len > PKG_SIZE ||
+            !post_multi_has_space(st, len)) {
+            /* Put back is not supported; treat as backpressure by re-queue. */
+            if (flow_buffer_enqueue(&st->post_multi_pkts, &pkt) != FB_OK) {
+                packet_free(pkt);
+                return -1;
+            }
+            blocked = 1;
+            break;
+        }
+
+        if (Buffer_Write(st->post_multi_in, pkt->payload, len) != CB_OK) {
+            if (flow_buffer_enqueue(&st->post_multi_pkts, &pkt) != FB_OK) {
+                packet_free(pkt);
+                return -1;
+            }
+            blocked = 1;
+            break;
+        }
+
+        st->pipe_bytes_read += (uint64_t)len;
+        total += (int)len;
+        packet_free(pkt);
+    }
+
+    if (blocked) {
+        return -2;
+    }
+    return total;
+}
+
+/*
+ * Drain worker pipe into post_multi.
+ * Returns:
+ *   >=0  bytes moved (0 = nothing this turn)
+ *   -1   hard error
+ *   -2   stopped due to post_multi backpressure (pipe may still have data)
+ */
 static int drain_pipe_to_post_multi(FlowStage *st)
 {
     unsigned char  buf[PKG_SIZE];
@@ -605,6 +736,7 @@ static int drain_pipe_to_post_multi(FlowStage *st)
     int            flags;
     int            saved_flags = -1;
     int            total = 0;
+    int            blocked = 0;
     CB_Status      wr;
 
     if (st == NULL || st->pipefd[0] < 0 || st->post_multi_in == NULL) {
@@ -628,10 +760,12 @@ static int drain_pipe_to_post_multi(FlowStage *st)
              */
             if (st->pipe_partial_len >= PKG_SIZE) {
                 if (!post_multi_has_space(st, PKG_SIZE)) {
+                    blocked = 1;
                     break;
                 }
                 wr = Buffer_Write(st->post_multi_in, st->pipe_partial, PKG_SIZE);
                 if (wr == CB_ERR_FULL) {
+                    blocked = 1;
                     break;
                 }
                 if (wr != CB_OK) {
@@ -648,6 +782,7 @@ static int drain_pipe_to_post_multi(FlowStage *st)
             need = PKG_SIZE - st->pipe_partial_len;
             if (!post_multi_has_space(st, PKG_SIZE)) {
                 /* Backpressure: leave partial in place until encode/send drains. */
+                blocked = 1;
                 break;
             }
 
@@ -658,12 +793,14 @@ static int drain_pipe_to_post_multi(FlowStage *st)
 
             if (n > 0) {
                 st->pipe_partial_len += (size_t)n;
+                st->pipe_bytes_read += (uint64_t)n;
                 if (st->pipe_partial_len < PKG_SIZE) {
                     break;
                 }
 
                 wr = Buffer_Write(st->post_multi_in, st->pipe_partial, PKG_SIZE);
                 if (wr == CB_ERR_FULL) {
+                    blocked = 1;
                     break;
                 }
                 if (wr != CB_OK) {
@@ -689,6 +826,7 @@ static int drain_pipe_to_post_multi(FlowStage *st)
         }
 
         if (!post_multi_has_space(st, PKG_SIZE)) {
+            blocked = 1;
             break;
         }
 
@@ -697,6 +835,7 @@ static int drain_pipe_to_post_multi(FlowStage *st)
         } while (n < 0 && errno == EINTR);
 
         if (n > 0) {
+            st->pipe_bytes_read += (uint64_t)n;
             if ((size_t)n < PKG_SIZE) {
                 memcpy(st->pipe_partial, buf, (size_t)n);
                 st->pipe_partial_len = (size_t)n;
@@ -708,6 +847,7 @@ static int drain_pipe_to_post_multi(FlowStage *st)
                 /* Already consumed from pipe; stash and retry next turn. */
                 memcpy(st->pipe_partial, buf, PKG_SIZE);
                 st->pipe_partial_len = PKG_SIZE;
+                blocked = 1;
                 break;
             }
             if (wr != CB_OK) {
@@ -735,6 +875,9 @@ static int drain_pipe_to_post_multi(FlowStage *st)
         (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
     }
 
+    if (blocked) {
+        return -2;
+    }
     return total;
 }
 
@@ -840,6 +983,18 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
         if ((size_t)n < PKG_SIZE) {
             memcpy(st->ingress_partial, buf, (size_t)n);
             st->ingress_partial_len = (size_t)n;
+            /* Regular-file short read is EOF; flush the tail packet now. */
+            if (!input_is_fifo(st)) {
+                WgPipelineStatus push_st;
+
+                push_st = push_ingress_packet(st, mgr, st->ingress_partial,
+                                              st->ingress_partial_len);
+                st->ingress_partial_len = 0;
+                if (push_st != WG_PIPE_OK) {
+                    return push_st;
+                }
+                mark_segment_ending(st);
+            }
             return WG_PIPE_OK;
         }
 
@@ -886,6 +1041,9 @@ static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
     }
 
     if (st->relay_mode && flow_buffer_is_full(&st->post_multi_pkts)) {
+        return 0;
+    }
+    if (st->wire_send_mode && flow_buffer_is_full(&st->post_multi_pkts)) {
         return 0;
     }
 
@@ -1209,7 +1367,7 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
                 int dr;
 
                 dr = drain_pipe_to_post_multi(st);
-                if (dr > 0) {
+                if (dr > 0 || dr == -2) {
                     progress = 1;
                 } else if (dr < 0) {
                     status = WG_PIPE_ERR;
@@ -1648,7 +1806,7 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
             int        dr;
 
             dr = drain_pipe_to_post_multi(st);
-            if (dr > 0) {
+            if (dr > 0 || dr == -2) {
                 progress = 1;
             } else if (dr < 0) {
                 status = WG_PIPE_ERR;
@@ -1798,7 +1956,8 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     for (i = 0; i < config->flow_count; i++) {
         uint32_t fid = config->flows[i].flow_id;
 
-        mgr.flows[fid].output_fd = stages[i].pipefd[1];
+        mgr.flows[fid].output_fd = -1;
+        mgr.flows[fid].relay_queue = &stages[i].post_multi_pkts;
         flow_context_set_pacing(&mgr.flows[fid], config->pacing_enabled);
     }
 
@@ -1818,8 +1977,8 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
             FlowStage *st = &stages[i];
             int        dr;
 
-            dr = drain_pipe_to_post_multi(st);
-            if (dr > 0) {
+            dr = drain_pkts_to_post_multi(st);
+            if (dr > 0 || dr == -2) {
                 progress = 1;
             } else if (dr < 0) {
                 fprintf(stderr,
@@ -1906,6 +2065,9 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     }
 
 cleanup_running:
+    for (i = 0; i < config->flow_count; i++) {
+        flow_buffer_shutdown(&stages[i].post_multi_pkts);
+    }
     flow_manager_stop(&mgr);
 cleanup_mgr:
     flow_manager_destroy(&mgr);

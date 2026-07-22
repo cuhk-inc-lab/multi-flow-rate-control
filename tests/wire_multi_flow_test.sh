@@ -41,20 +41,20 @@ cmp "$input1" "$out1"
 grep -q 'flow 0' "$base/wire_multi_receiver.log"
 grep -q 'flow 1' "$base/wire_multi_receiver.log"
 
-# Stress case: paced multi-flow must not abort when post_multi fills
+# Stress case: paced multi-flow must complete large non-aligned payloads
 rm -f "${prefix}"src_*_flow_*.ts
-dd if=/dev/urandom of="$input0" bs=188 count=8000 status=none
-dd if=/dev/urandom of="$input1" bs=188 count=8000 status=none
+dd if=/dev/urandom of="$input0" bs=1M count=12 status=none
+dd if=/dev/urandom of="$input1" bs=1M count=12 status=none
 port=$((port + 1))
 
-"$bin" --codec copy --udp-recv "$port" "$prefix" --max-flows 2 --idle-sec 5 \
+"$bin" --codec copy --udp-recv "$port" "$prefix" --max-flows 2 --idle-sec 8 \
     >"$base/wire_multi_receiver_stress.log" 2>&1 &
 receiver_pid=$!
 sleep 1
 
 "$bin" --codec copy --udp-send-multi \
-    --flow "0:127.0.0.1:$port:$input0:80" \
-    --flow "1:127.0.0.1:$port:$input1:80" \
+    --flow "0:127.0.0.1:$port:$input0:50" \
+    --flow "1:127.0.0.1:$port:$input1:50" \
     >"$base/wire_multi_sender_stress.log" 2>&1
 test $? -eq 0
 grep -q 'flow_id=0' "$base/wire_multi_sender_stress.log"
