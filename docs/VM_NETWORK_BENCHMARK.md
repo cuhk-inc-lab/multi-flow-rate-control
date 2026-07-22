@@ -145,18 +145,21 @@ Node2/Node3/Node4 receivers, plus relay iface monitoring), use:
 NODE2_SSH=fyp1@NODE2_MGMT NODE2_IP=NODE2_DATA_IP \
 NODE3_SSH=fyp1@NODE3_MGMT NODE3_IP=NODE3_DATA_IP \
 NODE4_SSH=fyp1@NODE4_MGMT NODE4_IP=NODE4_DATA_IP \
-NODE2_IFACES="ens5 ens6" NODE3_IFACES="ens5 ens6" \
   ./scripts/run_iperf_like_wire.sh input.ts
 ```
+
+Relay iface defaults match the lab topology (`NODE2_IFACES="ap0 station1"`,
+`NODE3_IFACES="ap1 station2"`). Override only if your names differ.
 
 The script:
 
 1. builds sized payloads for each stream (`rate * duration`) on Node1
    (including Node2's s2/s4), then scp's s2/s4 onto Node2 for sending
-2. starts receivers on Node2/3/4 (`--codec` default `xor-fec`)
+2. starts receivers on Node2/3/4 (`--codec` default `copy` for integrity;
+   use `CODEC=xor-fec` for FEC stress)
 3. starts relay monitors on Node2/3
 4. starts Node1 + Node2 senders at a shared `START_AT` barrier
-   (default rates: 4/4/8/8/4/8 Mbps)
+   (default rates: 1/1/2/2/1/2 Mbps, short durations, ~9 Mbps aggregate)
 5. collects logs and writes `streams.csv` + `summary.md` under
    `build/iperf-like-wire-*`
 
