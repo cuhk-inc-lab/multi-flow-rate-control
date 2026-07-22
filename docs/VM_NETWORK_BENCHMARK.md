@@ -151,10 +151,12 @@ NODE2_IFACES="ens5 ens6" NODE3_IFACES="ens5 ens6" \
 
 The script:
 
-1. builds sized payloads for each stream (`rate * duration`)
-2. starts receivers on Node2/3/4
+1. builds sized payloads for each stream (`rate * duration`) on Node1
+   (including Node2's s2/s4), then scp's s2/s4 onto Node2 for sending
+2. starts receivers on Node2/3/4 (`--codec` default `xor-fec`)
 3. starts relay monitors on Node2/3
 4. starts Node1 + Node2 senders at a shared `START_AT` barrier
+   (default rates: 4/4/8/8/4/8 Mbps)
 5. collects logs and writes `streams.csv` + `summary.md` under
    `build/iperf-like-wire-*`
 

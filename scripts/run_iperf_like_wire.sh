@@ -2,13 +2,13 @@
 
 # Concurrent multi-destination wire test (iperf-like), run from Node1.
 #
-# Default streams (supervisor diagram):
-#   1) Node1 -> Node4  10 Mbps / 10 s
-#   2) Node2 -> Node4  10 Mbps / 10 s
-#   3) Node1 -> Node2  20 Mbps / 10 s
-#   4) Node2 -> Node2  20 Mbps / 10 s  (loopback)
-#   5) Node1 -> Node3  10 Mbps / 10 s
-#   6) Node1 -> Node4  20 Mbps /  5 s
+# Default streams (supervisor diagram, conservative rates for shared links):
+#   1) Node1 -> Node4   4 Mbps / 10 s
+#   2) Node2 -> Node4   4 Mbps / 10 s
+#   3) Node1 -> Node2   8 Mbps / 10 s
+#   4) Node2 -> Node2   8 Mbps / 10 s  (loopback)
+#   5) Node1 -> Node3   4 Mbps / 10 s
+#   6) Node1 -> Node4   8 Mbps /  5 s
 #
 # Example:
 #   NODE2_SSH=fyp1@10.10.10.162 NODE2_IP=10.10.12.2 \
@@ -20,7 +20,7 @@
 set -u
 
 input_path=${1:-}
-codec=${CODEC:-copy}
+codec=${CODEC:-xor-fec}
 port=${PORT:-9000}
 idle_sec=${IDLE_SEC:-8}
 barrier_sec=${BARRIER_SEC:-5}
@@ -54,7 +54,7 @@ Required env:
   NODE4_SSH NODE4_IP
 
 Optional env:
-  CODEC=copy|block|xor-fec|rs-fec   (default: copy)
+  CODEC=copy|block|xor-fec|rs-fec   (default: xor-fec)
   PORT=9000
   IDLE_SEC=8
   BARRIER_SEC=5
@@ -285,12 +285,12 @@ mkdir -p "$result_dir/payloads" "$result_dir/logs" "$result_dir/remote" \
 # sender: local|node2
 # outdir_key: n2|n3|n4
 stream_defs="
-1 local 10 10 s1 n4 $node4_ip
-2 node2 10 10 s2 n4 $node4_ip
-3 local 20 10 s3 n2 $node2_ip
-4 node2 20 10 s4 n2 127.0.0.1
-5 local 10 10 s5 n3 $node3_ip
-6 local 20 5 s6 n4 $node4_ip
+1 local 4 10 s1 n4 $node4_ip
+2 node2 4 10 s2 n4 $node4_ip
+3 local 8 10 s3 n2 $node2_ip
+4 node2 8 10 s4 n2 127.0.0.1
+5 local 4 10 s5 n3 $node3_ip
+6 local 8 5 s6 n4 $node4_ip
 "
 
 echo "== preparing payloads =="
@@ -311,14 +311,20 @@ done
 
 echo "== creating remote dirs =="
 for host in "$node2_ssh" "$node3_ssh" "$node4_ssh"; do
-    ssh_run "$host" "mkdir -p '$remote_repo/build/$remote_run_id'/{out,logs,monitor}"
+    ssh_run "$host" "mkdir -p '$remote_repo/build/$remote_run_id'/{out,logs,monitor,payloads}"
 done
 
-echo "== syncing Node2 payloads =="
-ssh_run "$node2_ssh" "mkdir -p '$remote_repo/build/iperf-like-payloads'"
+echo "== syncing Node2 payloads (s2/s4 generated on Node1, copied for Node2 send) =="
 # shellcheck disable=SC2086
 scp $ssh_opts "$local_work/s2.ts" "$local_work/s4.ts" \
-    "$node2_ssh:$remote_repo/build/iperf-like-payloads/" >/dev/null
+    "$node2_ssh:$remote_repo/build/$remote_run_id/payloads/" >/dev/null \
+    || die "failed to scp s2.ts/s4.ts to Node2"
+ssh_run "$node2_ssh" "cd '$remote_repo' && \
+  test -s 'build/$remote_run_id/payloads/s2.ts' && \
+  test -s 'build/$remote_run_id/payloads/s4.ts' && \
+  wc -c 'build/$remote_run_id/payloads/s2.ts' 'build/$remote_run_id/payloads/s4.ts'" \
+    || die "Node2 payloads missing after scp"
+echo "  kept local copies+hashes under $local_work for validation"
 
 echo "== capturing pre-test link counters =="
 capture_link_stats "$node2_ssh" "$node2_ifaces" "$result_dir/monitor/node2-link-before.txt"
@@ -392,21 +398,21 @@ echo "== barrier START_AT=$start_at (wait ${barrier_sec}s) =="
 (
     while [ "$(date +%s)" -lt "$start_at" ]; do sleep 0.05; done
     ./build/wg_multi_pipeline --codec "$codec" --udp-send-multi \
-        --flow "${node4_ip}:${port}:${local_work}/s1.ts:10" \
-        --flow "${node2_ip}:${port}:${local_work}/s3.ts:20" \
-        --flow "${node3_ip}:${port}:${local_work}/s5.ts:10" \
-        --flow "${node4_ip}:${port}:${local_work}/s6.ts:20" \
+        --flow "${node4_ip}:${port}:${local_work}/s1.ts:4" \
+        --flow "${node2_ip}:${port}:${local_work}/s3.ts:8" \
+        --flow "${node3_ip}:${port}:${local_work}/s5.ts:4" \
+        --flow "${node4_ip}:${port}:${local_work}/s6.ts:8" \
         > "$result_dir/logs/node1-send.log" 2>&1
 ) &
 local_send_pid=$!
 
-# Node2 sender: streams 2,4
+# Node2 sender: streams 2,4 (payloads generated on Node1, then scp'd above)
 ssh_run "$node2_ssh" "cd '$remote_repo' && nohup sh -c '
   start_at=$start_at
   while [ \"\$(date +%s)\" -lt \"\$start_at\" ]; do sleep 0.05; done
   $bin_rel --codec \"$codec\" --udp-send-multi \
-    --flow \"${node4_ip}:${port}:build/iperf-like-payloads/s2.ts:10\" \
-    --flow \"127.0.0.1:${port}:build/iperf-like-payloads/s4.ts:20\" \
+    --flow \"${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:4\" \
+    --flow \"127.0.0.1:${port}:build/$remote_run_id/payloads/s4.ts:8\" \
     > \"build/$remote_run_id/logs/n2-send.log\" 2>&1
 ' >/dev/null 2>&1 </dev/null & echo \$!" > "$result_dir/remote/n2-send.pid"
 n2_send_pid=$(tr -d ' \n' < "$result_dir/remote/n2-send.pid")
@@ -545,12 +551,12 @@ total=$(awk -F, 'NF{c++} END{print c+0}' "$tmp_rows")
     echo
     echo "| Stream | Sender | Destination | Rate Mbps | Duration s |"
     echo "| --- | --- | --- | ---: | ---: |"
-    echo "| 1 | Node1 | Node4 ($node4_ip) | 10 | 10 |"
-    echo "| 2 | Node2 | Node4 ($node4_ip) | 10 | 10 |"
-    echo "| 3 | Node1 | Node2 ($node2_ip) | 20 | 10 |"
-    echo "| 4 | Node2 | Node2 (127.0.0.1) | 20 | 10 |"
-    echo "| 5 | Node1 | Node3 ($node3_ip) | 10 | 10 |"
-    echo "| 6 | Node1 | Node4 ($node4_ip) | 20 | 5 |"
+    echo "| 1 | Node1 | Node4 ($node4_ip) | 4 | 10 |"
+    echo "| 2 | Node2 | Node4 ($node4_ip) | 4 | 10 |"
+    echo "| 3 | Node1 | Node2 ($node2_ip) | 8 | 10 |"
+    echo "| 4 | Node2 | Node2 (127.0.0.1) | 8 | 10 |"
+    echo "| 5 | Node1 | Node3 ($node3_ip) | 4 | 10 |"
+    echo "| 6 | Node1 | Node4 ($node4_ip) | 8 | 5 |"
     echo
     echo "## Relay peaks"
     echo
