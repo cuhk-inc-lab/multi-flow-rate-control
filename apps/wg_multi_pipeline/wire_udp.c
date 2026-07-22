@@ -242,6 +242,7 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
     unsigned char datagram[WIRE_HEADER_SIZE + PKG_SIZE];
     size_t length = WIRE_HEADER_SIZE + header->payload_len;
     ssize_t sent;
+    int retries = 0;
 
     if (header->payload_len > PKG_SIZE) {
         return -1;
@@ -252,11 +253,26 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
         memcpy(datagram + WIRE_HEADER_SIZE, payload, header->payload_len);
     }
 
-    do {
+    for (;;) {
         sent = sendto(sock, datagram, length, 0, address, address_len);
-    } while (sent < 0 && errno == EINTR);
+        if (sent == (ssize_t)length) {
+            return 0;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                         errno == ENOBUFS) &&
+            retries < 10000) {
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000L};
 
-    return sent == (ssize_t)length ? 0 : -1;
+            retries++;
+            nanosleep(&delay, NULL);
+            continue;
+        }
+        fprintf(stderr, "wire-udp: sendto failed: %s\n", strerror(errno));
+        return -1;
+    }
 }
 
 int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,

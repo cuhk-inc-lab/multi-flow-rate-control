@@ -455,8 +455,17 @@ static WgPipelineStatus finish_segment_input(FlowStage *st, const FlowManager *m
     }
 
     if (st->pipe_partial_len > 0) {
-        if (Buffer_Write(st->post_multi_in, st->pipe_partial,
-                         st->pipe_partial_len) != CB_OK) {
+        CB_Status wr = Buffer_Write(st->post_multi_in, st->pipe_partial,
+                                    st->pipe_partial_len);
+
+        if (wr == CB_ERR_FULL) {
+            /* Wait for encode/send to free post_multi space. */
+            if (progress != NULL) {
+                *progress = 1;
+            }
+            return WG_PIPE_OK;
+        }
+        if (wr != CB_OK) {
             return WG_PIPE_ERR;
         }
         st->pipe_partial_len = 0;
@@ -581,6 +590,14 @@ static ssize_t read_input_nb(FlowStage *st, unsigned char *buf, size_t len)
     return n;
 }
 
+static int post_multi_has_space(const FlowStage *st, size_t nbytes)
+{
+    if (st == NULL || st->post_multi_in == NULL) {
+        return 0;
+    }
+    return st->post_multi_in->capacity - st->post_multi_in->size >= nbytes;
+}
+
 static int drain_pipe_to_post_multi(FlowStage *st)
 {
     unsigned char  buf[PKG_SIZE];
@@ -588,6 +605,7 @@ static int drain_pipe_to_post_multi(FlowStage *st)
     int            flags;
     int            saved_flags = -1;
     int            total = 0;
+    CB_Status      wr;
 
     if (st == NULL || st->pipefd[0] < 0 || st->post_multi_in == NULL) {
         return -1;
@@ -603,6 +621,11 @@ static int drain_pipe_to_post_multi(FlowStage *st)
         if (st->pipe_partial_len > 0) {
             size_t need = PKG_SIZE - st->pipe_partial_len;
 
+            if (!post_multi_has_space(st, PKG_SIZE)) {
+                /* Backpressure: leave partial in place until encode/send drains. */
+                break;
+            }
+
             do {
                 n = read(st->pipefd[0], st->pipe_partial + st->pipe_partial_len,
                          need);
@@ -614,8 +637,11 @@ static int drain_pipe_to_post_multi(FlowStage *st)
                     break;
                 }
 
-                if (Buffer_Write(st->post_multi_in, st->pipe_partial,
-                                 PKG_SIZE) != CB_OK) {
+                wr = Buffer_Write(st->post_multi_in, st->pipe_partial, PKG_SIZE);
+                if (wr == CB_ERR_FULL) {
+                    break;
+                }
+                if (wr != CB_OK) {
                     if (saved_flags >= 0) {
                         (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
                     }
@@ -637,6 +663,10 @@ static int drain_pipe_to_post_multi(FlowStage *st)
             return -1;
         }
 
+        if (!post_multi_has_space(st, PKG_SIZE)) {
+            break;
+        }
+
         do {
             n = read(st->pipefd[0], buf, PKG_SIZE);
         } while (n < 0 && errno == EINTR);
@@ -648,7 +678,14 @@ static int drain_pipe_to_post_multi(FlowStage *st)
                 break;
             }
 
-            if (Buffer_Write(st->post_multi_in, buf, PKG_SIZE) != CB_OK) {
+            wr = Buffer_Write(st->post_multi_in, buf, PKG_SIZE);
+            if (wr == CB_ERR_FULL) {
+                /* Already consumed from pipe; stash and retry next turn. */
+                memcpy(st->pipe_partial, buf, PKG_SIZE);
+                st->pipe_partial_len = PKG_SIZE;
+                break;
+            }
+            if (wr != CB_OK) {
                 if (saved_flags >= 0) {
                     (void)fcntl(st->pipefd[0], F_SETFL, saved_flags);
                 }
@@ -1760,17 +1797,26 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
             if (dr > 0) {
                 progress = 1;
             } else if (dr < 0) {
+                fprintf(stderr,
+                        "wire-multi-send: drain failed for flow_id=%u\n",
+                        config->flows[i].flow_id);
                 status = WG_PIPE_ERR;
                 goto cleanup_running;
             }
 
             if (finish_segment_input(st, &mgr, &progress) != WG_PIPE_OK) {
+                fprintf(stderr,
+                        "wire-multi-send: finish_segment failed for flow_id=%u\n",
+                        config->flows[i].flow_id);
                 status = WG_PIPE_ERR;
                 goto cleanup_running;
             }
 
             if (process_flow_wire_send(st, codec, &txs[i], work, &progress) !=
                 WG_PIPE_OK) {
+                fprintf(stderr,
+                        "wire-multi-send: wire send failed for flow_id=%u\n",
+                        config->flows[i].flow_id);
                 status = WG_PIPE_ERR;
                 goto cleanup_running;
             }
@@ -1786,6 +1832,9 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
                         progress = 1;
                     }
                 } else {
+                    fprintf(stderr,
+                            "wire-multi-send: ingress failed for flow_id=%u\n",
+                            config->flows[i].flow_id);
                     status = WG_PIPE_ERR;
                     goto cleanup_running;
                 }
@@ -1816,6 +1865,9 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     for (i = 0; i < config->flow_count; i++) {
         if (!stages[i].wire_end_sent) {
             if (wire_udp_tx_send_end(&txs[i], codec) != 0) {
+                fprintf(stderr,
+                        "wire-multi-send: END failed for flow_id=%u\n",
+                        config->flows[i].flow_id);
                 status = WG_PIPE_ERR;
                 goto cleanup_running;
             }
