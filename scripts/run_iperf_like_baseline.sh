@@ -33,7 +33,7 @@ rate_s6=${RATE_S6:-$rate_mbps}
 dur_s=${DURATION_S:-20}
 dur_short_s=${DURATION_SHORT_S:-15}
 barrier_sec=${BARRIER_SEC:-5}
-base_port=${BASE_PORT:-5201}
+base_port=${BASE_PORT:-15201}
 loss_max_pct=${LOSS_MAX_PCT:-1}
 ssh_opts="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
 ssh_cmd_timeout=${SSH_CMD_TIMEOUT:-20}
@@ -73,7 +73,7 @@ Required env:
 Optional env (same knobs as run_iperf_like_wire.sh):
   RATE_MBPS / RATE_S1..RATE_S6
   DURATION_S / DURATION_SHORT_S
-  BASE_PORT=5201          (streams use BASE_PORT .. BASE_PORT+5)
+  BASE_PORT=15201         (streams use BASE_PORT .. BASE_PORT+5)
   LOSS_MAX_PCT=1          (PASS if lost_percent <= this)
   BARRIER_SEC=5
   MONITOR_HZ=1
@@ -175,7 +175,14 @@ cleanup_ports() {
     shift
     ports=$*
     for p in $ports; do
-        ssh_run "$host" "fuser -k ${p}/tcp >/dev/null 2>&1 || true"
+        ssh_run "$host" "
+          fuser -k ${p}/tcp >/dev/null 2>&1 || true
+          fuser -k ${p}/udp >/dev/null 2>&1 || true
+          # fall back if fuser missing
+          for pid in \$(ss -ltnp 2>/dev/null | awk -v p=':${p}' '\$4 ~ p {print \$NF}' | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p'); do
+            kill \$pid 2>/dev/null || true
+          done
+        " || true
     done
 }
 cleanup_ports "$node2_ssh" "$port_s3" "$port_s4"
