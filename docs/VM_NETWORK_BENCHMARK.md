@@ -159,9 +159,11 @@ NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=...
 Relay iface defaults match the lab topology (`NODE2_IFACES="ap0 station1"`,
 `NODE3_IFACES="ap1 station2"`). Override only if your names differ.
 
-Single-run knobs: `CODEC`, `RATE_MBPS`, `DURATION_S`, `DURATION_SHORT_S`.
+Single-run knobs: `CODEC`, `RATE_MBPS`, `RATE_S1..RATE_S6`, `DURATION_S`
+(default 20), `DURATION_SHORT_S` (default 15).
 Results land under `build/iperf-like-wire-*` (or `build/iperf-like-matrix-*`):
-`summary.md`, `streams.csv`, `logs/`, `monitor/`, `out/`.
+`report.md` (CPU/RX/TX SVG charts + per-stream loss/recovery), `summary.md`,
+`streams.csv`, `logs/`, `monitor/`, `charts/`, `out/`.
 
 
 ## 4. Report

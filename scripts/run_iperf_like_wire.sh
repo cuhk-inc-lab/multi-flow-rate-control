@@ -2,17 +2,15 @@
 
 # Concurrent multi-destination wire test (iperf-like), run from Node1.
 #
-# Default streams (low aggregate; Node2 loopback uses PORT+1 to avoid sharing
-# the same udp-recv demux with Node1→Node2 under concurrent load):
-#   1) Node1 -> Node4   1 Mbps / 5 s
-#   2) Node2 -> Node4   1 Mbps / 5 s
-#   3) Node1 -> Node2   1 Mbps / 5 s
-#   4) Node2 -> Node2   1 Mbps / 5 s  (loopback on PORT+1)
-#   5) Node1 -> Node3   1 Mbps / 5 s
-#   6) Node1 -> Node4   1 Mbps / 3 s
-# Aggregate source ≈ 6 Mbps. Default codec is copy (hash-integrity baseline);
-# set CODEC=xor-fec for FEC stress (may need even lower rates on lossy hops).
-#
+# Default streams (longer runs for clearer CPU/NIC curves):
+#   1) Node1 -> Node4   RATE_S1 Mbps / DURATION_S
+#   2) Node2 -> Node4   RATE_S2 Mbps / DURATION_S
+#   3) Node1 -> Node2   RATE_S3 Mbps / DURATION_S
+#   4) Node2 -> Node2   RATE_S4 Mbps / DURATION_S  (loopback on PORT+1)
+#   5) Node1 -> Node3   RATE_S5 Mbps / DURATION_S
+#   6) Node1 -> Node4   RATE_S6 Mbps / DURATION_SHORT_S
+# Aggregate source depends on RATE_*; default codec is copy.
+# After each run, scripts/iperf_like_report.py writes report.md + charts/*.svg.
 # Example:
 #   NODE2_SSH=fyp1@10.10.10.162 NODE2_IP=10.10.12.2 \
 #   NODE3_SSH=fyp1@10.10.10.163 NODE3_IP=10.10.23.2 \
@@ -32,9 +30,9 @@ rate_s3=${RATE_S3:-$rate_mbps}
 rate_s4=${RATE_S4:-$rate_mbps}
 rate_s5=${RATE_S5:-$rate_mbps}
 rate_s6=${RATE_S6:-$rate_mbps}
-dur_s=${DURATION_S:-5}
-dur_short_s=${DURATION_SHORT_S:-3}
-idle_sec=${IDLE_SEC:-12}
+dur_s=${DURATION_S:-20}
+dur_short_s=${DURATION_SHORT_S:-15}
+idle_sec=${IDLE_SEC:-15}
 barrier_sec=${BARRIER_SEC:-5}
 monitor_hz=${MONITOR_HZ:-1}
 remote_repo=${REMOTE_REPO:-"$HOME/work/multi-flow-rate-control"}
@@ -45,7 +43,10 @@ local_work="$result_dir/payloads"
 bin_rel="./build/wg_multi_pipeline"
 remote_run_id="iperf-like-$timestamp"
 ssh_cmd_timeout=${SSH_CMD_TIMEOUT:-20}
-recv_wait_sec=${RECV_WAIT_SEC:-60}
+recv_wait_sec=${RECV_WAIT_SEC:-$((dur_s + 45))}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+monitor_py="$script_dir/iperf_like_monitor.py"
+report_py="$script_dir/iperf_like_report.py"
 
 node2_ssh=${NODE2_SSH:-}
 node3_ssh=${NODE3_SSH:-}
@@ -53,9 +54,11 @@ node4_ssh=${NODE4_SSH:-}
 node2_ip=${NODE2_IP:-}
 node3_ip=${NODE3_IP:-}
 node4_ip=${NODE4_IP:-}
-# Data-plane relay ifaces on the lab topology (Node2: N1↔N2 / N2↔N3; Node3: N2↔N3 / N3↔N4).
+# Data-plane ifaces on the lab topology.
+node1_ifaces=${NODE1_IFACES:-"station0"}
 node2_ifaces=${NODE2_IFACES:-"ap0 station1"}
 node3_ifaces=${NODE3_IFACES:-"ap1 station2"}
+node4_ifaces=${NODE4_IFACES:-"ap2"}
 
 usage() {
     cat >&2 <<'EOF'
@@ -70,17 +73,19 @@ Optional env:
   CODEC=copy|block|xor-fec|rs-fec   (default: copy)
   RATE_MBPS=1                       (default for all streams)
   RATE_S1..RATE_S6=...              (per-stream Mbps; override RATE_MBPS)
-  DURATION_S=5                      (streams 1-5)
-  DURATION_SHORT_S=3                (stream 6)
+  DURATION_S=20                     (streams 1-5)
+  DURATION_SHORT_S=15               (stream 6)
   PORT=9000
   LOOP_PORT=PORT+1                  (Node2 loopback stream)
-  IDLE_SEC=12
+  IDLE_SEC=15
   BARRIER_SEC=5
   MONITOR_HZ=1
   REMOTE_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/iperf-like-wire-<timestamp>
-  NODE2_IFACES="ap0 station1"     (Node2 data-plane relays)
-  NODE3_IFACES="ap1 station2"     (Node3 data-plane relays)
+  NODE1_IFACES="station0"
+  NODE2_IFACES="ap0 station1"
+  NODE3_IFACES="ap1 station2"
+  NODE4_IFACES="ap2"
 
 Example:
   NODE2_SSH=fyp1@10.10.10.162 NODE2_IP=10.10.12.2 \
@@ -196,7 +201,7 @@ match_hash_in_dir() {
 relay_peak() {
     csv=$1
     [ -f "$csv" ] || { echo "NA"; return; }
-    awk -F, 'NR > 1 {
+    awk -F, 'NR > 1 && $1 != "__cpu__" {
         if ($3 + 0 > rx) rx = $3 + 0
         if ($4 + 0 > tx) tx = $4 + 0
       }
@@ -233,51 +238,25 @@ install_remote_monitor() {
     ifaces=$2
     remote_csv=$3
     hz=$4
-    [ -n "$ifaces" ] || { echo ""; return; }
+    label=$5
 
-    # Upload a tiny monitor script, then nohup it.
-    mon_local="$result_dir/remote-monitor.py"
-    cat > "$mon_local" <<'PY'
-import sys, time, os
-ifaces = sys.argv[1].split()
-hz = float(sys.argv[2])
-log = sys.argv[3]
-
-def read_stats(iface):
-    base = "/sys/class/net/%s/statistics" % iface
-    out = {}
-    for name in ("rx_bytes", "tx_bytes", "rx_dropped", "tx_dropped", "rx_errors", "tx_errors"):
-        with open("%s/%s" % (base, name)) as f:
-            out[name] = int(f.read().strip())
-    return out
-
-prev = {}
-for iface in ifaces:
-    path = "/sys/class/net/%s/statistics" % iface
-    if os.path.isdir(path):
-        prev[iface] = read_stats(iface)
-prev_t = time.time()
-with open(log, "w") as g:
-    g.write("iface,ts,rx_bps,tx_bps,rx_drop,tx_drop,rx_err,tx_err\n")
-while True:
-    time.sleep(hz)
-    now = time.time()
-    dt = max(now - prev_t, 1e-6)
-    with open(log, "a") as g:
-        for iface, old in list(prev.items()):
-            cur = read_stats(iface)
-            rx_bps = (cur["rx_bytes"] - old["rx_bytes"]) * 8.0 / dt
-            tx_bps = (cur["tx_bytes"] - old["tx_bytes"]) * 8.0 / dt
-            g.write("%s,%d,%.0f,%.0f,%d,%d,%d,%d\n" % (
-                iface, int(now), rx_bps, tx_bps,
-                cur["rx_dropped"], cur["tx_dropped"],
-                cur["rx_errors"], cur["tx_errors"]))
-            prev[iface] = cur
-    prev_t = now
-PY
+    [ -f "$monitor_py" ] || die "missing monitor script: $monitor_py"
+    iface_arg=${ifaces:-"-"}
     # shellcheck disable=SC2086
-    scp $ssh_opts "$mon_local" "$host:$remote_repo/build/$remote_run_id/monitor/monitor.py" >/dev/null
-    ssh_run "$host" "nohup python3 '$remote_repo/build/$remote_run_id/monitor/monitor.py' '$ifaces' '$hz' '$remote_csv' >/dev/null 2>&1 & echo \$!"
+    scp $ssh_opts "$monitor_py" \
+        "$host:$remote_repo/build/$remote_run_id/monitor/monitor.py" >/dev/null \
+        || die "failed to scp monitor.py to $label"
+    ssh_run "$host" "nohup python3 '$remote_repo/build/$remote_run_id/monitor/monitor.py' '$iface_arg' '$hz' '$remote_csv' >/dev/null 2>&1 & echo \$!"
+}
+
+start_local_monitor() {
+    ifaces=$1
+    local_csv=$2
+    hz=$3
+    [ -f "$monitor_py" ] || die "missing monitor script: $monitor_py"
+    iface_arg=${ifaces:-"-"}
+    python3 "$monitor_py" "$iface_arg" "$hz" "$local_csv" >/dev/null 2>&1 &
+    echo $!
 }
 
 if [ -z "$input_path" ]; then
@@ -286,6 +265,8 @@ if [ -z "$input_path" ]; then
 fi
 [ -f "$input_path" ] || die "input file does not exist: $input_path"
 [ -x ./build/wg_multi_pipeline ] || die "local binary missing; run make wg-demo first"
+[ -f "$monitor_py" ] || die "missing $monitor_py"
+[ -f "$report_py" ] || die "missing $report_py"
 
 need NODE2_SSH
 need NODE3_SSH
@@ -344,8 +325,26 @@ ssh_run "$node2_ssh" "cd '$remote_repo' && \
 echo "  kept local copies+hashes under $local_work for validation"
 
 echo "== capturing pre-test link counters =="
+python3 - "$node1_ifaces" "$result_dir/monitor/node1-link-before.txt" <<'PY' || true
+import sys, time
+ifaces = sys.argv[1].split()
+out = sys.argv[2]
+with open(out, "w") as g:
+    g.write("ts %d\n" % int(time.time()))
+    for iface in ifaces:
+        base = "/sys/class/net/%s/statistics" % iface
+        try:
+            vals = []
+            for name in ("rx_bytes","tx_bytes","rx_packets","tx_packets","rx_dropped","tx_dropped","rx_errors","tx_errors"):
+                with open(base + "/" + name) as f:
+                    vals.append("%s=%s" % (name, f.read().strip()))
+            g.write("%s %s\n" % (iface, " ".join(vals)))
+        except Exception as e:
+            g.write("%s ERROR %s\n" % (iface, e))
+PY
 capture_link_stats "$node2_ssh" "$node2_ifaces" "$result_dir/monitor/node2-link-before.txt"
 capture_link_stats "$node3_ssh" "$node3_ifaces" "$result_dir/monitor/node3-link-before.txt"
+capture_link_stats "$node4_ssh" "$node4_ifaces" "$result_dir/monitor/node4-link-before.txt"
 
 start_remote_receiver() {
     host=$1
@@ -408,13 +407,20 @@ printf '%s\n' "$n2lb_recv_pid" > "$result_dir/remote/n2lb-recv.pid"
 printf '%s\n' "$n3_recv_pid" > "$result_dir/remote/n3-recv.pid"
 sleep 1
 
-echo "== starting relay monitors =="
+echo "== starting node monitors (CPU + NIC) =="
+n1_mon_pid=$(start_local_monitor "$node1_ifaces" \
+    "$result_dir/monitor/node1-ifaces.csv" "$monitor_hz")
 n2_mon_pid=$(install_remote_monitor "$node2_ssh" "$node2_ifaces" \
-    "$remote_repo/build/$remote_run_id/monitor/node2-ifaces.csv" "$monitor_hz")
+    "$remote_repo/build/$remote_run_id/monitor/node2-ifaces.csv" "$monitor_hz" node2)
 n3_mon_pid=$(install_remote_monitor "$node3_ssh" "$node3_ifaces" \
-    "$remote_repo/build/$remote_run_id/monitor/node3-ifaces.csv" "$monitor_hz")
+    "$remote_repo/build/$remote_run_id/monitor/node3-ifaces.csv" "$monitor_hz" node3)
+n4_mon_pid=$(install_remote_monitor "$node4_ssh" "$node4_ifaces" \
+    "$remote_repo/build/$remote_run_id/monitor/node4-ifaces.csv" "$monitor_hz" node4)
+echo "${n1_mon_pid:-}" > "$result_dir/remote/n1-mon.pid"
 echo "${n2_mon_pid:-}" > "$result_dir/remote/n2-mon.pid"
 echo "${n3_mon_pid:-}" > "$result_dir/remote/n3-mon.pid"
+echo "${n4_mon_pid:-}" > "$result_dir/remote/n4-mon.pid"
+echo "  monitor pids: n1=$n1_mon_pid n2=$n2_mon_pid n3=$n3_mon_pid n4=$n4_mon_pid"
 
 start_at=$(( $(date +%s) + barrier_sec ))
 echo "== barrier START_AT=$start_at (wait ${barrier_sec}s) =="
@@ -479,11 +485,15 @@ do
 done
 
 echo "== stopping monitors =="
+[ -n "${n1_mon_pid:-}" ] && kill "$n1_mon_pid" 2>/dev/null || true
 [ -n "${n2_mon_pid:-}" ] && ssh_run "$node2_ssh" "kill $n2_mon_pid 2>/dev/null || true"
 [ -n "${n3_mon_pid:-}" ] && ssh_run "$node3_ssh" "kill $n3_mon_pid 2>/dev/null || true"
+[ -n "${n4_mon_pid:-}" ] && ssh_run "$node4_ssh" "kill $n4_mon_pid 2>/dev/null || true"
+sleep 0.5
 
 capture_link_stats "$node2_ssh" "$node2_ifaces" "$result_dir/monitor/node2-link-after.txt"
 capture_link_stats "$node3_ssh" "$node3_ifaces" "$result_dir/monitor/node3-link-after.txt"
+capture_link_stats "$node4_ssh" "$node4_ifaces" "$result_dir/monitor/node4-link-after.txt"
 
 echo "== collecting artifacts =="
 # shellcheck disable=SC2086
@@ -500,6 +510,8 @@ scp $ssh_opts "$node2_ssh:$remote_repo/build/$remote_run_id/logs/n2-send.log" "$
 scp $ssh_opts "$node2_ssh:$remote_repo/build/$remote_run_id/monitor/node2-ifaces.csv" "$result_dir/monitor/" >/dev/null 2>/dev/null || true
 # shellcheck disable=SC2086
 scp $ssh_opts "$node3_ssh:$remote_repo/build/$remote_run_id/monitor/node3-ifaces.csv" "$result_dir/monitor/" >/dev/null 2>/dev/null || true
+# shellcheck disable=SC2086
+scp $ssh_opts "$node4_ssh:$remote_repo/build/$remote_run_id/monitor/node4-ifaces.csv" "$result_dir/monitor/" >/dev/null 2>/dev/null || true
 # shellcheck disable=SC2086
 scp $ssh_opts "$node2_ssh:$remote_repo/build/$remote_run_id/out/n2_*" "$result_dir/out/n2/" >/dev/null 2>/dev/null || true
 # shellcheck disable=SC2086
@@ -600,22 +612,40 @@ total=$(awk -F, 'NF{c++} END{print c+0}' "$tmp_rows")
     echo "| 5 | Node1 | Node3 ($node3_ip) | $rate_s5 | $dur_s |"
     echo "| 6 | Node1 | Node4 ($node4_ip) | $rate_s6 | $dur_short_s |"
     echo
-    echo "## Relay peaks"
+    echo "## Relay / node peaks"
     echo
+    echo "- Node1 ($node1_ifaces): $(relay_peak "$result_dir/monitor/node1-ifaces.csv")"
     echo "- Node2 ($node2_ifaces): $(relay_peak "$result_dir/monitor/node2-ifaces.csv")"
     echo "- Node3 ($node3_ifaces): $(relay_peak "$result_dir/monitor/node3-ifaces.csv")"
+    echo "- Node4 ($node4_ifaces): $(relay_peak "$result_dir/monitor/node4-ifaces.csv")"
     echo
     echo "## Artifacts"
     echo
+    echo "- \`report.md\` : full report with CPU/RX/TX charts + per-stream loss/recovery"
     echo "- \`streams.csv\` : per-stream PASS/FAIL + latency fields"
     echo "- \`logs/\` : sender/receiver logs"
-    echo "- \`monitor/\` : relay iface timeseries + before/after counters"
+    echo "- \`monitor/\` : per-node iface+CPU timeseries"
+    echo "- \`charts/\` : SVG figures referenced by report.md"
     echo "- \`out/\` : fetched decoded outputs"
 } > "$summary_md"
 
+echo "== generating report.md + charts =="
+report_md="$result_dir/report.md"
+if [ -f "$report_py" ]; then
+    python3 "$report_py" "$result_dir" >/dev/null \
+        || echo "warning: report generation failed" >&2
+else
+    echo "warning: missing $report_py" >&2
+fi
+
 echo
 echo "Done."
+echo "  Report:  $report_md"
 echo "  Summary: $summary_md"
 echo "  CSV:     $streams_csv"
 echo "  PASS:    $pass_count / $total"
+if [ -f "$report_md" ]; then
+    echo
+    echo "Open: $report_md"
+fi
 cat "$summary_md"
