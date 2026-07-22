@@ -26,12 +26,13 @@ idle_sec=${IDLE_SEC:-8}
 barrier_sec=${BARRIER_SEC:-5}
 monitor_hz=${MONITOR_HZ:-1}
 remote_repo=${REMOTE_REPO:-"$HOME/work/multi-flow-rate-control"}
-ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
+ssh_opts="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_dir=${RESULT_DIR:-"build/iperf-like-wire-$timestamp"}
 local_work="$result_dir/payloads"
 bin_rel="./build/wg_multi_pipeline"
 remote_run_id="iperf-like-$timestamp"
+ssh_cmd_timeout=${SSH_CMD_TIMEOUT:-20}
 
 node2_ssh=${NODE2_SSH:-}
 node3_ssh=${NODE3_SSH:-}
@@ -90,6 +91,18 @@ ssh_run() {
     shift
     # shellcheck disable=SC2086
     ssh $ssh_opts "$host" "$@"
+}
+
+# Like ssh_run, but fail fast if the remote command stalls (e.g. bad detach).
+ssh_run_timeout() {
+    host=$1
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        timeout "$ssh_cmd_timeout" ssh $ssh_opts "$host" "$@"
+    else
+        ssh_run "$host" "$@"
+    fi
 }
 
 gen_payload() {
@@ -315,38 +328,53 @@ start_remote_receiver() {
     out_prefix=$2
     max_flows=$3
     log_rel=$4
+    pid_rel=$5
 
-    # Fully detach from the SSH session: redirect stdio and background.
-    # Without </dev/null, OpenSSH can wait forever on the still-running recv.
-    ssh_run "$host" "cd '$remote_repo' && \
-      nohup $bin_rel --codec '$codec' \
-        --udp-recv '$port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' \
-        >'$log_rel' 2>&1 </dev/null &
-      echo \$!"
+    # Write PID on the remote host, then print it. Avoid relying on SSH staying
+    # attached to the long-running udp-recv process.
+    if ! out=$(ssh_run_timeout "$host" "cd '$remote_repo' || exit 1
+rm -f '$pid_rel'
+if command -v setsid >/dev/null 2>&1; then
+  setsid $bin_rel --codec '$codec' --udp-recv '$port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' >'$log_rel' 2>&1 </dev/null &
+else
+  nohup $bin_rel --codec '$codec' --udp-recv '$port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' >'$log_rel' 2>&1 </dev/null &
+fi
+echo \$! > '$pid_rel'
+sleep 0.3
+if ! kill -0 \"\$(cat '$pid_rel')\" 2>/dev/null; then
+  echo \"receiver exited immediately on $host\" >&2
+  tail -n 40 '$log_rel' >&2 || true
+  exit 1
+fi
+cat '$pid_rel'"); then
+        die "failed to start receiver on $host (ssh timeout=${ssh_cmd_timeout}s). Try manually:
+  ssh $host 'cd $remote_repo && $bin_rel --codec $codec --udp-recv $port /tmp/manual_ --max-flows 2 --idle-sec 3'"
+    fi
+    printf '%s\n' "$out" | tr -d ' \r' | tail -n 1
 }
 
 echo "== starting receivers =="
 echo "  Node4 receiver..."
-start_remote_receiver "$node4_ssh" \
+n4_recv_pid=$(start_remote_receiver "$node4_ssh" \
     "build/$remote_run_id/out/n4_" 8 \
     "build/$remote_run_id/logs/n4-recv.log" \
-    > "$result_dir/remote/n4-recv.pid"
+    "build/$remote_run_id/logs/n4-recv.pid")
 echo "  Node2 receiver..."
-start_remote_receiver "$node2_ssh" \
+n2_recv_pid=$(start_remote_receiver "$node2_ssh" \
     "build/$remote_run_id/out/n2_" 8 \
     "build/$remote_run_id/logs/n2-recv.log" \
-    > "$result_dir/remote/n2-recv.pid"
+    "build/$remote_run_id/logs/n2-recv.pid")
 echo "  Node3 receiver..."
-start_remote_receiver "$node3_ssh" \
+n3_recv_pid=$(start_remote_receiver "$node3_ssh" \
     "build/$remote_run_id/out/n3_" 4 \
     "build/$remote_run_id/logs/n3-recv.log" \
-    > "$result_dir/remote/n3-recv.pid"
-sleep 1
-
-n4_recv_pid=$(tr -d ' \n' < "$result_dir/remote/n4-recv.pid")
-n2_recv_pid=$(tr -d ' \n' < "$result_dir/remote/n2-recv.pid")
-n3_recv_pid=$(tr -d ' \n' < "$result_dir/remote/n3-recv.pid")
+    "build/$remote_run_id/logs/n3-recv.pid")
+echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n3=$n3_recv_pid" > "$result_dir/remote/recv-pids.txt"
 echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n3=$n3_recv_pid"
+printf '%s\n' "$n4_recv_pid" > "$result_dir/remote/n4-recv.pid"
+printf '%s\n' "$n2_recv_pid" > "$result_dir/remote/n2-recv.pid"
+printf '%s\n' "$n3_recv_pid" > "$result_dir/remote/n3-recv.pid"
+sleep 1
 
 echo "== starting relay monitors =="
 n2_mon_pid=$(install_remote_monitor "$node2_ssh" "$node2_ifaces" \
