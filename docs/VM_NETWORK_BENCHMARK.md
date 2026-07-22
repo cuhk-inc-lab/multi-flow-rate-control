@@ -136,6 +136,31 @@ CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" \
 Both endpoints must run the same wire protocol version. Synchronize VM1 and
 VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
 
+### Concurrent iperf-like multi-destination run
+
+For the supervisor-style 6-stream concurrent test (Node1/Node2 senders,
+Node2/Node3/Node4 receivers, plus relay iface monitoring), use:
+
+```bash
+NODE2_SSH=fyp1@NODE2_MGMT NODE2_IP=NODE2_DATA_IP \
+NODE3_SSH=fyp1@NODE3_MGMT NODE3_IP=NODE3_DATA_IP \
+NODE4_SSH=fyp1@NODE4_MGMT NODE4_IP=NODE4_DATA_IP \
+NODE2_IFACES="ens5 ens6" NODE3_IFACES="ens5 ens6" \
+  ./scripts/run_iperf_like_wire.sh input.ts
+```
+
+The script:
+
+1. builds sized payloads for each stream (`rate * duration`)
+2. starts receivers on Node2/3/4
+3. starts relay monitors on Node2/3
+4. starts Node1 + Node2 senders at a shared `START_AT` barrier
+5. collects logs and writes `streams.csv` + `summary.md` under
+   `build/iperf-like-wire-*`
+
+Receiver flow mapping uses UDP 5-tuple allocation. Pass/fail is decided by
+payload hash match against fetched outputs.
+
 ## 4. Report
 
 Keep TCP and loss-free UDP `iperf3` results separate from application results.
