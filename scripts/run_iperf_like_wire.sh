@@ -35,6 +35,7 @@ dur_short_s=${DURATION_SHORT_S:-15}
 idle_sec=${IDLE_SEC:-15}
 barrier_sec=${BARRIER_SEC:-5}
 monitor_hz=${MONITOR_HZ:-1}
+use_no_pace=${USE_NO_PACE:-0}
 remote_repo=${REMOTE_REPO:-"$HOME/work/multi-flow-rate-control"}
 ssh_opts="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
 timestamp=$(date +%Y%m%d-%H%M%S)
@@ -80,6 +81,7 @@ Optional env:
   IDLE_SEC=15
   BARRIER_SEC=5
   MONITOR_HZ=1
+  USE_NO_PACE=0                    (set 1 to disable per-flow pacing)
   REMOTE_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/iperf-like-wire-<timestamp>
   NODE1_IFACES="station0"
@@ -472,9 +474,13 @@ start_at=$(( $(date +%s) + barrier_sec ))
 echo "== barrier START_AT=$start_at (wait ${barrier_sec}s) =="
 
 # Node1 sender: streams 1,3,5,6 with unique wire flow ids
+send_pace_opt=
+if [ "$use_no_pace" = "1" ]; then
+    send_pace_opt="--no-pace"
+fi
 (
     while [ "$(date +%s)" -lt "$start_at" ]; do sleep 0.05; done
-    ./build/wg_multi_pipeline --no-pace --codec "$codec" --udp-send-multi \
+    ./build/wg_multi_pipeline $send_pace_opt --codec "$codec" --udp-send-multi \
         --flow "1:${node4_ip}:${port}:${local_work}/s1.ts:${rate_s1}" \
         --flow "3:${node2_ip}:${port}:${local_work}/s3.ts:${rate_s3}" \
         --flow "5:${node3_ip}:${port}:${local_work}/s5.ts:${rate_s5}" \
@@ -487,7 +493,7 @@ local_send_pid=$!
 ssh_run "$node2_ssh" "cd '$remote_repo' && nohup sh -c '
   start_at=$start_at
   while [ \"\$(date +%s)\" -lt \"\$start_at\" ]; do sleep 0.05; done
-  $bin_rel --no-pace --codec \"$codec\" --udp-send-multi \
+  $bin_rel $send_pace_opt --codec \"$codec\" --udp-send-multi \
     --flow \"2:${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:${rate_s2}\" \
     --flow \"4:127.0.0.1:${loop_port}:build/$remote_run_id/payloads/s4.ts:${rate_s4}\" \
     > \"build/$remote_run_id/logs/n2-send.log\" 2>&1

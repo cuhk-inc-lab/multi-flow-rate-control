@@ -262,7 +262,12 @@ static WgPipelineStatus process_flow_wire_send(FlowStage *st, const Codec *codec
     size_t output_block_size;
     unsigned blocks_this_turn = 0;
     /* Round-robin fairness across flows: avoid one flow catch-up bursting. */
-    const unsigned max_blocks_per_turn = 2u;
+    /*
+     * Multi-flow fairness: sending too many blocks per flow in one scheduler turn
+     * creates microbursts (N flows * shards per block), which amplifies late/drop
+     * risk on receivers. Keep this conservative.
+     */
+    const unsigned max_blocks_per_turn = 1u;
 
     if (st == NULL || codec == NULL || tx == NULL || work == NULL) {
         return WG_PIPE_ERR;
@@ -653,7 +658,11 @@ static int post_multi_has_space(const FlowStage *st, size_t nbytes)
     if (st == NULL || st->post_multi_in == NULL) {
         return 0;
     }
-    high_water = DECODE_BLOCK * 64u;
+    /*
+     * Smaller high-water reduces per-flow queueing latency in multi-flow wire
+     * mode and helps avoid bursty catch-up sends.
+     */
+    high_water = DECODE_BLOCK * 24u;
     if (st->post_multi_in->size >= high_water) {
         return 0;
     }

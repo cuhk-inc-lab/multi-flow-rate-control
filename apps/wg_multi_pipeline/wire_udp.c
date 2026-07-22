@@ -927,6 +927,7 @@ typedef struct WireFlowCtx {
     FILE        *output;
     char         output_path[512];
     uint64_t     output_bytes;
+    uint64_t     seen_datagrams;
     uint64_t     received_datagrams;
     uint64_t     duplicate_datagrams;
     uint64_t     late_datagrams;
@@ -1115,6 +1116,7 @@ static int wire_flow_process_datagram(WireFlowCtx *flow, const WireHeader *heade
         flow->malformed_datagrams++;
         return 0;
     }
+    flow->seen_datagrams++;
     if (header->block_id < flow->next_block) {
         flow->late_datagrams++;
         return 0;
@@ -1418,11 +1420,13 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         }
         fprintf(stderr,
                 "udp-recv: flow %u output=%s output_bytes=%llu datagrams=%llu "
+                "seen_datagrams=%llu "
                 "duplicates=%llu late=%llu malformed=%llu recovered_groups=%llu "
                 "dropped_groups=%llu missing_data_shards=%llu\n",
                 flow->key.flow_id, flow->output_path,
                 (unsigned long long)flow->output_bytes,
                 (unsigned long long)flow->received_datagrams,
+                (unsigned long long)flow->seen_datagrams,
                 (unsigned long long)flow->duplicate_datagrams,
                 (unsigned long long)flow->late_datagrams,
                 (unsigned long long)flow->malformed_datagrams,

@@ -235,6 +235,7 @@ def peak(series: Iterable[tuple[float, float]]) -> float:
 FLOW_LINE_RE = re.compile(
     r"udp-recv:\s+flow\s+(?P<fid>\d+)\s+output=(?P<path>\S+)\s+"
     r"output_bytes=(?P<bytes>\d+)\s+datagrams=(?P<dgrams>\d+)\s+"
+    r"(?:seen_datagrams=(?P<seen>\d+)\s+)?"
     r"duplicates=(?P<dup>\d+)\s+late=(?P<late>\d+)\s+malformed=(?P<mal>\d+)\s+"
     r"recovered_groups=(?P<rec>\d+)\s+dropped_groups=(?P<drop>\d+)\s+"
     r"missing_data_shards=(?P<miss>\d+)"
@@ -267,6 +268,7 @@ def parse_recv_logs(logs_dir: Path) -> tuple[dict[str, dict], dict[int, dict]]:
                 "output_path": m.group("path"),
                 "output_bytes": int(m.group("bytes")),
                 "datagrams": int(m.group("dgrams")),
+                "seen_datagrams": int(m.group("seen")) if m.group("seen") else None,
                 "duplicates": int(m.group("dup")),
                 "late": int(m.group("late")),
                 "malformed": int(m.group("mal")),
@@ -408,6 +410,9 @@ def loss_stats_for_stream(
     shards = int(ci["wire_shards"])
     exp_dgrams = blocks * shards  # DATA shards; END not included
     dgrams = int(fm["datagrams"]) if fm.get("datagrams") is not None else None
+    seen_dgrams = (
+        int(fm["seen_datagrams"]) if fm.get("seen_datagrams") is not None else None
+    )
     dups = int(fm["duplicates"]) if fm.get("duplicates") is not None else 0
     late = int(fm["late"]) if fm.get("late") is not None else 0
     dropped = int(fm["dropped_groups"]) if fm.get("dropped_groups") is not None else None
@@ -422,7 +427,8 @@ def loss_stats_for_stream(
     elif dropped is None and miss_end:
         dropped = miss_end
 
-    unique_rx = None if dgrams is None else max(0, dgrams - dups)
+    rx_base = seen_dgrams if seen_dgrams is not None else dgrams
+    unique_rx = None if rx_base is None else max(0, rx_base - dups)
     # Datagrams that arrived but were too late still count as received for loss;
     # loss ≈ missing on the wire relative to expected DATA datagrams.
     dgram_loss_pct = None
