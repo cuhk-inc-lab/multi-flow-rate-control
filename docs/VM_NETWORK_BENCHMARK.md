@@ -156,6 +156,17 @@ NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=...
   ./scripts/run_iperf_like_matrix.sh input.ts
 ```
 
+Link-only control (same 6 streams, plain `iperf3 -u`):
+
+```bash
+RATE_S1=1 RATE_S2=1 RATE_S3=2 RATE_S4=2 RATE_S5=1 RATE_S6=2 \
+DURATION_S=30 DURATION_SHORT_S=20 \
+NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... \
+  ./scripts/run_iperf_like_baseline.sh
+```
+
+If baseline PASS and wire FAIL → suspect app/codec. If baseline also FAIL → path loss.
+
 Relay iface defaults match the lab topology (`NODE2_IFACES="ap0 station1"`,
 `NODE3_IFACES="ap1 station2"`). Override only if your names differ.
 
