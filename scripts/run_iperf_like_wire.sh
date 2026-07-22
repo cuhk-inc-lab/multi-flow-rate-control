@@ -310,24 +310,43 @@ echo "== capturing pre-test link counters =="
 capture_link_stats "$node2_ssh" "$node2_ifaces" "$result_dir/monitor/node2-link-before.txt"
 capture_link_stats "$node3_ssh" "$node3_ifaces" "$result_dir/monitor/node3-link-before.txt"
 
+start_remote_receiver() {
+    host=$1
+    out_prefix=$2
+    max_flows=$3
+    log_rel=$4
+
+    # Fully detach from the SSH session: redirect stdio and background.
+    # Without </dev/null, OpenSSH can wait forever on the still-running recv.
+    ssh_run "$host" "cd '$remote_repo' && \
+      nohup $bin_rel --codec '$codec' \
+        --udp-recv '$port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' \
+        >'$log_rel' 2>&1 </dev/null &
+      echo \$!"
+}
+
 echo "== starting receivers =="
-ssh_run "$node4_ssh" "cd '$remote_repo' && nohup $bin_rel --codec '$codec' \
-  --udp-recv '$port' 'build/$remote_run_id/out/n4_' --max-flows 8 --idle-sec '$idle_sec' \
-  > 'build/$remote_run_id/logs/n4-recv.log' 2>&1 & echo \$!" \
-  > "$result_dir/remote/n4-recv.pid"
-ssh_run "$node2_ssh" "cd '$remote_repo' && nohup $bin_rel --codec '$codec' \
-  --udp-recv '$port' 'build/$remote_run_id/out/n2_' --max-flows 8 --idle-sec '$idle_sec' \
-  > 'build/$remote_run_id/logs/n2-recv.log' 2>&1 & echo \$!" \
-  > "$result_dir/remote/n2-recv.pid"
-ssh_run "$node3_ssh" "cd '$remote_repo' && nohup $bin_rel --codec '$codec' \
-  --udp-recv '$port' 'build/$remote_run_id/out/n3_' --max-flows 4 --idle-sec '$idle_sec' \
-  > 'build/$remote_run_id/logs/n3-recv.log' 2>&1 & echo \$!" \
-  > "$result_dir/remote/n3-recv.pid"
+echo "  Node4 receiver..."
+start_remote_receiver "$node4_ssh" \
+    "build/$remote_run_id/out/n4_" 8 \
+    "build/$remote_run_id/logs/n4-recv.log" \
+    > "$result_dir/remote/n4-recv.pid"
+echo "  Node2 receiver..."
+start_remote_receiver "$node2_ssh" \
+    "build/$remote_run_id/out/n2_" 8 \
+    "build/$remote_run_id/logs/n2-recv.log" \
+    > "$result_dir/remote/n2-recv.pid"
+echo "  Node3 receiver..."
+start_remote_receiver "$node3_ssh" \
+    "build/$remote_run_id/out/n3_" 4 \
+    "build/$remote_run_id/logs/n3-recv.log" \
+    > "$result_dir/remote/n3-recv.pid"
 sleep 1
 
 n4_recv_pid=$(tr -d ' \n' < "$result_dir/remote/n4-recv.pid")
 n2_recv_pid=$(tr -d ' \n' < "$result_dir/remote/n2-recv.pid")
 n3_recv_pid=$(tr -d ' \n' < "$result_dir/remote/n3-recv.pid")
+echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n3=$n3_recv_pid"
 
 echo "== starting relay monitors =="
 n2_mon_pid=$(install_remote_monitor "$node2_ssh" "$node2_ifaces" \
@@ -360,8 +379,9 @@ ssh_run "$node2_ssh" "cd '$remote_repo' && nohup sh -c '
     --flow \"${node4_ip}:${port}:build/iperf-like-payloads/s2.ts:10\" \
     --flow \"127.0.0.1:${port}:build/iperf-like-payloads/s4.ts:20\" \
     > \"build/$remote_run_id/logs/n2-send.log\" 2>&1
-' >/dev/null 2>&1 & echo \$!" > "$result_dir/remote/n2-send.pid"
+' >/dev/null 2>&1 </dev/null & echo \$!" > "$result_dir/remote/n2-send.pid"
 n2_send_pid=$(tr -d ' \n' < "$result_dir/remote/n2-send.pid")
+echo "  Node2 sender pid=$n2_send_pid"
 
 echo "== waiting for senders =="
 wait "$local_send_pid"
