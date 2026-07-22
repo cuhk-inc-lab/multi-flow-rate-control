@@ -25,6 +25,9 @@ input_path=${1:-}
 codec=${CODEC:-copy}
 port=${PORT:-9000}
 loop_port=${LOOP_PORT:-$((port + 1))}
+rate_mbps=${RATE_MBPS:-1}
+dur_s=${DURATION_S:-5}
+dur_short_s=${DURATION_SHORT_S:-3}
 idle_sec=${IDLE_SEC:-12}
 barrier_sec=${BARRIER_SEC:-5}
 monitor_hz=${MONITOR_HZ:-1}
@@ -59,6 +62,9 @@ Required env:
 
 Optional env:
   CODEC=copy|block|xor-fec|rs-fec   (default: copy)
+  RATE_MBPS=1                       (all streams; default 1)
+  DURATION_S=5                      (streams 1-5)
+  DURATION_SHORT_S=3                (stream 6)
   PORT=9000
   LOOP_PORT=PORT+1                  (Node2 loopback stream)
   IDLE_SEC=12
@@ -289,12 +295,12 @@ mkdir -p "$result_dir/payloads" "$result_dir/logs" "$result_dir/remote" \
 # sender: local|node2
 # outdir_key: n2|n3|n4
 stream_defs="
-1 local 1 5 s1 n4 $node4_ip
-2 node2 1 5 s2 n4 $node4_ip
-3 local 1 5 s3 n2 $node2_ip
-4 node2 1 5 s4 n2 127.0.0.1
-5 local 1 5 s5 n3 $node3_ip
-6 local 1 3 s6 n4 $node4_ip
+1 local $rate_mbps $dur_s s1 n4 $node4_ip
+2 node2 $rate_mbps $dur_s s2 n4 $node4_ip
+3 local $rate_mbps $dur_s s3 n2 $node2_ip
+4 node2 $rate_mbps $dur_s s4 n2 127.0.0.1
+5 local $rate_mbps $dur_s s5 n3 $node3_ip
+6 local $rate_mbps $dur_short_s s6 n4 $node4_ip
 "
 
 echo "== preparing payloads =="
@@ -410,10 +416,10 @@ echo "== barrier START_AT=$start_at (wait ${barrier_sec}s) =="
 (
     while [ "$(date +%s)" -lt "$start_at" ]; do sleep 0.05; done
     ./build/wg_multi_pipeline --codec "$codec" --udp-send-multi \
-        --flow "1:${node4_ip}:${port}:${local_work}/s1.ts:1" \
-        --flow "3:${node2_ip}:${port}:${local_work}/s3.ts:1" \
-        --flow "5:${node3_ip}:${port}:${local_work}/s5.ts:1" \
-        --flow "6:${node4_ip}:${port}:${local_work}/s6.ts:1" \
+        --flow "1:${node4_ip}:${port}:${local_work}/s1.ts:${rate_mbps}" \
+        --flow "3:${node2_ip}:${port}:${local_work}/s3.ts:${rate_mbps}" \
+        --flow "5:${node3_ip}:${port}:${local_work}/s5.ts:${rate_mbps}" \
+        --flow "6:${node4_ip}:${port}:${local_work}/s6.ts:${rate_mbps}" \
         > "$result_dir/logs/node1-send.log" 2>&1
 ) &
 local_send_pid=$!
@@ -423,8 +429,8 @@ ssh_run "$node2_ssh" "cd '$remote_repo' && nohup sh -c '
   start_at=$start_at
   while [ \"\$(date +%s)\" -lt \"\$start_at\" ]; do sleep 0.05; done
   $bin_rel --codec \"$codec\" --udp-send-multi \
-    --flow \"2:${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:1\" \
-    --flow \"4:127.0.0.1:${loop_port}:build/$remote_run_id/payloads/s4.ts:1\" \
+    --flow \"2:${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:${rate_mbps}\" \
+    --flow \"4:127.0.0.1:${loop_port}:build/$remote_run_id/payloads/s4.ts:${rate_mbps}\" \
     > \"build/$remote_run_id/logs/n2-send.log\" 2>&1
 ' >/dev/null 2>&1 </dev/null & echo \$!" > "$result_dir/remote/n2-send.pid"
 n2_send_pid=$(tr -d ' \n' < "$result_dir/remote/n2-send.pid")
@@ -567,7 +573,8 @@ total=$(awk -F, 'NF{c++} END{print c+0}' "$tmp_rows")
     echo
     echo "- Timestamp: $timestamp"
     echo "- Codec: $codec"
-    echo "- UDP port: $port"
+    echo "- Rate: ${rate_mbps} Mbps (stream6 duration ${dur_short_s}s, others ${dur_s}s)"
+    echo "- UDP port: $port (Node2 loopback: $loop_port)"
     echo "- Barrier START_AT: $start_at"
     echo "- Input seed: $input_path"
     echo "- Git: $(git rev-parse --short HEAD 2>/dev/null || echo NA)"
@@ -578,12 +585,12 @@ total=$(awk -F, 'NF{c++} END{print c+0}' "$tmp_rows")
     echo
     echo "| Stream | Sender | Destination | Rate Mbps | Duration s |"
     echo "| --- | --- | --- | ---: | ---: |"
-    echo "| 1 | Node1 | Node4 ($node4_ip) | 1 | 5 |"
-    echo "| 2 | Node2 | Node4 ($node4_ip) | 1 | 5 |"
-    echo "| 3 | Node1 | Node2 ($node2_ip:$port) | 1 | 5 |"
-    echo "| 4 | Node2 | Node2 (127.0.0.1:$loop_port) | 1 | 5 |"
-    echo "| 5 | Node1 | Node3 ($node3_ip) | 1 | 5 |"
-    echo "| 6 | Node1 | Node4 ($node4_ip) | 1 | 3 |"
+    echo "| 1 | Node1 | Node4 ($node4_ip) | $rate_mbps | $dur_s |"
+    echo "| 2 | Node2 | Node4 ($node4_ip) | $rate_mbps | $dur_s |"
+    echo "| 3 | Node1 | Node2 ($node2_ip:$port) | $rate_mbps | $dur_s |"
+    echo "| 4 | Node2 | Node2 (127.0.0.1:$loop_port) | $rate_mbps | $dur_s |"
+    echo "| 5 | Node1 | Node3 ($node3_ip) | $rate_mbps | $dur_s |"
+    echo "| 6 | Node1 | Node4 ($node4_ip) | $rate_mbps | $dur_short_s |"
     echo
     echo "## Relay peaks"
     echo

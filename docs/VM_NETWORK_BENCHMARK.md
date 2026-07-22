@@ -141,6 +141,11 @@ VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
 For the supervisor-style 6-stream concurrent test (Node1/Node2 senders,
 Node2/Node3/Node4 receivers, plus relay iface monitoring), use:
 
+For the supervisor-style 6-stream concurrent test, see the full Chinese/ops
+guide: [IPERF_LIKE_WIRE_GUIDE.md](IPERF_LIKE_WIRE_GUIDE.md).
+
+Quick start (from Node1):
+
 ```bash
 NODE2_SSH=fyp1@NODE2_MGMT NODE2_IP=NODE2_DATA_IP \
 NODE3_SSH=fyp1@NODE3_MGMT NODE3_IP=NODE3_DATA_IP \
@@ -148,23 +153,20 @@ NODE4_SSH=fyp1@NODE4_MGMT NODE4_IP=NODE4_DATA_IP \
   ./scripts/run_iperf_like_wire.sh input.ts
 ```
 
+Sweep codecs and rates:
+
+```bash
+CODECS="copy xor-fec" RATES="1 2" \
+NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... \
+  ./scripts/run_iperf_like_matrix.sh input.ts
+```
+
 Relay iface defaults match the lab topology (`NODE2_IFACES="ap0 station1"`,
 `NODE3_IFACES="ap1 station2"`). Override only if your names differ.
 
-The script:
+Single-run knobs: `CODEC`, `RATE_MBPS`, `DURATION_S`, `DURATION_SHORT_S`.
+Results land under `build/iperf-like-wire-*` (or `build/iperf-like-matrix-*`).
 
-1. builds sized payloads for each stream (`rate * duration`) on Node1
-   (including Node2's s2/s4), then scp's s2/s4 onto Node2 for sending
-2. starts receivers on Node2/3/4 (`--codec` default `copy` for integrity;
-   use `CODEC=xor-fec` for FEC stress)
-3. starts relay monitors on Node2/3
-4. starts Node1 + Node2 senders at a shared `START_AT` barrier
-   (default rates: 1 Mbps each, ~6 Mbps aggregate; Node2 loopback on PORT+1)
-5. collects logs and writes `streams.csv` + `summary.md` under
-   `build/iperf-like-wire-*`
-
-Receiver flow mapping uses UDP 5-tuple allocation. Pass/fail is decided by
-payload hash match against fetched outputs.
 
 ## 4. Report
 
