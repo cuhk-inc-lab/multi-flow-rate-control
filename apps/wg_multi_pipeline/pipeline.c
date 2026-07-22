@@ -260,6 +260,9 @@ static WgPipelineStatus process_flow_wire_send(FlowStage *st, const Codec *codec
 {
     size_t input_block_size;
     size_t output_block_size;
+    unsigned blocks_this_turn = 0;
+    /* Round-robin fairness across flows: avoid one flow catch-up bursting. */
+    const unsigned max_blocks_per_turn = 2u;
 
     if (st == NULL || codec == NULL || tx == NULL || work == NULL) {
         return WG_PIPE_ERR;
@@ -272,7 +275,8 @@ static WgPipelineStatus process_flow_wire_send(FlowStage *st, const Codec *codec
         return WG_PIPE_ERR;
     }
 
-    while (st->post_multi_in->size >= input_block_size) {
+    while (st->post_multi_in->size >= input_block_size &&
+           blocks_this_turn < max_blocks_per_turn) {
         uint64_t encode_begin_ns;
         uint64_t encode_end_ns;
 
@@ -289,6 +293,7 @@ static WgPipelineStatus process_flow_wire_send(FlowStage *st, const Codec *codec
                                    encode_begin_ns, encode_end_ns) != 0) {
             return WG_PIPE_ERR;
         }
+        blocks_this_turn++;
         if (progress != NULL) {
             *progress = 1;
         }
@@ -648,7 +653,7 @@ static int post_multi_has_space(const FlowStage *st, size_t nbytes)
     if (st == NULL || st->post_multi_in == NULL) {
         return 0;
     }
-    high_water = DECODE_BLOCK * 8u;
+    high_water = DECODE_BLOCK * 64u;
     if (st->post_multi_in->size >= high_water) {
         return 0;
     }

@@ -25,6 +25,19 @@
 #define WIRE_HEADER_SIZE    44u
 #define WIRE_GROUP_WINDOW   128u
 #define WIRE_MAX_SHARDS     (CODEC_MAX_ENCODE_BLOCK / PKG_SIZE)
+/* Larger UDP buffers reduce drops under multi-flow microbursts of 232 B datagrams. */
+#define WIRE_UDP_SOCKBUF    (8 * 1024 * 1024)
+
+static void wire_set_udp_buffers(int sock)
+{
+    int buf = WIRE_UDP_SOCKBUF;
+
+    if (sock < 0) {
+        return;
+    }
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    (void)setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+}
 
 typedef struct WireHeader {
     uint8_t  type;
@@ -225,6 +238,7 @@ static int open_sender_socket(const char *host, uint16_t port,
         }
         sock = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (sock >= 0) {
+            wire_set_udp_buffers(sock);
             memcpy(address, entry->ai_addr, entry->ai_addrlen);
             *address_len = (socklen_t)entry->ai_addrlen;
             break;
@@ -518,6 +532,7 @@ static int open_receiver_socket(uint16_t port)
         return -1;
     }
     (void)setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+    wire_set_udp_buffers(sock);
 
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;

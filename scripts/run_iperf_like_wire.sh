@@ -474,7 +474,7 @@ echo "== barrier START_AT=$start_at (wait ${barrier_sec}s) =="
 # Node1 sender: streams 1,3,5,6 with unique wire flow ids
 (
     while [ "$(date +%s)" -lt "$start_at" ]; do sleep 0.05; done
-    ./build/wg_multi_pipeline --codec "$codec" --udp-send-multi \
+    ./build/wg_multi_pipeline --no-pace --codec "$codec" --udp-send-multi \
         --flow "1:${node4_ip}:${port}:${local_work}/s1.ts:${rate_s1}" \
         --flow "3:${node2_ip}:${port}:${local_work}/s3.ts:${rate_s3}" \
         --flow "5:${node3_ip}:${port}:${local_work}/s5.ts:${rate_s5}" \
@@ -487,7 +487,7 @@ local_send_pid=$!
 ssh_run "$node2_ssh" "cd '$remote_repo' && nohup sh -c '
   start_at=$start_at
   while [ \"\$(date +%s)\" -lt \"\$start_at\" ]; do sleep 0.05; done
-  $bin_rel --codec \"$codec\" --udp-send-multi \
+  $bin_rel --no-pace --codec \"$codec\" --udp-send-multi \
     --flow \"2:${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:${rate_s2}\" \
     --flow \"4:127.0.0.1:${loop_port}:build/$remote_run_id/payloads/s4.ts:${rate_s4}\" \
     > \"build/$remote_run_id/logs/n2-send.log\" 2>&1
