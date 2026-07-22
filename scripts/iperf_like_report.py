@@ -22,6 +22,7 @@ DATAGRAM_APP = WIRE_HEADER_SIZE + PKG_SIZE  # 232 B UDP payload
 IP_UDP_HDR = 20 + 8  # typical IPv4 + UDP
 DATAGRAM_IP = DATAGRAM_APP + IP_UDP_HDR  # 260 B IP packet (no Ethernet)
 DATA_SHARDS = 4
+DECODE_BLOCK = PKG_SIZE * DATA_SHARDS  # 752
 
 CODEC_SHARDS = {
     "copy": 8,
@@ -232,7 +233,7 @@ def peak(series: Iterable[tuple[float, float]]) -> float:
 
 
 FLOW_LINE_RE = re.compile(
-    r"udp-recv:\s+flow\s+\d+\s+output=(?P<path>\S+)\s+"
+    r"udp-recv:\s+flow\s+(?P<fid>\d+)\s+output=(?P<path>\S+)\s+"
     r"output_bytes=(?P<bytes>\d+)\s+datagrams=(?P<dgrams>\d+)\s+"
     r"duplicates=(?P<dup>\d+)\s+late=(?P<late>\d+)\s+malformed=(?P<mal>\d+)\s+"
     r"recovered_groups=(?P<rec>\d+)\s+dropped_groups=(?P<drop>\d+)\s+"
@@ -244,9 +245,13 @@ LAT_RE = re.compile(
     r"p95_us=(?P<p95>[0-9.]+)"
 )
 
+OUT_DIR_BY_STREAM = {1: "n4", 2: "n4", 3: "n2", 4: "n2", 5: "n3", 6: "n4"}
 
-def parse_recv_logs(logs_dir: Path) -> dict[str, dict]:
+
+def parse_recv_logs(logs_dir: Path) -> tuple[dict[str, dict], dict[int, dict]]:
+    """Return (by_output_basename, by_wire_flow_id)."""
     by_base: dict[str, dict] = {}
+    by_flow: dict[int, dict] = {}
     for log in sorted(logs_dir.glob("*-recv.log")):
         text = log.read_text(encoding="utf-8", errors="replace")
         chunks = re.split(r"(?=udp-recv: flow )", text)
@@ -255,8 +260,11 @@ def parse_recv_logs(logs_dir: Path) -> dict[str, dict]:
             if not m:
                 continue
             base = Path(m.group("path")).name
+            fid = int(m.group("fid"))
             info = {
                 "log": log.name,
+                "flow_id": fid,
+                "output_path": m.group("path"),
                 "output_bytes": int(m.group("bytes")),
                 "datagrams": int(m.group("dgrams")),
                 "duplicates": int(m.group("dup")),
@@ -267,6 +275,8 @@ def parse_recv_logs(logs_dir: Path) -> dict[str, dict]:
                 "missing_data_shards": int(m.group("miss")),
                 "e2e_p95_us": None,
                 "jitter_p95_us": None,
+                "incomplete": False,
+                "missing_groups_end": 0,
             }
             for lm in LAT_RE.finditer(chunk):
                 if lm.group("kind") == "end_to_end":
@@ -274,7 +284,192 @@ def parse_recv_logs(logs_dir: Path) -> dict[str, dict]:
                 elif lm.group("kind") == "end_to_end_jitter":
                     info["jitter_p95_us"] = float(lm.group("p95"))
             by_base[base] = info
-    return by_base
+            by_flow[fid] = info
+
+        for im in re.finditer(
+            r"udp-recv: flow (?P<fid>\d+) incomplete: received_blocks=(?P<rx>\d+) "
+            r"expected_blocks=(?P<exp>\d+) missing_groups=(?P<miss>\d+)",
+            text,
+        ):
+            fid = int(im.group("fid"))
+            extra = {
+                "incomplete": True,
+                "received_blocks": int(im.group("rx")),
+                "expected_blocks": int(im.group("exp")),
+                "missing_groups_end": int(im.group("miss")),
+                "log": log.name,
+            }
+            if fid in by_flow:
+                by_flow[fid].update(extra)
+            else:
+                by_flow[fid] = extra
+    return by_base, by_flow
+
+
+def expected_blocks(payload_bytes: int) -> int:
+    if payload_bytes <= 0:
+        return 0
+    return (payload_bytes + DECODE_BLOCK - 1) // DECODE_BLOCK
+
+
+def find_stream_output(
+    result_dir: Path,
+    stream_id: int,
+    payload_path: Path,
+    matched: str,
+    flow_metrics_by_id: dict[int, dict],
+) -> Path | None:
+    if matched and matched != "NA":
+        p = Path(matched)
+        if not p.is_absolute():
+            p = result_dir / p
+        if p.is_file():
+            return p
+
+    # Prefer path recorded in recv log for this wire flow_id
+    fm = flow_metrics_by_id.get(stream_id) or {}
+    log_path = fm.get("output_path")
+    if log_path:
+        remote = Path(str(log_path))
+        sub = OUT_DIR_BY_STREAM.get(stream_id)
+        if sub is not None:
+            local = result_dir / "out" / sub / remote.name
+            if local.is_file():
+                return local
+            # also try basename under out/
+            for p in (result_dir / "out").rglob(remote.name):
+                if p.is_file():
+                    return p
+
+    sub = OUT_DIR_BY_STREAM.get(stream_id)
+    if sub is None:
+        return None
+    out_dir = result_dir / "out" / sub
+    if not out_dir.is_dir():
+        return None
+
+    # Filename tag includes flow_<id>
+    tagged = sorted(out_dir.glob(f"*flow_{stream_id}.ts"))
+    if len(tagged) == 1:
+        return tagged[0]
+    if tagged:
+        return tagged[0]
+
+    if not payload_path.is_file():
+        return None
+    want = payload_path.stat().st_size
+    cands = [p for p in out_dir.glob("*.ts") if p.is_file() and p.stat().st_size == want]
+    return cands[0] if len(cands) == 1 else (cands[0] if cands else None)
+
+
+def content_mismatch_pct(
+    payload: Path, output: Path | None, status: str | None = None
+) -> float | None:
+    if status and status.upper() == "PASS":
+        return 0.0
+    if output is None or not payload.is_file() or not output.is_file():
+        return None
+    try:
+        pa = payload.stat().st_size
+        pb = output.stat().st_size
+    except OSError:
+        return None
+    if pa == 0 and pb == 0:
+        return 0.0
+    mism = 0
+    n = max(pa, pb)
+    with payload.open("rb") as fa, output.open("rb") as fb:
+        while True:
+            ca = fa.read(1024 * 1024)
+            cb = fb.read(1024 * 1024)
+            if not ca and not cb:
+                break
+            if len(ca) != len(cb):
+                mism += abs(len(ca) - len(cb))
+            for x, y in zip(ca, cb):
+                if x != y:
+                    mism += 1
+    return 100.0 * mism / float(n) if n else 0.0
+
+
+def loss_stats_for_stream(
+    ci: dict[str, Any],
+    payload_bytes: int,
+    fm: dict,
+    mismatch_pct: float | None,
+) -> dict[str, Any]:
+    blocks = expected_blocks(payload_bytes)
+    # Prefer end-of-flow expected_blocks from incomplete line when present
+    if fm.get("expected_blocks"):
+        try:
+            blocks = max(blocks, int(fm["expected_blocks"]))
+        except (TypeError, ValueError):
+            pass
+    shards = int(ci["wire_shards"])
+    exp_dgrams = blocks * shards  # DATA shards; END not included
+    dgrams = int(fm["datagrams"]) if fm.get("datagrams") is not None else None
+    dups = int(fm["duplicates"]) if fm.get("duplicates") is not None else 0
+    late = int(fm["late"]) if fm.get("late") is not None else 0
+    dropped = int(fm["dropped_groups"]) if fm.get("dropped_groups") is not None else None
+    recovered = int(fm["recovered_groups"]) if fm.get("recovered_groups") is not None else None
+    missing_shards = (
+        int(fm["missing_data_shards"]) if fm.get("missing_data_shards") is not None else None
+    )
+    # Trailing incomplete groups (never flushed) also count as group loss
+    miss_end = int(fm.get("missing_groups_end") or 0)
+    if dropped is not None and miss_end:
+        dropped = dropped + miss_end
+    elif dropped is None and miss_end:
+        dropped = miss_end
+
+    unique_rx = None if dgrams is None else max(0, dgrams - dups)
+    # Datagrams that arrived but were too late still count as received for loss;
+    # loss ≈ missing on the wire relative to expected DATA datagrams.
+    dgram_loss_pct = None
+    if exp_dgrams > 0 and unique_rx is not None:
+        dgram_loss_pct = max(0.0, 100.0 * (1.0 - unique_rx / float(exp_dgrams)))
+        if unique_rx >= exp_dgrams:
+            dgram_loss_pct = 0.0
+
+    group_drop_pct = None
+    if blocks > 0 and dropped is not None:
+        group_drop_pct = 100.0 * dropped / float(blocks)
+
+    recovered_pct = None
+    if blocks > 0 and recovered is not None:
+        recovered_pct = 100.0 * recovered / float(blocks)
+
+    late_pct = None
+    if exp_dgrams > 0 and late:
+        late_pct = 100.0 * late / float(exp_dgrams)
+
+    return {
+        "expected_blocks": blocks,
+        "expected_datagrams": exp_dgrams,
+        "rx_datagrams": dgrams,
+        "unique_rx_datagrams": unique_rx,
+        "est_datagram_loss_pct": dgram_loss_pct,
+        "dropped_groups": dropped,
+        "group_drop_pct": group_drop_pct,
+        "recovered_groups": recovered,
+        "recovered_pct": recovered_pct,
+        "late_datagrams": late,
+        "late_pct": late_pct,
+        "missing_data_shards": missing_shards,
+        "content_mismatch_pct": mismatch_pct,
+    }
+
+
+def fmt_pct(v: float | None, digits: int = 4) -> str:
+    if v is None:
+        return "NA"
+    return f"{v:.{digits}f}"
+
+
+def fmt_num(v) -> str:
+    if v is None:
+        return "NA"
+    return str(v)
 
 
 def md_escape(s: str) -> str:
@@ -421,7 +616,7 @@ def generate(result_dir: Path) -> Path:
             encoding="utf-8",
         )
 
-    flow_metrics = parse_recv_logs(logs)
+    flow_metrics_by_base, flow_metrics_by_id = parse_recv_logs(logs)
     stream_rows: list[dict[str, str]] = []
     if streams_csv.is_file():
         stream_rows = list(csv.DictReader(streams_csv.open(encoding="utf-8")))
@@ -446,62 +641,144 @@ def generate(result_dir: Path) -> Path:
 
     lines.extend(wire_accounting_section(meta, ci))
 
+    # Build per-stream loss rows
+    loss_rows: list[dict[str, Any]] = []
+    label_of = {1: "s1", 2: "s2", 3: "s3", 4: "s4", 5: "s5", 6: "s6"}
+
     lines.append("## Streams (integrity / loss / recovery)")
     lines.append("")
     lines.append(
-        "| Stream | Status | Source Mbps | Est. wire Mbps | Bytes | Datagrams | Dup | Late | "
-        "Malformed | Recovered | Dropped | Missing shards | E2E p95 (us) | Jitter p95 (us) | Output |"
+        "| Stream | Status | Src Mbps | Wire Mbps | "
+        "Est. dgram loss % | Group drop % | Recovered % | Late % | "
+        "Content mismatch % | Rx/Exp dgrams | Dropped groups | Output |"
     )
     lines.append(
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |"
     )
 
     for row in stream_rows:
+        try:
+            sid = int(row.get("stream") or 0)
+        except ValueError:
+            continue
+        label = label_of.get(sid, f"s{sid}")
+        payload_path = result_dir / "payloads" / f"{label}.ts"
         matched = row.get("matched_output") or "NA"
-        base = Path(matched).name if matched != "NA" else ""
-        fm = flow_metrics.get(base, {})
+        out_path = find_stream_output(
+            result_dir, sid, payload_path, matched, flow_metrics_by_id
+        )
+        base = out_path.name if out_path is not None else (
+            Path(matched).name if matched != "NA" else ""
+        )
+        fm = dict(flow_metrics_by_id.get(sid) or {})
+        if not fm and base:
+            fm = dict(flow_metrics_by_base.get(base) or {})
 
-        def pick(key: str, csv_key: str | None = None) -> str:
-            if key in fm and fm[key] is not None:
-                return str(fm[key])
-            if csv_key and row.get(csv_key) not in (None, ""):
-                return str(row[csv_key])
-            return "NA"
+        try:
+            payload_bytes = int(row.get("payload_bytes") or 0)
+        except ValueError:
+            payload_bytes = payload_path.stat().st_size if payload_path.is_file() else 0
+        if payload_bytes <= 0 and payload_path.is_file():
+            payload_bytes = payload_path.stat().st_size
+
+        mismatch = content_mismatch_pct(
+            payload_path, out_path, status=str(row.get("status") or "")
+        )
+        stats = loss_stats_for_stream(ci, payload_bytes, fm, mismatch)
+        stats.update(
+            {
+                "stream": sid,
+                "status": row.get("status", ""),
+                "rate_mbps": row.get("rate_mbps", ""),
+                "output": base or matched,
+            }
+        )
+        loss_rows.append(stats)
 
         try:
             src_rate = float(row.get("rate_mbps") or 0)
         except ValueError:
             src_rate = 0.0
         est_wire = src_rate * ci["app_expansion"]
+        rx = stats["unique_rx_datagrams"]
+        exp = stats["expected_datagrams"]
+        rx_exp = f"{fmt_num(rx)}/{exp}" if exp else "NA"
 
         lines.append(
-            "| {sid} | {st} | {rate} | {wire:.3f} | {nbytes} | {dgrams} | {dup} | {late} | {mal} | "
-            "{rec} | {drop} | {miss} | {e2e} | {jit} | `{out}` |".format(
-                sid=row.get("stream", ""),
+            "| {sid} | {st} | {rate} | {wire:.3f} | {dloss} | {gloss} | {rec} | {late} | "
+            "{cm} | {rxexp} | {drop} | `{out}` |".format(
+                sid=sid,
                 st=row.get("status", ""),
                 rate=row.get("rate_mbps", ""),
                 wire=est_wire,
-                nbytes=pick("output_bytes", "payload_bytes"),
-                dgrams=pick("datagrams"),
-                dup=pick("duplicates"),
-                late=pick("late"),
-                mal=pick("malformed"),
-                rec=pick("recovered_groups", "recovered_groups"),
-                drop=pick("dropped_groups", "dropped_groups"),
-                miss=pick("missing_data_shards", "missing_data_shards"),
-                e2e=pick("e2e_p95_us", "e2e_p95_us"),
-                jit=pick("jitter_p95_us", "jitter_p95_us"),
-                out=md_escape(base or matched),
+                dloss=fmt_pct(stats["est_datagram_loss_pct"]),
+                gloss=fmt_pct(stats["group_drop_pct"]),
+                rec=fmt_pct(stats["recovered_pct"]),
+                late=fmt_pct(stats["late_pct"]),
+                cm=fmt_pct(stats["content_mismatch_pct"]),
+                rxexp=rx_exp,
+                drop=fmt_num(stats["dropped_groups"]),
+                out=md_escape(base or matched or "NA"),
             )
         )
+
     lines.append("")
     lines.append(
-        "Notes: `Recovered` / `Dropped` / `Missing shards` come from the receiver "
-        "FEC/group accounting. For `copy`/`block`, recovered is usually 0; "
-        "`xor-fec`/`rs-fec` may show recoveries under loss. "
-        "`Est. wire Mbps` uses app-layer expansion (UDP payload including wire header)."
+        "**How to read loss columns**"
     )
     lines.append("")
+    lines.append(
+        "- `Est. dgram loss %` ≈ `1 - (rx_datagrams - duplicates) / expected_data_datagrams`, "
+        f"where expected = ceil(payload/{DECODE_BLOCK}) × {ci['wire_shards']} "
+        f"shards for codec `{ci['codec']}`."
+    )
+    lines.append(
+        "- `Group drop %` = `dropped_groups / expected_blocks` (receiver gave up on a group)."
+    )
+    lines.append(
+        "- `Recovered %` = groups repaired by FEC / expected blocks "
+        "(`copy`/`block` usually 0; may still be high if the recover path always runs)."
+    )
+    lines.append(
+        "- `Late %` = late datagrams / expected datagrams (arrived after window advance)."
+    )
+    lines.append(
+        "- `Content mismatch %` = byte-wise diff vs source payload "
+        "(0 means hash PASS; >0 with full length means silent corruption)."
+    )
+    lines.append(
+        "- PASS/FAIL is still **sha256 of full file**. Loss % explains *why* a FAIL happened."
+    )
+    lines.append("")
+
+    # Persist machine-readable loss table
+    loss_csv = result_dir / "loss.csv"
+    with loss_csv.open("w", encoding="utf-8", newline="") as g:
+        w = csv.DictWriter(
+            g,
+            fieldnames=[
+                "stream",
+                "status",
+                "rate_mbps",
+                "expected_blocks",
+                "expected_datagrams",
+                "rx_datagrams",
+                "unique_rx_datagrams",
+                "est_datagram_loss_pct",
+                "dropped_groups",
+                "group_drop_pct",
+                "recovered_groups",
+                "recovered_pct",
+                "late_datagrams",
+                "late_pct",
+                "missing_data_shards",
+                "content_mismatch_pct",
+                "output",
+            ],
+        )
+        w.writeheader()
+        for r in loss_rows:
+            w.writerow({k: r.get(k) for k in w.fieldnames})
 
     lines.append("## Node peaks")
     lines.append("")
@@ -540,6 +817,7 @@ def generate(result_dir: Path) -> Path:
     lines.append("")
     lines.append("- `meta.json` — codec, rates, durations, expansion knobs")
     lines.append("- `streams.csv` — PASS/FAIL + latency columns")
+    lines.append("- `loss.csv` — per-stream estimated datagram/group loss + content mismatch")
     lines.append("- `summary.md` — short summary")
     lines.append("- `monitor/*-ifaces.csv` — per-second iface + CPU")
     lines.append("- `logs/*` — sender/receiver logs")

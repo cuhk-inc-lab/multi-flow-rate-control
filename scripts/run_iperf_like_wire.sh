@@ -676,8 +676,9 @@ PY
     echo
     echo "## Artifacts"
     echo
-    echo "- \`report.md\` : full report with CPU/RX/TX charts + per-stream loss/recovery"
+    echo "- \`report.md\` : full report with CPU/RX/TX charts + per-stream loss rates"
     echo "- \`streams.csv\` : per-stream PASS/FAIL + latency fields"
+    echo "- \`loss.csv\` : estimated datagram/group loss + content mismatch %"
     echo "- \`logs/\` : sender/receiver logs"
     echo "- \`monitor/\` : per-node iface+CPU timeseries"
     echo "- \`charts/\` : SVG figures referenced by report.md"
