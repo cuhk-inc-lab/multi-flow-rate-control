@@ -159,7 +159,7 @@ The script:
    use `CODEC=xor-fec` for FEC stress)
 3. starts relay monitors on Node2/3
 4. starts Node1 + Node2 senders at a shared `START_AT` barrier
-   (default rates: 1/1/2/2/1/2 Mbps, short durations, ~9 Mbps aggregate)
+   (default rates: 1 Mbps each, ~6 Mbps aggregate; Node2 loopback on PORT+1)
 5. collects logs and writes `streams.csv` + `summary.md` under
    `build/iperf-like-wire-*`
 

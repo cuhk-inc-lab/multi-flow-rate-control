@@ -2,14 +2,15 @@
 
 # Concurrent multi-destination wire test (iperf-like), run from Node1.
 #
-# Default streams (low aggregate rate so multi-hop UDP can stay loss-free):
+# Default streams (low aggregate; Node2 loopback uses PORT+1 to avoid sharing
+# the same udp-recv demux with Node1→Node2 under concurrent load):
 #   1) Node1 -> Node4   1 Mbps / 5 s
 #   2) Node2 -> Node4   1 Mbps / 5 s
-#   3) Node1 -> Node2   2 Mbps / 5 s
-#   4) Node2 -> Node2   2 Mbps / 5 s  (loopback)
+#   3) Node1 -> Node2   1 Mbps / 5 s
+#   4) Node2 -> Node2   1 Mbps / 5 s  (loopback on PORT+1)
 #   5) Node1 -> Node3   1 Mbps / 5 s
-#   6) Node1 -> Node4   2 Mbps / 3 s
-# Aggregate source ≈ 9 Mbps. Default codec is copy (hash-integrity baseline);
+#   6) Node1 -> Node4   1 Mbps / 3 s
+# Aggregate source ≈ 6 Mbps. Default codec is copy (hash-integrity baseline);
 # set CODEC=xor-fec for FEC stress (may need even lower rates on lossy hops).
 #
 # Example:
@@ -23,6 +24,7 @@ set -u
 input_path=${1:-}
 codec=${CODEC:-copy}
 port=${PORT:-9000}
+loop_port=${LOOP_PORT:-$((port + 1))}
 idle_sec=${IDLE_SEC:-12}
 barrier_sec=${BARRIER_SEC:-5}
 monitor_hz=${MONITOR_HZ:-1}
@@ -58,6 +60,7 @@ Required env:
 Optional env:
   CODEC=copy|block|xor-fec|rs-fec   (default: copy)
   PORT=9000
+  LOOP_PORT=PORT+1                  (Node2 loopback stream)
   IDLE_SEC=12
   BARRIER_SEC=5
   MONITOR_HZ=1
@@ -288,10 +291,10 @@ mkdir -p "$result_dir/payloads" "$result_dir/logs" "$result_dir/remote" \
 stream_defs="
 1 local 1 5 s1 n4 $node4_ip
 2 node2 1 5 s2 n4 $node4_ip
-3 local 2 5 s3 n2 $node2_ip
-4 node2 2 5 s4 n2 127.0.0.1
+3 local 1 5 s3 n2 $node2_ip
+4 node2 1 5 s4 n2 127.0.0.1
 5 local 1 5 s5 n3 $node3_ip
-6 local 2 3 s6 n4 $node4_ip
+6 local 1 3 s6 n4 $node4_ip
 "
 
 echo "== preparing payloads =="
@@ -333,54 +336,62 @@ capture_link_stats "$node3_ssh" "$node3_ifaces" "$result_dir/monitor/node3-link-
 
 start_remote_receiver() {
     host=$1
-    out_prefix=$2
-    max_flows=$3
-    log_rel=$4
-    pid_rel=$5
+    listen_port=$2
+    out_prefix=$3
+    max_flows=$4
+    log_rel=$5
+    pid_rel=$6
 
     # Write PID on the remote host, then print it. Avoid relying on SSH staying
     # attached to the long-running udp-recv process.
     if ! out=$(ssh_run_timeout "$host" "cd '$remote_repo' || exit 1
 rm -f '$pid_rel'
 if command -v setsid >/dev/null 2>&1; then
-  setsid $bin_rel --codec '$codec' --udp-recv '$port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' >'$log_rel' 2>&1 </dev/null &
+  setsid $bin_rel --codec '$codec' --udp-recv '$listen_port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' >'$log_rel' 2>&1 </dev/null &
 else
-  nohup $bin_rel --codec '$codec' --udp-recv '$port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' >'$log_rel' 2>&1 </dev/null &
+  nohup $bin_rel --codec '$codec' --udp-recv '$listen_port' '$out_prefix' --max-flows '$max_flows' --idle-sec '$idle_sec' >'$log_rel' 2>&1 </dev/null &
 fi
 echo \$! > '$pid_rel'
 sleep 0.3
 if ! kill -0 \"\$(cat '$pid_rel')\" 2>/dev/null; then
-  echo \"receiver exited immediately on $host\" >&2
+  echo \"receiver exited immediately on $host port $listen_port\" >&2
   tail -n 40 '$log_rel' >&2 || true
   exit 1
 fi
 cat '$pid_rel'"); then
-        die "failed to start receiver on $host (ssh timeout=${ssh_cmd_timeout}s). Try manually:
-  ssh $host 'cd $remote_repo && $bin_rel --codec $codec --udp-recv $port /tmp/manual_ --max-flows 2 --idle-sec 3'"
+        die "failed to start receiver on $host port $listen_port (ssh timeout=${ssh_cmd_timeout}s). Try manually:
+  ssh $host 'cd $remote_repo && $bin_rel --codec $codec --udp-recv $listen_port /tmp/manual_ --max-flows 2 --idle-sec 3'"
     fi
     printf '%s\n' "$out" | tr -d ' \r' | tail -n 1
 }
 
 echo "== starting receivers =="
-echo "  Node4 receiver..."
-n4_recv_pid=$(start_remote_receiver "$node4_ssh" \
+echo "  Node4 receiver (UDP $port)..."
+n4_recv_pid=$(start_remote_receiver "$node4_ssh" "$port" \
     "build/$remote_run_id/out/n4_" 8 \
     "build/$remote_run_id/logs/n4-recv.log" \
     "build/$remote_run_id/logs/n4-recv.pid")
-echo "  Node2 receiver..."
-n2_recv_pid=$(start_remote_receiver "$node2_ssh" \
-    "build/$remote_run_id/out/n2_" 8 \
+echo "  Node2 receiver (UDP $port, from Node1)..."
+n2_recv_pid=$(start_remote_receiver "$node2_ssh" "$port" \
+    "build/$remote_run_id/out/n2_" 4 \
     "build/$remote_run_id/logs/n2-recv.log" \
     "build/$remote_run_id/logs/n2-recv.pid")
-echo "  Node3 receiver..."
-n3_recv_pid=$(start_remote_receiver "$node3_ssh" \
+echo "  Node2 loopback receiver (UDP $loop_port)..."
+n2lb_recv_pid=$(start_remote_receiver "$node2_ssh" "$loop_port" \
+    "build/$remote_run_id/out/n2_" 2 \
+    "build/$remote_run_id/logs/n2lb-recv.log" \
+    "build/$remote_run_id/logs/n2lb-recv.pid")
+echo "  Node3 receiver (UDP $port)..."
+n3_recv_pid=$(start_remote_receiver "$node3_ssh" "$port" \
     "build/$remote_run_id/out/n3_" 4 \
     "build/$remote_run_id/logs/n3-recv.log" \
     "build/$remote_run_id/logs/n3-recv.pid")
-echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n3=$n3_recv_pid" > "$result_dir/remote/recv-pids.txt"
-echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n3=$n3_recv_pid"
+echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n2lb=$n2lb_recv_pid n3=$n3_recv_pid" \
+    > "$result_dir/remote/recv-pids.txt"
+echo "  pids: n4=$n4_recv_pid n2=$n2_recv_pid n2lb=$n2lb_recv_pid n3=$n3_recv_pid"
 printf '%s\n' "$n4_recv_pid" > "$result_dir/remote/n4-recv.pid"
 printf '%s\n' "$n2_recv_pid" > "$result_dir/remote/n2-recv.pid"
+printf '%s\n' "$n2lb_recv_pid" > "$result_dir/remote/n2lb-recv.pid"
 printf '%s\n' "$n3_recv_pid" > "$result_dir/remote/n3-recv.pid"
 sleep 1
 
@@ -395,25 +406,25 @@ echo "${n3_mon_pid:-}" > "$result_dir/remote/n3-mon.pid"
 start_at=$(( $(date +%s) + barrier_sec ))
 echo "== barrier START_AT=$start_at (wait ${barrier_sec}s) =="
 
-# Node1 sender: streams 1,3,5,6
+# Node1 sender: streams 1,3,5,6 with unique wire flow ids
 (
     while [ "$(date +%s)" -lt "$start_at" ]; do sleep 0.05; done
     ./build/wg_multi_pipeline --codec "$codec" --udp-send-multi \
-        --flow "${node4_ip}:${port}:${local_work}/s1.ts:1" \
-        --flow "${node2_ip}:${port}:${local_work}/s3.ts:2" \
-        --flow "${node3_ip}:${port}:${local_work}/s5.ts:1" \
-        --flow "${node4_ip}:${port}:${local_work}/s6.ts:2" \
+        --flow "1:${node4_ip}:${port}:${local_work}/s1.ts:1" \
+        --flow "3:${node2_ip}:${port}:${local_work}/s3.ts:1" \
+        --flow "5:${node3_ip}:${port}:${local_work}/s5.ts:1" \
+        --flow "6:${node4_ip}:${port}:${local_work}/s6.ts:1" \
         > "$result_dir/logs/node1-send.log" 2>&1
 ) &
 local_send_pid=$!
 
-# Node2 sender: streams 2,4 (payloads generated on Node1, then scp'd above)
+# Node2 sender: stream2 -> N4 on PORT; stream4 loopback on LOOP_PORT
 ssh_run "$node2_ssh" "cd '$remote_repo' && nohup sh -c '
   start_at=$start_at
   while [ \"\$(date +%s)\" -lt \"\$start_at\" ]; do sleep 0.05; done
   $bin_rel --codec \"$codec\" --udp-send-multi \
-    --flow \"${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:1\" \
-    --flow \"127.0.0.1:${port}:build/$remote_run_id/payloads/s4.ts:2\" \
+    --flow \"2:${node4_ip}:${port}:build/$remote_run_id/payloads/s2.ts:1\" \
+    --flow \"4:127.0.0.1:${loop_port}:build/$remote_run_id/payloads/s4.ts:1\" \
     > \"build/$remote_run_id/logs/n2-send.log\" 2>&1
 ' >/dev/null 2>&1 </dev/null & echo \$!" > "$result_dir/remote/n2-send.pid"
 n2_send_pid=$(tr -d ' \n' < "$result_dir/remote/n2-send.pid")
@@ -428,7 +439,12 @@ echo "  Node2 sender finished"
 
 echo "== waiting for receivers (max ${recv_wait_sec}s) =="
 deadline=$(( $(date +%s) + recv_wait_sec ))
-for pair in "n4:$node4_ssh:$n4_recv_pid" "n2:$node2_ssh:$n2_recv_pid" "n3:$node3_ssh:$n3_recv_pid"; do
+for pair in \
+    "n4:$node4_ssh:$n4_recv_pid" \
+    "n2:$node2_ssh:$n2_recv_pid" \
+    "n2lb:$node2_ssh:$n2lb_recv_pid" \
+    "n3:$node3_ssh:$n3_recv_pid"
+do
     name=${pair%%:*}
     rest=${pair#*:}
     host=${rest%%:*}
@@ -461,6 +477,8 @@ echo "== collecting artifacts =="
 scp $ssh_opts "$node4_ssh:$remote_repo/build/$remote_run_id/logs/n4-recv.log" "$result_dir/logs/" >/dev/null
 # shellcheck disable=SC2086
 scp $ssh_opts "$node2_ssh:$remote_repo/build/$remote_run_id/logs/n2-recv.log" "$result_dir/logs/" >/dev/null
+# shellcheck disable=SC2086
+scp $ssh_opts "$node2_ssh:$remote_repo/build/$remote_run_id/logs/n2lb-recv.log" "$result_dir/logs/" >/dev/null 2>/dev/null || true
 # shellcheck disable=SC2086
 scp $ssh_opts "$node3_ssh:$remote_repo/build/$remote_run_id/logs/n3-recv.log" "$result_dir/logs/" >/dev/null
 # shellcheck disable=SC2086
@@ -508,11 +526,19 @@ echo "$stream_defs" | while read -r sid sender rate dur label outkey dst; do
         matched=NA
     fi
 
-    case "$outkey" in
-        n4) recv_log="$result_dir/logs/n4-recv.log" ;;
-        n2) recv_log="$result_dir/logs/n2-recv.log" ;;
-        n3) recv_log="$result_dir/logs/n3-recv.log" ;;
-        *) recv_log="" ;;
+    case "$label" in
+        s4) recv_log="$result_dir/logs/n2lb-recv.log" ;;
+        s3) recv_log="$result_dir/logs/n2-recv.log" ;;
+        s1|s2|s6) recv_log="$result_dir/logs/n4-recv.log" ;;
+        s5) recv_log="$result_dir/logs/n3-recv.log" ;;
+        *)
+            case "$outkey" in
+                n4) recv_log="$result_dir/logs/n4-recv.log" ;;
+                n2) recv_log="$result_dir/logs/n2-recv.log" ;;
+                n3) recv_log="$result_dir/logs/n3-recv.log" ;;
+                *) recv_log="" ;;
+            esac
+            ;;
     esac
 
     e2e_p95=NA
@@ -554,10 +580,10 @@ total=$(awk -F, 'NF{c++} END{print c+0}' "$tmp_rows")
     echo "| --- | --- | --- | ---: | ---: |"
     echo "| 1 | Node1 | Node4 ($node4_ip) | 1 | 5 |"
     echo "| 2 | Node2 | Node4 ($node4_ip) | 1 | 5 |"
-    echo "| 3 | Node1 | Node2 ($node2_ip) | 2 | 5 |"
-    echo "| 4 | Node2 | Node2 (127.0.0.1) | 2 | 5 |"
+    echo "| 3 | Node1 | Node2 ($node2_ip:$port) | 1 | 5 |"
+    echo "| 4 | Node2 | Node2 (127.0.0.1:$loop_port) | 1 | 5 |"
     echo "| 5 | Node1 | Node3 ($node3_ip) | 1 | 5 |"
-    echo "| 6 | Node1 | Node4 ($node4_ip) | 2 | 3 |"
+    echo "| 6 | Node1 | Node4 ($node4_ip) | 1 | 3 |"
     echo
     echo "## Relay peaks"
     echo
