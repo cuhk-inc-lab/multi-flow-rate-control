@@ -118,8 +118,6 @@ done
       }' "$csv"
     echo
     echo "Per-run details: \`runs/*/summary.md\`, \`runs/*/streams.csv\`, \`runs/*/monitor/\`."
-    echo
-    echo "Guide: [IPERF_LIKE_WIRE_GUIDE.md](../docs/IPERF_LIKE_WIRE_GUIDE.md)"
 } > "$md"
 
 echo "== matrix done =="

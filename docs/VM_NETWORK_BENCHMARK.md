@@ -139,12 +139,7 @@ VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
 ### Concurrent iperf-like multi-destination run
 
 For the supervisor-style 6-stream concurrent test (Node1/Node2 senders,
-Node2/Node3/Node4 receivers, plus relay iface monitoring), use:
-
-For the supervisor-style 6-stream concurrent test, see the full Chinese/ops
-guide: [IPERF_LIKE_WIRE_GUIDE.md](IPERF_LIKE_WIRE_GUIDE.md).
-
-Quick start (from Node1):
+Node2/Node3/Node4 receivers, plus relay iface monitoring), from Node1:
 
 ```bash
 NODE2_SSH=fyp1@NODE2_MGMT NODE2_IP=NODE2_DATA_IP \
@@ -165,7 +160,8 @@ Relay iface defaults match the lab topology (`NODE2_IFACES="ap0 station1"`,
 `NODE3_IFACES="ap1 station2"`). Override only if your names differ.
 
 Single-run knobs: `CODEC`, `RATE_MBPS`, `DURATION_S`, `DURATION_SHORT_S`.
-Results land under `build/iperf-like-wire-*` (or `build/iperf-like-matrix-*`).
+Results land under `build/iperf-like-wire-*` (or `build/iperf-like-matrix-*`):
+`summary.md`, `streams.csv`, `logs/`, `monitor/`, `out/`.
 
 
 ## 4. Report
