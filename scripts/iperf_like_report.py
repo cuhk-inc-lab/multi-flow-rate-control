@@ -8,12 +8,93 @@ Usage:
 from __future__ import annotations
 
 import csv
-import os
+import json
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+# Must match apps/wg_multi_pipeline/stream_config.h + wire_udp.c
+PKG_SIZE = 188
+WIRE_HEADER_SIZE = 44
+DATAGRAM_APP = WIRE_HEADER_SIZE + PKG_SIZE  # 232 B UDP payload
+IP_UDP_HDR = 20 + 8  # typical IPv4 + UDP
+DATAGRAM_IP = DATAGRAM_APP + IP_UDP_HDR  # 260 B IP packet (no Ethernet)
+DATA_SHARDS = 4
+
+CODEC_SHARDS = {
+    "copy": 8,
+    "block": 8,
+    "xor-fec": 5,  # 4 data + 1 XOR
+    "rs-fec": 6,  # 4 data + 2 RS
+    "none": 4,
+}
+
+
+def codec_info(codec: str) -> dict[str, Any]:
+    codec = (codec or "copy").strip().lower()
+    shards = CODEC_SHARDS.get(codec, CODEC_SHARDS["copy"])
+    shard_exp = shards / float(DATA_SHARDS)
+    app_exp = shard_exp * (DATAGRAM_APP / float(PKG_SIZE))
+    ip_exp = shard_exp * (DATAGRAM_IP / float(PKG_SIZE))
+    return {
+        "codec": codec,
+        "data_shards": DATA_SHARDS,
+        "wire_shards": shards,
+        "shard_expansion": shard_exp,
+        "app_expansion": app_exp,
+        "ip_expansion": ip_exp,
+        "pkg_size": PKG_SIZE,
+        "wire_header": WIRE_HEADER_SIZE,
+        "datagram_app": DATAGRAM_APP,
+        "datagram_ip": DATAGRAM_IP,
+    }
+
+
+def load_meta(result_dir: Path) -> dict[str, Any]:
+    meta_path = result_dir / "meta.json"
+    if meta_path.is_file():
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    meta: dict[str, Any] = {"codec": "copy", "streams": []}
+    summary = result_dir / "summary.md"
+    if summary.is_file():
+        text = summary.read_text(encoding="utf-8")
+        m = re.search(r"- Codec:\s*(\S+)", text)
+        if m:
+            meta["codec"] = m.group(1)
+        for row in re.finditer(
+            r"\|\s*(\d+)\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|",
+            text,
+        ):
+            meta["streams"].append(
+                {
+                    "stream": int(row.group(1)),
+                    "sender": row.group(2).strip(),
+                    "dst": row.group(3).strip(),
+                    "rate_mbps": float(row.group(4)),
+                    "duration_s": float(row.group(5)),
+                }
+            )
+    streams_csv = result_dir / "streams.csv"
+    if streams_csv.is_file():
+        rows = list(csv.DictReader(streams_csv.open(encoding="utf-8")))
+        if rows:
+            meta["streams"] = [
+                {
+                    "stream": int(r["stream"]),
+                    "sender": r.get("sender", ""),
+                    "dst": r.get("dst", ""),
+                    "rate_mbps": float(r["rate_mbps"]),
+                    "duration_s": float(r["duration_s"]),
+                }
+                for r in rows
+                if r.get("stream")
+            ]
+    return meta
 
 
 def svg_line_chart(
@@ -24,7 +105,6 @@ def svg_line_chart(
     height: int = 280,
     y_is_pct: bool = False,
 ) -> str:
-    """Minimal multi-series SVG line chart. x is relative seconds."""
     colors = [
         "#2563eb",
         "#dc2626",
@@ -58,7 +138,6 @@ def svg_line_chart(
         xmax = xmin + 1.0
     if ymax <= ymin:
         ymax = ymin + 1.0
-    # pad y a bit when not pct
     if not y_is_pct:
         span = ymax - ymin
         ymin = max(0.0, ymin - span * 0.05)
@@ -84,13 +163,10 @@ def svg_line_chart(
         f'y2="{pad_t + plot_h}" stroke="#ccc"/>',
     ]
 
-    # y ticks
     for i in range(5):
         yv = ymin + (ymax - ymin) * i / 4.0
         y = sy(yv)
-        label = f"{yv:.0f}" if not y_is_pct and ymax >= 10 else f"{yv:.1f}"
-        if y_is_pct:
-            label = f"{yv:.0f}"
+        label = f"{yv:.0f}" if (y_is_pct or ymax >= 10) else f"{yv:.1f}"
         parts.append(
             f'<line x1="{pad_l}" y1="{y:.1f}" x2="{pad_l + plot_w}" y2="{y:.1f}" '
             f'stroke="#eee"/>'
@@ -100,7 +176,6 @@ def svg_line_chart(
             f'font-family="sans-serif" font-size="10" fill="#666">{label}</text>'
         )
 
-    # x ticks
     for i in range(5):
         xv = xmin + (xmax - xmin) * i / 4.0
         x = sx(xv)
@@ -171,11 +246,9 @@ LAT_RE = re.compile(
 
 
 def parse_recv_logs(logs_dir: Path) -> dict[str, dict]:
-    """Map output basename -> metrics from recv logs."""
     by_base: dict[str, dict] = {}
     for log in sorted(logs_dir.glob("*-recv.log")):
         text = log.read_text(encoding="utf-8", errors="replace")
-        # Split into flow blocks roughly by "udp-recv: flow"
         chunks = re.split(r"(?=udp-recv: flow )", text)
         for chunk in chunks:
             m = FLOW_LINE_RE.search(chunk)
@@ -208,6 +281,93 @@ def md_escape(s: str) -> str:
     return s.replace("|", "\\|")
 
 
+def wire_accounting_section(meta: dict[str, Any], ci: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    lines.append("## Wire packet size & expansion")
+    lines.append("")
+    lines.append(
+        "Compared with plain iperf3 (`-b X M` ≈ X Mbps on the wire), this app "
+        "sends **small TS shards** plus a **wire header**, and codecs may emit "
+        "**extra parity/padding shards**."
+    )
+    lines.append("")
+    lines.append("### Constants")
+    lines.append("")
+    lines.append("| Item | Value |")
+    lines.append("| --- | --- |")
+    lines.append(f"| TS package (`PKG_SIZE`) | {ci['pkg_size']} B |")
+    lines.append(f"| Wire header (`WIRE_HEADER_SIZE`) | {ci['wire_header']} B |")
+    lines.append(
+        f"| UDP payload per datagram | {ci['datagram_app']} B "
+        f"(= {ci['wire_header']}+{ci['pkg_size']}) |"
+    )
+    lines.append(
+        f"| Typical IPv4+UDP packet | {ci['datagram_ip']} B "
+        f"(+{IP_UDP_HDR} B IP/UDP hdr; Ethernet headers not included) |"
+    )
+    lines.append(f"| Source data shards / group | {ci['data_shards']} |")
+    lines.append(
+        f"| Wire shards / group (`{ci['codec']}`) | {ci['wire_shards']} |"
+    )
+    lines.append(
+        f"| Shard expansion | ×{ci['shard_expansion']:.3f} "
+        f"({ci['wire_shards']}/{ci['data_shards']}) |"
+    )
+    lines.append(
+        f"| App-layer expansion (incl. wire hdr) | ×{ci['app_expansion']:.3f} |"
+    )
+    lines.append(
+        f"| IP-layer expansion (incl. IP/UDP hdr) | ×{ci['ip_expansion']:.3f} |"
+    )
+    lines.append("")
+    lines.append(
+        f"**Rule of thumb:** estimated wire Mbps ≈ source Mbps × "
+        f"{ci['app_expansion']:.3f} (UDP payload) or × {ci['ip_expansion']:.3f} (IP)."
+    )
+    lines.append("")
+
+    streams = meta.get("streams") or []
+    if streams:
+        lines.append("### Per-stream source vs estimated wire rate")
+        lines.append("")
+        lines.append(
+            "| Stream | Source Mbps | Est. wire Mbps (UDP payload) | "
+            "Est. wire Mbps (IP) | Duration s |"
+        )
+        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        sum_src = 0.0
+        sum_app = 0.0
+        sum_ip = 0.0
+        for s in streams:
+            src = float(s["rate_mbps"])
+            app = src * ci["app_expansion"]
+            ip = src * ci["ip_expansion"]
+            sum_src += src
+            sum_app += app
+            sum_ip += ip
+            lines.append(
+                f"| {s['stream']} | {src:g} | {app:.3f} | {ip:.3f} | "
+                f"{s['duration_s']:g} |"
+            )
+        lines.append(
+            f"| **Σ concurrent** | **{sum_src:g}** | **{sum_app:.3f}** | "
+            f"**{sum_ip:.3f}** | |"
+        )
+        lines.append("")
+        lines.append(
+            "Σ assumes all streams overlap (barrier start). Stream 6 may end "
+            "earlier if `DURATION_SHORT_S` < `DURATION_S`."
+        )
+        lines.append("")
+        lines.append(
+            "When comparing to `run_iperf_like_baseline.sh`, matching source "
+            f"`Σ={sum_src:g} Mbps` is **not** equivalent — match the **est. wire** "
+            f"column (≈ **{sum_app:.1f} Mbps** UDP payload for this codec/run)."
+        )
+        lines.append("")
+    return lines
+
+
 def generate(result_dir: Path) -> Path:
     charts = result_dir / "charts"
     charts.mkdir(parents=True, exist_ok=True)
@@ -215,6 +375,9 @@ def generate(result_dir: Path) -> Path:
     logs = result_dir / "logs"
     streams_csv = result_dir / "streams.csv"
     report_path = result_dir / "report.md"
+
+    meta = load_meta(result_dir)
+    ci = codec_info(str(meta.get("codec") or "copy"))
 
     nodes = [
         ("node1", "Node1 (sender)"),
@@ -231,7 +394,6 @@ def generate(result_dir: Path) -> Path:
         rx, tx, cpu = load_monitor(csv_path)
         if cpu:
             cpu_all[key] = cpu
-        # RX chart
         if rx:
             (charts / f"{key}-rx.svg").write_text(
                 svg_line_chart(rx, f"{label} RX", "Mbps"), encoding="utf-8"
@@ -267,7 +429,6 @@ def generate(result_dir: Path) -> Path:
     summary_bits = []
     summary_md = result_dir / "summary.md"
     if summary_md.is_file():
-        # pull a few bullets
         for line in summary_md.read_text(encoding="utf-8").splitlines():
             if line.startswith("- "):
                 summary_bits.append(line)
@@ -283,19 +444,23 @@ def generate(result_dir: Path) -> Path:
         lines.extend(summary_bits)
         lines.append("")
 
+    lines.extend(wire_accounting_section(meta, ci))
+
     lines.append("## Streams (integrity / loss / recovery)")
     lines.append("")
     lines.append(
-        "| Stream | Status | Rate Mbps | Bytes | Datagrams | Dup | Late | "
+        "| Stream | Status | Source Mbps | Est. wire Mbps | Bytes | Datagrams | Dup | Late | "
         "Malformed | Recovered | Dropped | Missing shards | E2E p95 (us) | Jitter p95 (us) | Output |"
     )
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append(
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    )
 
     for row in stream_rows:
         matched = row.get("matched_output") or "NA"
         base = Path(matched).name if matched != "NA" else ""
         fm = flow_metrics.get(base, {})
-        # Prefer per-flow parsed values; fall back to streams.csv aggregates
+
         def pick(key: str, csv_key: str | None = None) -> str:
             if key in fm and fm[key] is not None:
                 return str(fm[key])
@@ -303,12 +468,19 @@ def generate(result_dir: Path) -> Path:
                 return str(row[csv_key])
             return "NA"
 
+        try:
+            src_rate = float(row.get("rate_mbps") or 0)
+        except ValueError:
+            src_rate = 0.0
+        est_wire = src_rate * ci["app_expansion"]
+
         lines.append(
-            "| {sid} | {st} | {rate} | {nbytes} | {dgrams} | {dup} | {late} | {mal} | "
+            "| {sid} | {st} | {rate} | {wire:.3f} | {nbytes} | {dgrams} | {dup} | {late} | {mal} | "
             "{rec} | {drop} | {miss} | {e2e} | {jit} | `{out}` |".format(
                 sid=row.get("stream", ""),
                 st=row.get("status", ""),
                 rate=row.get("rate_mbps", ""),
+                wire=est_wire,
                 nbytes=pick("output_bytes", "payload_bytes"),
                 dgrams=pick("datagrams"),
                 dup=pick("duplicates"),
@@ -326,7 +498,8 @@ def generate(result_dir: Path) -> Path:
     lines.append(
         "Notes: `Recovered` / `Dropped` / `Missing shards` come from the receiver "
         "FEC/group accounting. For `copy`/`block`, recovered is usually 0; "
-        "`xor-fec`/`rs-fec` may show recoveries under loss."
+        "`xor-fec`/`rs-fec` may show recoveries under loss. "
+        "`Est. wire Mbps` uses app-layer expansion (UDP payload including wire header)."
     )
     lines.append("")
 
@@ -335,6 +508,12 @@ def generate(result_dir: Path) -> Path:
     lines.append("| Node | RX peak (Mbps) | TX peak (Mbps) | CPU peak (%) | Source |")
     lines.append("| --- | ---: | ---: | ---: | --- |")
     lines.extend(node_peaks)
+    lines.append("")
+    lines.append(
+        "Compare TX/RX peaks to the **Σ est. wire Mbps** above. Peaks near that "
+        "estimate are consistent; large gaps may indicate pacing, idle gaps, or "
+        "measurement on a subset of ifaces."
+    )
     lines.append("")
 
     lines.append("## Charts")
@@ -359,6 +538,7 @@ def generate(result_dir: Path) -> Path:
 
     lines.append("## Raw artifacts")
     lines.append("")
+    lines.append("- `meta.json` — codec, rates, durations, expansion knobs")
     lines.append("- `streams.csv` — PASS/FAIL + latency columns")
     lines.append("- `summary.md` — short summary")
     lines.append("- `monitor/*-ifaces.csv` — per-second iface + CPU")

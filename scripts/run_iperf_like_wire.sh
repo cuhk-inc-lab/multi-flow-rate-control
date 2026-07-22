@@ -291,6 +291,52 @@ stream_defs="
 6 local $rate_s6 $dur_short_s s6 n4 $node4_ip
 "
 
+# Persist run knobs for report.md (packet size / expansion accounting).
+python3 - "$result_dir/meta.json" "$codec" \
+    "$rate_s1" "$rate_s2" "$rate_s3" "$rate_s4" "$rate_s5" "$rate_s6" \
+    "$dur_s" "$dur_short_s" "$port" "$loop_port" <<'PY'
+import json, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+codec = sys.argv[2]
+rates = [float(sys.argv[i]) for i in range(3, 9)]
+dur_s, dur_short = float(sys.argv[9]), float(sys.argv[10])
+port, loop_port = int(sys.argv[11]), int(sys.argv[12])
+PKG, HDR = 188, 44
+shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6, "none": 4}.get(codec, 8)
+meta = {
+    "codec": codec,
+    "pkg_size": PKG,
+    "wire_header_size": HDR,
+    "datagram_app_bytes": HDR + PKG,
+    "datagram_ip_bytes": HDR + PKG + 28,
+    "data_shards": 4,
+    "wire_shards": shards,
+    "shard_expansion": shards / 4.0,
+    "app_expansion": (shards / 4.0) * ((HDR + PKG) / PKG),
+    "ip_expansion": (shards / 4.0) * ((HDR + PKG + 28) / PKG),
+    "udp_port": port,
+    "loop_port": loop_port,
+    "streams": [
+        {"stream": 1, "sender": "local", "dst": "node4", "rate_mbps": rates[0], "duration_s": dur_s},
+        {"stream": 2, "sender": "node2", "dst": "node4", "rate_mbps": rates[1], "duration_s": dur_s},
+        {"stream": 3, "sender": "local", "dst": "node2", "rate_mbps": rates[2], "duration_s": dur_s},
+        {"stream": 4, "sender": "node2", "dst": "127.0.0.1", "rate_mbps": rates[3], "duration_s": dur_s},
+        {"stream": 5, "sender": "local", "dst": "node3", "rate_mbps": rates[4], "duration_s": dur_s},
+        {"stream": 6, "sender": "local", "dst": "node4", "rate_mbps": rates[5], "duration_s": dur_short},
+    ],
+}
+src = sum(rates)
+meta["aggregate_source_mbps"] = src
+meta["aggregate_wire_udp_mbps"] = src * meta["app_expansion"]
+meta["aggregate_wire_ip_mbps"] = src * meta["ip_expansion"]
+out.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+print(
+    "  wire accounting: codec=%s shard×%.2f app×%.3f → Σsource=%.3g Mbps ≈ Σwire_udp=%.3g Mbps"
+    % (codec, meta["shard_expansion"], meta["app_expansion"], src, meta["aggregate_wire_udp_mbps"])
+)
+PY
+
 echo "== preparing payloads =="
 echo "$stream_defs" | while read -r sid sender rate dur label outkey dst; do
     [ -n "${sid:-}" ] || continue
@@ -594,6 +640,15 @@ total=$(awk -F, 'NF{c++} END{print c+0}' "$tmp_rows")
     echo "- Codec: $codec"
     echo "- Rate default: ${rate_mbps} Mbps (per-stream: $rate_s1/$rate_s2/$rate_s3/$rate_s4/$rate_s5/$rate_s6)"
     echo "- Duration: ${dur_s}s (stream6: ${dur_short_s}s)"
+    if [ -f "$result_dir/meta.json" ]; then
+        python3 - "$result_dir/meta.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+print(f"- Wire datagram: {m['datagram_app_bytes']} B UDP payload ({m['wire_header_size']}+{m['pkg_size']}); ~{m['datagram_ip_bytes']} B IPv4+UDP")
+print(f"- Expansion (`{m['codec']}`): shard ×{m['shard_expansion']:.3f}, app ×{m['app_expansion']:.3f}, IP ×{m['ip_expansion']:.3f}")
+print(f"- Aggregate: source {m['aggregate_source_mbps']:g} Mbps → est. wire UDP {m['aggregate_wire_udp_mbps']:.3f} Mbps (IP {m['aggregate_wire_ip_mbps']:.3f} Mbps)")
+PY
+    fi
     echo "- UDP port: $port (Node2 loopback: $loop_port)"
     echo "- Barrier START_AT: $start_at"
     echo "- Input seed: $input_path"
