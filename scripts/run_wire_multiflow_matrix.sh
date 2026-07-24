@@ -146,6 +146,46 @@ flow_csv_field() {
     ' "$file"
 }
 
+# output= path may contain no spaces; take that field.
+flow_output_path() {
+    flow_id=$1
+    file=$2
+    awk -v fid="$flow_id" '
+        $1 == "udp-recv:" && $2 == "flow" && $3 == fid {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^output=/) {
+                    sub(/^output=/, "", $i)
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' "$file"
+}
+
+# Hash a specific remote file (cd into repo first — logs often use relative paths).
+remote_sha256() {
+    path=$1
+    case "$path" in
+        /*) ssh $ssh_opts "$receiver_ssh" "sha256sum -- '$path' 2>/dev/null | awk '{print \$1}'" ;;
+        *)  ssh $ssh_opts "$receiver_ssh" "cd '$remote_repo' && sha256sum -- '$path' 2>/dev/null | awk '{print \$1}'" ;;
+    esac
+}
+
+# Find remote output whose sha256 matches; print path on success.
+remote_match_hash() {
+    want_hash=$1
+    prefix=$2
+    ssh $ssh_opts "$receiver_ssh" \
+        "for f in ${prefix}*; do
+           [ -f \"\$f\" ] || continue
+           h=\$(sha256sum -- \"\$f\" 2>/dev/null | awk '{print \$1}')
+           [ -n \"\$h\" ] || continue
+           if [ \"\$h\" = '$want_hash' ]; then echo \"\$f\"; exit 0; fi
+         done
+         exit 1"
+}
+
 latency_field() {
     metric=$1
     key=$2
@@ -250,19 +290,6 @@ match_hash_in_dir() {
         fi
     done
     return 1
-}
-
-# Find remote output whose sha256 matches; print path on success.
-remote_match_hash() {
-    want_hash=$1
-    prefix=$2
-    ssh $ssh_opts "$receiver_ssh" \
-        "for f in ${prefix}*; do
-           [ -f \"\$f\" ] || continue
-           h=\$(sha256sum \"\$f\" | awk '{print \$1}')
-           if [ \"\$h\" = '$want_hash' ]; then echo \"\$f\"; exit 0; fi
-         done
-         exit 1" 2>/dev/null
 }
 
 eta_seconds() {
@@ -483,7 +510,28 @@ for codec in $codecs; do
             fail_reason=no_match
             log_fid=$fid
 
-            remote_hit=$(remote_match_hash "$want_hash" "$remote_prefix" || true)
+            remote_hit=
+            remote_hash=NA
+            # Prefer the exact path from the receiver log (relative to remote_repo).
+            log_out=$(flow_output_path "$fid" "$receiver_log")
+            if [ -n "$log_out" ] && [ "$log_out" != "NA" ]; then
+                remote_hash=$(remote_sha256 "$log_out" || true)
+                if [ -n "$remote_hash" ] && [ "$remote_hash" = "$want_hash" ]; then
+                    remote_hit=$log_out
+                fi
+            fi
+            # Fallback: scan prefix glob (absolute paths under remote_base).
+            if [ -z "$remote_hit" ]; then
+                remote_hit=$(remote_match_hash "$want_hash" "$remote_prefix" || true)
+                if [ -n "$remote_hit" ]; then
+                    remote_hash=$want_hash
+                elif [ -n "$log_out" ] && [ "$log_out" != "NA" ] &&
+                    { [ -z "$remote_hash" ] || [ "$remote_hash" = "NA" ]; }; then
+                    remote_hash=$(remote_sha256 "$log_out" || true)
+                    [ -n "$remote_hash" ] || remote_hash=NA
+                fi
+            fi
+
             if [ -n "$remote_hit" ]; then
                 flow_status=PASS
                 hash_match=yes
@@ -493,10 +541,12 @@ for codec in $codecs; do
                 log_fid=$(printf '%s\n' "$remote_hit" | sed -n 's/.*_flow_\([0-9][0-9]*\)\..*/\1/p')
                 [ -n "$log_fid" ] || log_fid=$fid
             else
-                # Help diagnose: compare remote output_bytes vs payload.
                 out_bytes_guess=$(flow_csv_field "$fid" output_bytes "$receiver_log")
                 if [ "$out_bytes_guess" != "NA" ] && [ "$out_bytes_guess" != "$payload_bytes" ]; then
                     fail_reason="size_mismatch_out=${out_bytes_guess}_want=${payload_bytes}"
+                elif [ "$remote_hash" != "NA" ] && [ -n "$remote_hash" ] &&
+                    [ "$remote_hash" != "$want_hash" ]; then
+                    fail_reason="content_hash_mismatch"
                 else
                     fail_reason="hash_mismatch_or_missing_remote_file"
                 fi
@@ -548,6 +598,8 @@ for codec in $codecs; do
                 echo "  flow $fid -> PASS  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes"
             else
                 echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes  reason=$fail_reason"
+                echo "           local_sha=$want_hash"
+                echo "           remote_sha=$remote_hash  remote_path=${log_out:-NA}"
             fi
             fid=$((fid + 1))
         done
