@@ -125,12 +125,26 @@ cmp input1.ts /tmp/out_multi_src_*_flow_1.ts
 
 Run this script on VM1 after VM1 can use key-based SSH to VM4. It starts a
 fresh receiver on VM4 for every codec/rate pair, verifies the output hash, and
-writes CSV and Markdown tables containing throughput, delay, and jitter
-statistics under `build/wire-matrix-*`.
+writes a lean report under `build/wire-matrix-*`:
+
+- `results.md` — status + est. datagram loss% / late% / drop% / recovered% + key latency
+- `results.csv` — full counters and latency percentiles
+- `logs/` — per-case sender/receiver logs
+- Receiver `.ts` files kept on VM4 under `build/wire-matrix-<ts>-*.ts`
+  (set `KEEP_REMOTE_OUTPUT=0` to delete after hash check)
 
 ```bash
 CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" \
   ./scripts/run_wire_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP input.ts
+```
+
+Optional teaching mode: append a `[WG_DECODE_MARK]` footer after `Codec_decode`
+into the received file (hash will no longer match; status becomes `MARKED`):
+
+```bash
+DECODE_MARK=1 CODECS="copy" RATES="10" \
+  ./scripts/run_wire_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP input.ts
+# On VM4: tail -c 300 build/wire-matrix-*-copy-10m.ts
 ```
 
 Both endpoints must run the same wire protocol version. Synchronize VM1 and

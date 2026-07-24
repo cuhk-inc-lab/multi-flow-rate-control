@@ -23,6 +23,8 @@ typedef struct WireUdpRecvConfig {
     unsigned    idle_sec;
     int         best_effort;
     uint32_t    max_flows;
+    /* Demo/teaching: after Codec_decode path, append a text mark into the output. */
+    int         decode_mark;
 } WireUdpRecvConfig;
 
 typedef struct WireUdpTx {

@@ -203,9 +203,15 @@ Integration handoff details: [docs/INTEGRATION_BOUNDARIES.md](../../docs/INTEGRA
 ```
 ingress (flow_id or 5-tuple)
   → FlowManager (MixedQueue → per-flow queues → optional pacing)
+  → per-flow demux buffer → encode
   → either:
-       A) default: pipe → BlockCodec encode → transfer → decode → output
-       B) --no-codec: DataPacket* queue → FileDrain_write_packet → output
+       A) local --multi: pipe → encode → transfer → decode → file
+       B) --udp-send-multi: packet queue → encode → wire UDP shards
+       C) --no-codec: DataPacket* queue → FileDrain_write_packet → output
 ```
+
+`--udp-send-multi` mirrors local `--multi`: demux before encode, then the same
+per-flow encode step. Only the demux buffer (packet queue vs pipe) and
+post-encode egress (UDP vs local transfer/decode) differ.
 
 BlockCodec is a demo encode/decode transform only — not cryptographic encryption.

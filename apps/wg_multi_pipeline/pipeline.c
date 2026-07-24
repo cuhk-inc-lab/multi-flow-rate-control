@@ -185,13 +185,14 @@ static WgPipelineStatus init_wire_flow_stage(FlowStage *stage, uint32_t flow_id,
     stage->input_path[sizeof(stage->input_path) - 1u] = '\0';
 
     /*
-     * Use a packet queue (same as relay mode) instead of a byte pipe so
-     * paced wire send cannot mis-assemble partial 188-byte reads.
+     * Same architecture as local --multi (demux → per-flow buffer → encode),
+     * but use a packet queue into post_multi_in instead of a byte pipe.
+     * Under pacing, a raw pipe can reassemble across partial 188 B reads and
+     * corrupt codec blocks; packet boundaries keep wire send aligned.
      */
     if (flow_buffer_init(&stage->post_multi_pkts, MF_QUEUE_CAPACITY) != FB_OK) {
         return WG_PIPE_ERR;
     }
-
     if (Buffer_Init(&stage->post_multi_in, BUFFER_BLOCK_COUNT, BUFFER_BLOCK_SIZE,
                     BUFFER_OVERFLOW_POLICY) != CB_OK) {
         flow_buffer_destroy(&stage->post_multi_pkts);
@@ -261,13 +262,12 @@ static WgPipelineStatus process_flow_wire_send(FlowStage *st, const Codec *codec
     size_t input_block_size;
     size_t output_block_size;
     unsigned blocks_this_turn = 0;
-    /* Round-robin fairness across flows: avoid one flow catch-up bursting. */
     /*
-     * Multi-flow fairness: sending too many blocks per flow in one scheduler turn
-     * creates microbursts (N flows * shards per block), which amplifies late/drop
-     * risk on receivers. Keep this conservative.
+     * Same encode step as local process_flow_post_multi, but bound work per
+     * scheduler turn so concurrent flows interleave fairly (local multi also
+     * round-robins flows in the outer loop).
      */
-    const unsigned max_blocks_per_turn = 1u;
+    const unsigned max_blocks_per_turn = 2u;
 
     if (st == NULL || codec == NULL || tx == NULL || work == NULL) {
         return WG_PIPE_ERR;
@@ -396,14 +396,6 @@ static void destroy_flow_stage(FlowStage *stage)
         flow_buffer_shutdown(&stage->post_multi_pkts);
         flow_buffer_destroy(&stage->post_multi_pkts);
         Buffer_Destroy(&stage->post_multi_in);
-        if (stage->pipefd[0] >= 0) {
-            close(stage->pipefd[0]);
-            stage->pipefd[0] = -1;
-        }
-        if (stage->pipefd[1] >= 0) {
-            close(stage->pipefd[1]);
-            stage->pipefd[1] = -1;
-        }
     } else {
         Buffer_Destroy(&stage->post_multi_in);
         Buffer_Destroy(&stage->sending_out);
@@ -658,11 +650,7 @@ static int post_multi_has_space(const FlowStage *st, size_t nbytes)
     if (st == NULL || st->post_multi_in == NULL) {
         return 0;
     }
-    /*
-     * Smaller high-water reduces per-flow queueing latency in multi-flow wire
-     * mode and helps avoid bursty catch-up sends.
-     */
-    high_water = DECODE_BLOCK * 24u;
+    high_water = DECODE_BLOCK * 64u;
     if (st->post_multi_in->size >= high_water) {
         return 0;
     }
@@ -670,7 +658,7 @@ static int post_multi_has_space(const FlowStage *st, size_t nbytes)
 }
 
 /*
- * Move whole packets from the wire ingress queue into post_multi.
+ * Move whole packets from the per-flow demux queue into post_multi.
  * Returns: >=0 bytes, -1 error, -2 backpressure.
  */
 static int drain_pkts_to_post_multi(FlowStage *st)
@@ -1981,7 +1969,7 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     }
 
     fprintf(stderr,
-            "wire-multi-send: %u flows via FlowManager -> wire UDP\n",
+            "wire-multi-send: %u flows via FlowManager (local-multi style) -> wire UDP\n",
             config->flow_count);
 
     for (;;) {

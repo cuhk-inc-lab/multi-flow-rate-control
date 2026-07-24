@@ -166,7 +166,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N] [--decode-mark]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
@@ -402,6 +402,7 @@ int main(int argc, char **argv)
         unsigned idle_sec = 3u;
         unsigned max_flows = 0u;
         int best_effort = 0;
+        int decode_mark = 0;
         char *end = NULL;
         long port;
         const char *output_path;
@@ -432,6 +433,9 @@ int main(int argc, char **argv)
             } else if (strcmp(argv[argi], "--best-effort") == 0) {
                 best_effort = 1;
                 argi++;
+            } else if (strcmp(argv[argi], "--decode-mark") == 0) {
+                decode_mark = 1;
+                argi++;
             } else if (strcmp(argv[argi], "--max-flows") == 0) {
                 if (argi + 1 >= argc) {
                     print_usage(argv[0]);
@@ -455,6 +459,7 @@ int main(int argc, char **argv)
             .idle_sec = idle_sec,
             .best_effort = best_effort,
             .max_flows = max_flows,
+            .decode_mark = decode_mark,
         };
         return wire_udp_recv(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

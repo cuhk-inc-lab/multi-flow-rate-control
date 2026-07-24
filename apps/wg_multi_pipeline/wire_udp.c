@@ -28,6 +28,23 @@
 /* Larger UDP buffers reduce drops under multi-flow microbursts of 232 B datagrams. */
 #define WIRE_UDP_SOCKBUF    (8 * 1024 * 1024)
 
+static const char *wire_codec_kind_name(CodecKind kind)
+{
+    switch (kind) {
+    case CODEC_KIND_BLOCK:
+        return "block";
+    case CODEC_KIND_COPY:
+        return "copy";
+    case CODEC_KIND_XOR_FEC:
+        return "xor-fec";
+    case CODEC_KIND_RS_FEC:
+        return "rs-fec";
+    case CODEC_KIND_NONE:
+    default:
+        return "none";
+    }
+}
+
 static void wire_set_udp_buffers(int sock)
 {
     int buf = WIRE_UDP_SOCKBUF;
@@ -781,6 +798,7 @@ static void latency_stats_print(const LatencyStats *stats)
 
 static int write_decoded_group(WireGroup *group, const Codec *codec,
                                FILE *output, uint64_t *output_bytes,
+                               uint64_t *decoded_blocks,
                                LatencyStats *latency_stats)
 {
     size_t input_size = Codec_input_block_size(codec);
@@ -792,9 +810,21 @@ static int write_decoded_group(WireGroup *group, const Codec *codec,
         group->shard_count * PKG_SIZE != output_size) {
         return -1;
     }
+
+    /*
+     * === DECODE SITE (for teaching / --decode-mark) ===
+     * This is the only place the wire receiver calls Codec_decode().
+     * Encoded shards were reassembled into group->data; Codec_decode()
+     * transforms that buffer back to plaintext in-place. With --decode-mark,
+     * each successful call increments decoded_blocks, and a text footer is
+     * appended once the flow finishes (wire_append_decode_mark).
+     */
     decode_ready_ns = realtime_nanoseconds();
     Codec_decode(codec, group->data, output_size);
     decode_done_ns = realtime_nanoseconds();
+    if (decoded_blocks != NULL) {
+        (*decoded_blocks)++;
+    }
     if (group->timing_valid) {
         latency_stats_add(latency_stats, group->encode_begin_ns,
                           group->encode_end_ns, decode_ready_ns, decode_done_ns);
@@ -810,6 +840,7 @@ static int write_decoded_group(WireGroup *group, const Codec *codec,
 static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
                                     uint64_t *next_block, const Codec *codec,
                                     FILE *output, uint64_t *output_bytes,
+                                    uint64_t *decoded_blocks,
                                     uint64_t *recovered_groups,
                                     LatencyStats *latency_stats)
 {
@@ -826,7 +857,7 @@ static int flush_recoverable_groups(WireGroup groups[WIRE_GROUP_WINDOW],
             return 0;
         }
         if (write_decoded_group(group, codec, output, output_bytes,
-                                latency_stats) != 0) {
+                                decoded_blocks, latency_stats) != 0) {
             return -1;
         }
         (*next_block)++;
@@ -895,7 +926,7 @@ static int flush_best_effort_groups(WireGroup groups[WIRE_GROUP_WINDOW],
         }
         if (group_complete(group)) {
             if (write_decoded_group(group, codec, output, output_bytes,
-                                    latency_stats) != 0) {
+                                    NULL, latency_stats) != 0) {
                 return -1;
             }
         } else if (write_best_effort_group(group, codec, output, output_bytes,
@@ -935,8 +966,59 @@ typedef struct WireFlowCtx {
     uint64_t     dropped_groups;
     uint64_t     recovered_groups;
     uint64_t     missing_data_shards;
+    uint64_t     decoded_blocks;
+    int          decode_mark;
+    int          decode_mark_written;
+    const char  *codec_name;
     LatencyStats latency_stats;
 } WireFlowCtx;
+
+/*
+ * Append a human-readable mark proving Codec_decode ran for this flow.
+ * Called after all decoded plaintext has been written.
+ */
+static int wire_append_decode_mark(WireFlowCtx *flow)
+{
+    time_t now;
+    struct tm tm_utc;
+    char timebuf[64];
+    char line[512];
+    int n;
+
+    if (flow == NULL || flow->output == NULL || !flow->decode_mark ||
+        flow->decode_mark_written || flow->decoded_blocks == 0) {
+        return 0;
+    }
+
+    now = time(NULL);
+    if (gmtime_r(&now, &tm_utc) == NULL) {
+        return -1;
+    }
+    if (strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0) {
+        return -1;
+    }
+
+    n = snprintf(line, sizeof(line),
+                 "\n[WG_DECODE_MARK] decoded=yes time_utc=%s codec=%s "
+                 "decoded_blocks=%llu flow_id=%u "
+                 "note=this_file_passed_Codec_decode_on_receiver\n",
+                 timebuf,
+                 flow->codec_name != NULL ? flow->codec_name : "unknown",
+                 (unsigned long long)flow->decoded_blocks,
+                 flow->key.flow_id);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        return -1;
+    }
+    if (fwrite(line, 1, (size_t)n, flow->output) != (size_t)n) {
+        return -1;
+    }
+    flow->output_bytes += (uint64_t)n;
+    flow->decode_mark_written = 1;
+    fprintf(stderr,
+            "udp-recv: decode-mark appended to %s (decoded_blocks=%llu time=%s)\n",
+            flow->output_path, (unsigned long long)flow->decoded_blocks, timebuf);
+    return 0;
+}
 
 static int wire_flow_key_equal(const WireFlowKey *left, const WireFlowKey *right)
 {
@@ -1032,7 +1114,8 @@ static WireFlowCtx *wire_flow_find(WireFlowCtx flows[], size_t max_flows,
 
 static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
                                     const WireFlowKey *key,
-                                    const char *output_path)
+                                    const char *output_path,
+                                    int decode_mark, const char *codec_name)
 {
     size_t index;
 
@@ -1041,6 +1124,8 @@ static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
             memset(&flows[index], 0, sizeof(flows[index]));
             flows[index].active = true;
             flows[index].key = *key;
+            flows[index].decode_mark = decode_mark;
+            flows[index].codec_name = codec_name;
             if (output_path != NULL) {
                 strncpy(flows[index].output_path, output_path,
                         sizeof(flows[index].output_path) - 1u);
@@ -1150,6 +1235,7 @@ static int wire_flow_process_datagram(WireFlowCtx *flow, const WireHeader *heade
 
     if (flush_recoverable_groups(flow->groups, &flow->next_block, codec,
                                  flow->output, &flow->output_bytes,
+                                 &flow->decoded_blocks,
                                  &flow->recovered_groups,
                                  &flow->latency_stats) != 0) {
         return -1;
@@ -1242,16 +1328,19 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         WireFlowKey  key = {0};
         WireFlowCtx *flow;
 
-        flow = wire_flow_alloc(flows, 1, &key, config->output_path);
+        flow = wire_flow_alloc(flows, 1, &key, config->output_path,
+                               config->decode_mark,
+                               wire_codec_kind_name(config->codec_kind));
         if (flow == NULL) {
             goto cleanup;
         }
     }
 
     fprintf(stderr,
-            "udp-recv: listening on UDP port %u (max_flows=%zu%s)\n",
+            "udp-recv: listening on UDP port %u (max_flows=%zu%s%s)\n",
             (unsigned)config->port, max_flows,
-            multi_mode ? ", prefix mode" : "");
+            multi_mode ? ", prefix mode" : "",
+            config->decode_mark ? ", decode-mark" : "");
 
     last_receive = monotonic_seconds();
     for (;;) {
@@ -1361,7 +1450,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                                                 sizeof(path)) != 0) {
                         continue;
                     }
-                    flow = wire_flow_alloc(flows, max_flows, &key, path);
+                    flow = wire_flow_alloc(flows, max_flows, &key, path,
+                                           config->decode_mark,
+                                           wire_codec_kind_name(config->codec_kind));
                     if (flow == NULL) {
                         fprintf(stderr,
                                 "udp-recv: flow table full, dropping mapped_flow=%u wire_flow=%u\n",
@@ -1418,11 +1509,20 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             result = -1;
             continue;
         }
+        if (wire_append_decode_mark(flow) != 0) {
+            result = -1;
+            continue;
+        }
+        if (flow->output != NULL && fflush(flow->output) != 0) {
+            result = -1;
+            continue;
+        }
         fprintf(stderr,
                 "udp-recv: flow %u output=%s output_bytes=%llu datagrams=%llu "
                 "seen_datagrams=%llu "
                 "duplicates=%llu late=%llu malformed=%llu recovered_groups=%llu "
-                "dropped_groups=%llu missing_data_shards=%llu\n",
+                "dropped_groups=%llu missing_data_shards=%llu decoded_blocks=%llu "
+                "decode_mark=%s\n",
                 flow->key.flow_id, flow->output_path,
                 (unsigned long long)flow->output_bytes,
                 (unsigned long long)flow->received_datagrams,
@@ -1432,7 +1532,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                 (unsigned long long)flow->malformed_datagrams,
                 (unsigned long long)flow->recovered_groups,
                 (unsigned long long)flow->dropped_groups,
-                (unsigned long long)flow->missing_data_shards);
+                (unsigned long long)flow->missing_data_shards,
+                (unsigned long long)flow->decoded_blocks,
+                flow->decode_mark_written ? "yes" : "no");
         latency_stats_print(&flow->latency_stats);
     }
 
