@@ -130,7 +130,33 @@ with open(src, "rb") as f, open(out, "wb") as g:
 PY
 }
 
-# Per-flow field from "udp-recv: flow N ... key=value"
+# Receiver demux assigns peer_map ids by first-seen 5-tuple order, which may
+# NOT equal the sender --flow id. Open lines look like:
+#   udp-recv: opened flow <mapped> (wire flow <sender_id>) -> <path>
+# Resolve sender wire id → mapped log id used in later "udp-recv: flow N ..." lines.
+wire_to_log_fid() {
+    wire_fid=$1
+    file=$2
+    mapped=$(awk -v wid="$wire_fid" '
+        $1 == "udp-recv:" && $2 == "opened" && $3 == "flow" &&
+        $5 == "(wire" && $6 == "flow" {
+            w = $7
+            sub(/\)/, "", w)
+            if (w == wid) {
+                print $4
+                exit
+            }
+        }
+    ' "$file")
+    # Fallback: old logs / missing open line — assume ids match.
+    if [ -n "$mapped" ]; then
+        printf '%s\n' "$mapped"
+    else
+        printf '%s\n' "$wire_fid"
+    fi
+}
+
+# Per-flow field from "udp-recv: flow N ... key=value" (N = mapped log id)
 flow_csv_field() {
     flow_id=$1
     key=$2
@@ -146,7 +172,7 @@ flow_csv_field() {
     ' "$file"
 }
 
-# output= path may contain no spaces; take that field.
+# output= path may contain no spaces; take that field. flow_id = mapped log id.
 flow_output_path() {
     flow_id=$1
     file=$2
@@ -508,12 +534,13 @@ for codec in $codecs; do
             hash_match=no
             matched=NA
             fail_reason=no_match
-            log_fid=$fid
+            # Sender --flow id → receiver peer_map / log id (may differ).
+            log_fid=$(wire_to_log_fid "$fid" "$receiver_log")
 
             remote_hit=
             remote_hash=NA
             # Prefer the exact path from the receiver log (relative to remote_repo).
-            log_out=$(flow_output_path "$fid" "$receiver_log")
+            log_out=$(flow_output_path "$log_fid" "$receiver_log")
             if [ -n "$log_out" ] && [ "$log_out" != "NA" ]; then
                 remote_hash=$(remote_sha256 "$log_out" || true)
                 if [ -n "$remote_hash" ] && [ "$remote_hash" = "$want_hash" ]; then
@@ -538,10 +565,8 @@ for codec in $codecs; do
                 matched=$remote_hit
                 flows_pass=$((flows_pass + 1))
                 fail_reason=
-                log_fid=$(printf '%s\n' "$remote_hit" | sed -n 's/.*_flow_\([0-9][0-9]*\)\..*/\1/p')
-                [ -n "$log_fid" ] || log_fid=$fid
             else
-                out_bytes_guess=$(flow_csv_field "$fid" output_bytes "$receiver_log")
+                out_bytes_guess=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
                 if [ "$out_bytes_guess" != "NA" ] && [ "$out_bytes_guess" != "$payload_bytes" ]; then
                     fail_reason="size_mismatch_out=${out_bytes_guess}_want=${payload_bytes}"
                 elif [ "$remote_hash" != "NA" ] && [ -n "$remote_hash" ] &&
@@ -598,7 +623,7 @@ for codec in $codecs; do
                 echo "  flow $fid -> PASS  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes"
             else
                 echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes  reason=$fail_reason"
-                echo "           local_sha=$want_hash"
+                echo "           wire_id=$fid log_id=$log_fid local_sha=$want_hash"
                 echo "           remote_sha=$remote_hash  remote_path=${log_out:-NA}"
             fi
             fid=$((fid + 1))
