@@ -2,6 +2,7 @@
 #define WG_PIPELINE_H
 
 #include "codec.h"
+#include "flow_peer_map.h"
 
 #include <stdint.h>
 
@@ -38,6 +39,9 @@ typedef struct WgWireFlowPath {
     const char *host;
     uint16_t    port;
     double      source_rate_mbps;
+    /* When set, file ingress uses flow_peer_map + ingress_push_tuple. */
+    int         use_tuple;
+    FlowTuple   tuple;
 } WgWireFlowPath;
 
 typedef struct WgWireMultiSendConfig {
@@ -45,6 +49,8 @@ typedef struct WgWireMultiSendConfig {
     uint32_t              flow_count;
     int                   pacing_enabled;
     CodecKind             codec_kind;
+    /* Shared map for tuple-mode flows; NULL when no flow uses a fake 5-tuple. */
+    FlowPeerMap          *peer_map;
 } WgWireMultiSendConfig;
 
 WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config);

@@ -67,6 +67,9 @@ typedef struct FlowStage {
     bool                wire_send_mode;
     bool                wire_tail_sent;
     bool                wire_end_sent;
+    /* Optional fake ingress 5-tuple (file + tuple → flow_id). */
+    const FlowTuple    *ingress_tuple;
+    FlowPeerMap        *peer_map;
 } FlowStage;
 
 static int buffer_has_space(CircularBuffer *buf, size_t need);
@@ -168,15 +171,22 @@ static WgPipelineStatus init_flow_stage(FlowStage *stage, const WgFlowPath *path
 }
 
 static WgPipelineStatus init_wire_flow_stage(FlowStage *stage, uint32_t flow_id,
-                                             const char *input_path)
+                                             const char *input_path,
+                                             const FlowTuple *ingress_tuple,
+                                             FlowPeerMap *peer_map)
 {
     if (stage == NULL || input_path == NULL) {
+        return WG_PIPE_ERR;
+    }
+    if ((ingress_tuple != NULL) != (peer_map != NULL)) {
         return WG_PIPE_ERR;
     }
 
     memset(stage, 0, sizeof(*stage));
     stage->flow_id = flow_id;
     stage->wire_send_mode = true;
+    stage->ingress_tuple = ingress_tuple;
+    stage->peer_map = peer_map;
     atomic_init(&stage->packets_pushed, 0);
     atomic_init(&stage->last_recv_ns, 0);
     stage->pipefd[0] = -1;
@@ -886,7 +896,15 @@ static int drain_pipe_to_post_multi(FlowStage *st)
 static WgPipelineStatus push_ingress_packet(FlowStage *st, FlowManager *mgr,
                                             const unsigned char *data, size_t len)
 {
-    if (ingress_push(mgr, st->flow_id, data, len) != INGRESS_PUSH_OK) {
+    IngressPushStatus push_st;
+
+    if (st->ingress_tuple != NULL && st->peer_map != NULL) {
+        push_st = ingress_push_tuple(mgr, st->peer_map, st->ingress_tuple,
+                                     data, len);
+    } else {
+        push_st = ingress_push(mgr, st->flow_id, data, len);
+    }
+    if (push_st != INGRESS_PUSH_OK) {
         return WG_PIPE_ERR;
     }
 
@@ -1928,9 +1946,19 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
 
     for (i = 0; i < config->flow_count; i++) {
         const WgWireFlowPath *path = &config->flows[i];
+        const FlowTuple *tuple = NULL;
+        FlowPeerMap *map = NULL;
 
-        if (init_wire_flow_stage(&stages[i], path->flow_id,
-                                 path->input_path) != WG_PIPE_OK) {
+        if (path->use_tuple) {
+            if (config->peer_map == NULL) {
+                status = WG_PIPE_ERR;
+                goto cleanup;
+            }
+            tuple = &path->tuple;
+            map = config->peer_map;
+        }
+        if (init_wire_flow_stage(&stages[i], path->flow_id, path->input_path,
+                                 tuple, map) != WG_PIPE_OK) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }
@@ -1969,8 +1997,9 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     }
 
     fprintf(stderr,
-            "wire-multi-send: %u flows via FlowManager (local-multi style) -> wire UDP\n",
-            config->flow_count);
+            "wire-multi-send: %u flows via FlowManager (local-multi style) -> wire UDP%s\n",
+            config->flow_count,
+            config->peer_map != NULL ? " [tuple→flow_id]" : "");
 
     for (;;) {
         int progress = 0;

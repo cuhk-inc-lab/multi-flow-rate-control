@@ -147,6 +147,23 @@ DECODE_MARK=1 CODECS="copy" RATES="10" \
 # On VM4: tail -c 300 build/wire-matrix-*-copy-10m.<same-suffix-as-input>
 ```
 
+### Multi-flow Node1 → Node4 matrix
+
+Concurrent flows with explicit `flow_id` (same `--udp-send-multi` path as
+iperf-like, but only Node1→Node4). Writes `results.md` / `results.csv` /
+`flows.csv` under `build/wire-multiflow-*`:
+
+```bash
+# One local file per flow (recommended)
+CODECS="copy xor-fec" RATES="10 20" \
+  ./scripts/run_wire_multiflow_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP \
+    a.bin b.bin c.bin d.bin
+
+# Or synthesize N payloads from one seed
+FLOWS=4 DURATION_S=10 RATES="10 20" \
+  ./scripts/run_wire_multiflow_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP seed.ts
+```
+
 Both endpoints must run the same wire protocol version. Synchronize VM1 and
 VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
 

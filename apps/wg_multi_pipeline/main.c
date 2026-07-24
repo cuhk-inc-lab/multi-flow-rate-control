@@ -1,12 +1,17 @@
 #include "pipeline.h"
 #include "wire_udp.h"
 
+#include "flow_peer_map.h"
+
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 
 static int lock_process_memory(void)
 {
@@ -33,6 +38,49 @@ static int parse_u32_token(const char *text, uint32_t *out)
     return 0;
 }
 
+static int parse_ipv4_endpoint(const char *ip, const char *port_text,
+                               struct sockaddr_in *out)
+{
+    char *end = NULL;
+    long  port;
+
+    if (ip == NULL || port_text == NULL || out == NULL) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip, &out->sin_addr) != 1) {
+        return -1;
+    }
+    port = strtol(port_text, &end, 10);
+    if (end == port_text || *end != '\0' || port <= 0 || port > 65535) {
+        return -1;
+    }
+    out->sin_port = htons((uint16_t)port);
+    return 0;
+}
+
+static int parse_rate_token(const char *rate_text, double *out)
+{
+    char  *end = NULL;
+    double rate;
+
+    if (rate_text == NULL || out == NULL) {
+        return -1;
+    }
+    rate = strtod(rate_text, &end);
+    if (end == rate_text || *end != '\0' || rate <= 0.0) {
+        return -1;
+    }
+    *out = rate;
+    return 0;
+}
+
+/*
+ * Formats:
+ *   [id:]host:port:input[:rate-mbps]
+ *   tuple:src_ip:src_port:dst_ip:dst_port:wire_host:wire_port:input[:rate-mbps]
+ */
 static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
                                 char **host_out, char **input_out,
                                 double default_rate_mbps,
@@ -41,7 +89,7 @@ static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
     char       *copy = NULL;
     char       *save = NULL;
     char       *token;
-    char       *parts[5];
+    char       *parts[8];
     size_t      count = 0;
     uint32_t    parsed_flow_id = 0;
     long        port;
@@ -63,36 +111,76 @@ static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
     memset(path, 0, sizeof(*path));
     path->source_rate_mbps = default_rate_mbps;
 
-    copy = strdup(spec);
-    if (copy == NULL) {
-        return -1;
-    }
+    if (strncmp(spec, "tuple:", 6) == 0) {
+        struct sockaddr_in src;
+        struct sockaddr_in dst;
+        const char        *body = spec + 6;
 
-    for (token = strtok_r(copy, ":", &save);
-         token != NULL && count < (sizeof(parts) / sizeof(parts[0]));
-         token = strtok_r(NULL, ":", &save)) {
-        parts[count++] = token;
-    }
-    if (token != NULL || count < 3 || count > 5) {
-        free(copy);
-        return -1;
-    }
-
-    if ((count == 4 || count == 5) && parse_u32_token(parts[0], &parsed_flow_id) == 0) {
-        explicit_flow_id = 1;
-        path->flow_id = parsed_flow_id;
-        host_text = parts[1];
-        port_text = parts[2];
-        input_text = parts[3];
-        if (count == 5) {
-            rate_text = parts[4];
+        copy = strdup(body);
+        if (copy == NULL) {
+            return -1;
         }
+        for (token = strtok_r(copy, ":", &save);
+             token != NULL && count < (sizeof(parts) / sizeof(parts[0]));
+             token = strtok_r(NULL, ":", &save)) {
+            parts[count++] = token;
+        }
+        if (token != NULL || (count != 7 && count != 8)) {
+            free(copy);
+            return -1;
+        }
+        if (parse_ipv4_endpoint(parts[0], parts[1], &src) != 0 ||
+            parse_ipv4_endpoint(parts[2], parts[3], &dst) != 0) {
+            free(copy);
+            return -1;
+        }
+        if (flow_tuple_set(&path->tuple,
+                           (const struct sockaddr *)&src, sizeof(src),
+                           (const struct sockaddr *)&dst, sizeof(dst),
+                           IPPROTO_UDP) != 0) {
+            free(copy);
+            return -1;
+        }
+        host_text = parts[4];
+        port_text = parts[5];
+        input_text = parts[6];
+        if (count == 8) {
+            rate_text = parts[7];
+        }
+        path->use_tuple = 1;
     } else {
-        host_text = parts[0];
-        port_text = parts[1];
-        input_text = parts[2];
-        if (count == 4) {
-            rate_text = parts[3];
+        copy = strdup(spec);
+        if (copy == NULL) {
+            return -1;
+        }
+
+        for (token = strtok_r(copy, ":", &save);
+             token != NULL && count < 5;
+             token = strtok_r(NULL, ":", &save)) {
+            parts[count++] = token;
+        }
+        if (token != NULL || count < 3 || count > 5) {
+            free(copy);
+            return -1;
+        }
+
+        if ((count == 4 || count == 5) &&
+            parse_u32_token(parts[0], &parsed_flow_id) == 0) {
+            explicit_flow_id = 1;
+            path->flow_id = parsed_flow_id;
+            host_text = parts[1];
+            port_text = parts[2];
+            input_text = parts[3];
+            if (count == 5) {
+                rate_text = parts[4];
+            }
+        } else {
+            host_text = parts[0];
+            port_text = parts[1];
+            input_text = parts[2];
+            if (count == 4) {
+                rate_text = parts[3];
+            }
         }
     }
 
@@ -126,9 +214,7 @@ static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
     path->port = (uint16_t)port;
     path->input_path = *input_out;
     if (rate_text != NULL) {
-        double rate = strtod(rate_text, &end);
-
-        if (end == rate_text || *end != '\0' || rate <= 0.0) {
+        if (parse_rate_token(rate_text, &path->source_rate_mbps) != 0) {
             free(*host_out);
             free(*input_out);
             *host_out = NULL;
@@ -136,7 +222,6 @@ static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
             free(copy);
             return -1;
         }
-        path->source_rate_mbps = rate;
     }
 
     *has_explicit_flow_id = explicit_flow_id;
@@ -144,14 +229,49 @@ static int parse_wire_flow_spec(const char *spec, WgWireFlowPath *path,
     return 0;
 }
 
-static int wire_flow_id_used(const WgWireFlowPath *paths, uint32_t flow_count,
-                             uint32_t flow_id)
+static void format_ipv4_endpoint(const struct sockaddr_storage *addr,
+                                 socklen_t addr_len, char *out, size_t out_len)
 {
-    uint32_t i;
+    char host[INET_ADDRSTRLEN];
+    unsigned port = 0;
 
-    for (i = 0; i < flow_count; i++) {
-        if (paths[i].flow_id == flow_id) {
-            return 1;
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (addr == NULL || addr_len < (socklen_t)sizeof(struct sockaddr_in) ||
+        addr->ss_family != AF_INET) {
+        snprintf(out, out_len, "?");
+        return;
+    }
+    {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)addr;
+
+        if (inet_ntop(AF_INET, &ipv4->sin_addr, host, sizeof(host)) == NULL) {
+            snprintf(out, out_len, "?");
+            return;
+        }
+        port = ntohs(ipv4->sin_port);
+        snprintf(out, out_len, "%s:%u", host, port);
+    }
+}
+
+/* flow_id taken by tuple flows, explicit flows, or autos with index < assigned_upto. */
+static int wire_flow_id_taken(const WgWireFlowPath *paths,
+                              const int *explicit_flags, uint32_t flow_count,
+                              uint32_t assigned_upto, uint32_t self,
+                              uint32_t flow_id)
+{
+    uint32_t j;
+
+    for (j = 0; j < flow_count; j++) {
+        if (j == self) {
+            continue;
+        }
+        if (paths[j].use_tuple || explicit_flags[j] || j < assigned_upto) {
+            if (paths[j].flow_id == flow_id) {
+                return 1;
+            }
         }
     }
     return 0;
@@ -165,7 +285,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]> ...\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:src_ip:src_port:dst_ip:dst_port:host:port:input[:rate-mbps]> ...\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N] [--decode-mark]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
@@ -298,9 +418,13 @@ int main(int argc, char **argv)
         WgWireFlowPath *paths = NULL;
         char          **hosts = NULL;
         char          **inputs = NULL;
+        int            *explicit_flags = NULL;
         uint32_t        flow_count = 0;
         uint32_t        flow_cap = 0;
         uint32_t        next_auto_flow_id = 0;
+        uint32_t        tuple_count = 0;
+        uint32_t        i;
+        FlowPeerMap    *peer_map = NULL;
         WgPipelineStatus status;
 
         if (codec_kind == CODEC_KIND_NONE) {
@@ -325,23 +449,16 @@ int main(int argc, char **argv)
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
-
-            if (has_explicit_flow_id) {
-                if (wire_flow_id_used(paths, flow_count, path.flow_id)) {
-                    fprintf(stderr, "duplicate flow_id in --flow specs: %u\n",
-                            path.flow_id);
-                    free(host);
-                    free(input);
-                    free(paths);
-                    free(hosts);
-                    free(inputs);
-                    return EXIT_FAILURE;
-                }
-            } else {
-                while (wire_flow_id_used(paths, flow_count, next_auto_flow_id)) {
-                    next_auto_flow_id++;
-                }
-                path.flow_id = next_auto_flow_id++;
+            if (path.use_tuple && has_explicit_flow_id) {
+                fprintf(stderr,
+                        "tuple --flow cannot also set an explicit flow_id\n");
+                free(host);
+                free(input);
+                free(paths);
+                free(hosts);
+                free(inputs);
+                free(explicit_flags);
+                return EXIT_FAILURE;
             }
 
             if (flow_count == flow_cap) {
@@ -349,14 +466,19 @@ int main(int argc, char **argv)
                 WgWireFlowPath *new_paths;
                 char          **new_hosts;
                 char          **new_inputs;
+                int            *new_flags;
 
                 new_paths = realloc(paths, (size_t)new_cap * sizeof(*paths));
                 new_hosts = realloc(hosts, (size_t)new_cap * sizeof(*hosts));
                 new_inputs = realloc(inputs, (size_t)new_cap * sizeof(*inputs));
-                if (new_paths == NULL || new_hosts == NULL || new_inputs == NULL) {
+                new_flags = realloc(explicit_flags,
+                                    (size_t)new_cap * sizeof(*explicit_flags));
+                if (new_paths == NULL || new_hosts == NULL || new_inputs == NULL ||
+                    new_flags == NULL) {
                     free(paths);
                     free(hosts);
                     free(inputs);
+                    free(explicit_flags);
                     free(host);
                     free(input);
                     return EXIT_FAILURE;
@@ -364,19 +486,90 @@ int main(int argc, char **argv)
                 paths = new_paths;
                 hosts = new_hosts;
                 inputs = new_inputs;
+                explicit_flags = new_flags;
                 flow_cap = new_cap;
             }
 
             paths[flow_count] = path;
             hosts[flow_count] = host;
             inputs[flow_count] = input;
+            explicit_flags[flow_count] = has_explicit_flow_id;
+            if (path.use_tuple) {
+                tuple_count++;
+            }
             flow_count++;
             argi += 2;
         }
 
         if (flow_count == 0) {
             print_usage(argv[0]);
+            free(explicit_flags);
             return EXIT_FAILURE;
+        }
+
+        if (tuple_count > 0) {
+            if (flow_peer_map_init(&peer_map, flow_count) != FPM_OK) {
+                fprintf(stderr, "failed to init flow_peer_map for tuple flows\n");
+                goto multi_fail;
+            }
+            for (i = 0; i < flow_count; i++) {
+                char src_text[64];
+                char dst_text[64];
+                uint32_t mapped;
+
+                if (!paths[i].use_tuple) {
+                    continue;
+                }
+                mapped = flow_peer_map_lookup(peer_map, &paths[i].tuple);
+                if (mapped == (uint32_t)-1) {
+                    fprintf(stderr, "flow_peer_map full or invalid tuple\n");
+                    goto multi_fail;
+                }
+                paths[i].flow_id = mapped;
+                format_ipv4_endpoint(&paths[i].tuple.src, paths[i].tuple.src_len,
+                                     src_text, sizeof(src_text));
+                format_ipv4_endpoint(&paths[i].tuple.dst, paths[i].tuple.dst_len,
+                                     dst_text, sizeof(dst_text));
+                fprintf(stderr,
+                        "wire-multi-send: tuple %s -> %s UDP => flow_id=%u "
+                        "(wire %s:%u %s)\n",
+                        src_text, dst_text, mapped,
+                        paths[i].host, (unsigned)paths[i].port,
+                        paths[i].input_path);
+            }
+        }
+
+        for (i = 0; i < flow_count; i++) {
+            if (paths[i].use_tuple) {
+                continue;
+            }
+            if (explicit_flags[i]) {
+                if (wire_flow_id_taken(paths, explicit_flags, flow_count, i, i,
+                                       paths[i].flow_id)) {
+                    fprintf(stderr, "duplicate flow_id in --flow specs: %u\n",
+                            paths[i].flow_id);
+                    goto multi_fail;
+                }
+            } else {
+                while (wire_flow_id_taken(paths, explicit_flags, flow_count, i, i,
+                                          next_auto_flow_id)) {
+                    next_auto_flow_id++;
+                }
+                paths[i].flow_id = next_auto_flow_id++;
+            }
+        }
+
+        /* Final uniqueness check across all flows (tuple + explicit). */
+        for (i = 0; i < flow_count; i++) {
+            uint32_t j;
+
+            for (j = i + 1; j < flow_count; j++) {
+                if (paths[i].flow_id == paths[j].flow_id) {
+                    fprintf(stderr, "duplicate flow_id after tuple map: %u\n",
+                            paths[i].flow_id);
+                    goto multi_fail;
+                }
+            }
         }
 
         status = wg_pipeline_run_wire_multi_send(
@@ -385,16 +578,31 @@ int main(int argc, char **argv)
                 .flow_count = flow_count,
                 .pacing_enabled = pacing,
                 .codec_kind = codec_kind,
+                .peer_map = peer_map,
             });
-        for (uint32_t i = 0; i < flow_count; i++) {
+        flow_peer_map_destroy(peer_map);
+        for (i = 0; i < flow_count; i++) {
             free(hosts[i]);
             free(inputs[i]);
         }
         free(paths);
         free(hosts);
         free(inputs);
+        free(explicit_flags);
 
         return status == WG_PIPE_OK ? EXIT_SUCCESS : EXIT_FAILURE;
+
+    multi_fail:
+        flow_peer_map_destroy(peer_map);
+        for (i = 0; i < flow_count; i++) {
+            free(hosts[i]);
+            free(inputs[i]);
+        }
+        free(paths);
+        free(hosts);
+        free(inputs);
+        free(explicit_flags);
+        return EXIT_FAILURE;
     }
 
     if (argi < argc && strcmp(argv[argi], "--udp-recv") == 0) {

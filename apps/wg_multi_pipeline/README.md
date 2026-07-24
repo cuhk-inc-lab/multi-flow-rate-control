@@ -128,9 +128,14 @@ process per VM.
 Sender uses `--udp-send-multi` + repeated `--flow` specs, receiver uses
 `--udp-recv <port> <out_prefix> --max-flows N`.
 
-`--flow` spec format:
+`--flow` spec formats:
 
-`<flow_id>:<receiver_ip>:<port>:<input_path>[:rate_mbps]`
+- Explicit id (iperf-like): `<flow_id>:<receiver_ip>:<port>:<input_path>[:rate_mbps]`
+- Fake upstream 5-tuple → `flow_id` via `flow_peer_map`, then wire to receiver:
+
+```text
+tuple:<src_ip>:<src_port>:<dst_ip>:<dst_port>:<wire_host>:<wire_port>:<input>[:rate]
+```
 
 Example: 2 flows (Node1 -> Node4) with `copy` codec.
 
@@ -141,7 +146,7 @@ Node4 (receiver):
   --udp-recv 9000 /tmp/out_multi_ --idle-sec 5 --max-flows 2
 ```
 
-Node1 (sender):
+Node1 (sender, explicit flow ids):
 
 ```bash
 ./build/wg_multi_pipeline --codec copy --udp-send-multi \
@@ -149,6 +154,16 @@ Node1 (sender):
   --flow "1:10.10.34.2:9000:input1.ts:32"
 ```
 
+Node1 (sender, file + fake 5-tuple → flow_id, then same wire path):
+
+```bash
+./build/wg_multi_pipeline --codec copy --udp-send-multi \
+  --flow "tuple:10.0.0.1:4001:10.10.12.1:5000:10.10.34.2:9000:input0.ts:32" \
+  --flow "tuple:10.0.0.1:4002:10.10.12.1:5000:10.10.34.2:9000:input1.ts:32"
+```
+
+Stderr prints `tuple … => flow_id=N`. File chunks use `ingress_push_tuple` (same API as `--udp`).
+The tuple is only the simulated ingress key; `wire_host:wire_port` is the real next hop.
 Output file naming (receiver writes one file per flow):
 
 `{out_prefix}src_<sender_ip>_p<sender_port>_flow_<flow_id>.ts`
@@ -167,14 +182,22 @@ Step-by-step demos (offline + FIFO live): [docs/DEMOS.md](../../docs/DEMOS.md).
 
 ### File demo (current)
 
-Files mock wg-obfs upstream with a **fixed `flow_id` per path**:
+Files can mock upstream in two ways:
+
+1. **Fixed `flow_id`** (explicit `--flow "id:host:port:file"`):
 
 ```c
 ingress_push(mgr, flow_id, data, len);
 ```
 
-This skips 5-tuple lookup but exercises the same FlowManager → encode → decode path.
+2. **Fake 5-tuple → `flow_id`** (`--flow "tuple:src:sport:dst:dport:wire_host:wire_port:file"`):
 
+```c
+flow_tuple_set(&tuple, src, ..., dst, ..., IPPROTO_UDP);
+ingress_push_tuple(mgr, peer_map, &tuple, data, len);
+```
+
+Both then share the same FlowManager → encode → wire path.
 ### UDP demo
 
 Routing key is the **full UDP 5-tuple** `(src, dst, protocol)`, not `flow_id`.
