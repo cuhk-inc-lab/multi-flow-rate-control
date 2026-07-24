@@ -130,8 +130,8 @@ writes a lean report under `build/wire-matrix-*`:
 - `results.md` — status + est. datagram loss% / late% / drop% / recovered% + key latency
 - `results.csv` — full counters and latency percentiles
 - `logs/` — per-case sender/receiver logs
-- Receiver `.ts` files kept on VM4 under `build/wire-matrix-<ts>-*.ts`
-  (set `KEEP_REMOTE_OUTPUT=0` to delete after hash check)
+- Receiver files kept on VM4 under `build/wire-matrix-<ts>-*<input-suffix>`
+  (same suffix as the input file; set `KEEP_REMOTE_OUTPUT=0` to delete after hash check)
 
 ```bash
 CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" \
@@ -144,7 +144,7 @@ into the received file (hash will no longer match; status becomes `MARKED`):
 ```bash
 DECODE_MARK=1 CODECS="copy" RATES="10" \
   ./scripts/run_wire_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP input.ts
-# On VM4: tail -c 300 build/wire-matrix-*-copy-10m.ts
+# On VM4: tail -c 300 build/wire-matrix-*-copy-10m.<same-suffix-as-input>
 ```
 
 Both endpoints must run the same wire protocol version. Synchronize VM1 and

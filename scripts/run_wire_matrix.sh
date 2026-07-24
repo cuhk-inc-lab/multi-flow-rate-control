@@ -31,8 +31,9 @@ usage() {
     echo "Usage: $0 RECEIVER_SSH RECEIVER_DATA_IP INPUT_FILE" >&2
     echo "Example: $0 fyp1@10.10.10.164 10.10.34.2 input-128m.ts" >&2
     echo "Set CODECS, RATES, RECEIVER_REPO, IDLE_SEC, PORT_BASE, RESULT_DIR," >&2
-    echo "KEEP_REMOTE_OUTPUT=0 to delete receiver .ts after hash check," >&2
+    echo "KEEP_REMOTE_OUTPUT=0 to delete receiver output after hash check," >&2
     echo "DECODE_MARK=1 to append a decode proof footer into the received file." >&2
+    echo "Receiver output uses the same file suffix as INPUT_FILE." >&2
 }
 
 die() {
@@ -144,6 +145,13 @@ if [ ! -x ./build/wg_multi_pipeline ]; then
     die "build/wg_multi_pipeline is missing; run make wg-demo first"
 fi
 
+# Keep the same suffix as the input (e.g. .txt / .ts); no suffix → no suffix.
+input_base=$(basename -- "$input_path")
+case "$input_base" in
+    *.*) input_ext=".${input_base##*.}" ;;
+    *)   input_ext= ;;
+esac
+
 mkdir -p "$result_dir/logs" || die "cannot create result directory: $result_dir"
 csv="$result_dir/results.csv"
 markdown="$result_dir/results.md"
@@ -172,7 +180,7 @@ ssh $ssh_opts "$receiver_ssh" \
     else
         echo "- Decode-mark: off (set DECODE_MARK=1 to enable)"
     fi
-    echo "- Receiver outputs kept on Node4: \`build/wire-matrix-${timestamp}-<codec>-<rate>m.ts\` (set KEEP_REMOTE_OUTPUT=0 to delete)"
+    echo "- Receiver outputs kept on Node4: \`build/wire-matrix-${timestamp}-<codec>-<rate>m${input_ext}\` (same suffix as input; set KEEP_REMOTE_OUTPUT=0 to delete)"
     echo "- Est. dgram loss % ≈ \`1 - seen_datagrams / (ceil(bytes/752) × shards)\` (late counted as arrived when \`seen_datagrams\` present)"
     echo
     echo "| Codec | Mbps | Status | Mark | Est. loss % | Late % | Drop % | Recovered % | Wire Mbps | E2E p95 µs | Jitter p95 µs |"
@@ -189,7 +197,7 @@ for codec in $codecs; do
     for rate in $rates; do
         port=$((port_base + case_number))
         label="${codec}-${rate}m"
-        remote_output="$remote_repo/build/wire-matrix-$timestamp-$label.ts"
+        remote_output="$remote_repo/build/wire-matrix-$timestamp-$label$input_ext"
         receiver_log="$result_dir/logs/$label-receiver.log"
         sender_log="$result_dir/logs/$label-sender.log"
         receiver_pid=
@@ -300,7 +308,7 @@ done
     echo "- Detailed latency / counters: \`results.csv\`"
     echo "- Raw logs: \`logs/*-sender.log\`, \`logs/*-receiver.log\`"
     if [ "$keep_remote" = "1" ]; then
-        echo "- Receiver files: \`$remote_repo/build/wire-matrix-${timestamp}-*.ts\` on $receiver_ssh"
+        echo "- Receiver files: \`$remote_repo/build/wire-matrix-${timestamp}-*${input_ext}\` on $receiver_ssh"
     fi
 } >> "$markdown"
 
@@ -310,7 +318,7 @@ echo "  Report: $markdown"
 echo "  CSV:    $csv"
 echo "  Logs:   $result_dir/logs/"
 if [ "$keep_remote" = "1" ]; then
-    echo "  Remote: $receiver_ssh:$remote_repo/build/wire-matrix-${timestamp}-*.ts"
+    echo "  Remote: $receiver_ssh:$remote_repo/build/wire-matrix-${timestamp}-*${input_ext}"
 fi
 echo
 cat "$markdown"
