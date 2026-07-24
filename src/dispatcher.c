@@ -101,6 +101,20 @@ static int route_packet(FlowManager *mgr, DataPacket *pkt)
     }
 
     flow = &mgr->flows[flow_id];
+
+    /*
+     * If this flow already has deferred packets, new ones must append there.
+     * Otherwise a slot freed by the worker can admit a later mixed-queue
+     * packet ahead of an earlier deferred one (reorder → corrupt payload).
+     */
+    if (atomic_load(&mgr->deferred[flow_id].count) > 0) {
+        if (!deferred_push(&mgr->deferred[flow_id], pkt)) {
+            mgr->route_errors++;
+            packet_free(pkt);
+        }
+        return 1;
+    }
+
     fb_st = flow_buffer_try_enqueue(&flow->queue, &pkt);
     if (fb_st == FB_OK) {
         flow_metrics_record_enqueue(&flow->metrics, bytes);

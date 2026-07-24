@@ -67,6 +67,7 @@ typedef struct FlowStage {
     bool                wire_send_mode;
     bool                wire_tail_sent;
     bool                wire_end_sent;
+    DataPacket         *post_multi_held;
     /* Optional fake ingress 5-tuple (file + tuple → flow_id). */
     const FlowTuple    *ingress_tuple;
     FlowPeerMap        *peer_map;
@@ -77,6 +78,7 @@ static int flow_packets_delivered(const FlowStage *st, const FlowManager *mgr);
 static int flow_pipe_bytes_caught_up(const FlowStage *st, const FlowManager *mgr);
 static int drain_pipe_to_post_multi(FlowStage *st);
 static int drain_pkts_to_post_multi(FlowStage *st);
+
 
 static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
                                             unsigned char *work, int *progress)
@@ -185,6 +187,7 @@ static WgPipelineStatus init_wire_flow_stage(FlowStage *stage, uint32_t flow_id,
     memset(stage, 0, sizeof(*stage));
     stage->flow_id = flow_id;
     stage->wire_send_mode = true;
+    stage->post_multi_held = NULL;
     stage->ingress_tuple = ingress_tuple;
     stage->peer_map = peer_map;
     atomic_init(&stage->packets_pushed, 0);
@@ -342,6 +345,7 @@ static int wire_flow_stage_quiescent(const FlowStage *st, const FlowManager *mgr
 
     return st->segment_input_drained &&
            st->pipe_partial_len == 0 &&
+           st->post_multi_held == NULL &&
            flow_buffer_is_empty(&st->post_multi_pkts) &&
            Buffer_IsEmpty(st->post_multi_in) &&
            (st->wire_tail_sent || st->post_multi_in->size == 0) &&
@@ -403,6 +407,10 @@ static void destroy_flow_stage(FlowStage *stage)
         flow_buffer_shutdown(&stage->post_multi_pkts);
         flow_buffer_destroy(&stage->post_multi_pkts);
     } else if (stage->wire_send_mode) {
+        if (stage->post_multi_held != NULL) {
+            packet_free(stage->post_multi_held);
+            stage->post_multi_held = NULL;
+        }
         flow_buffer_shutdown(&stage->post_multi_pkts);
         flow_buffer_destroy(&stage->post_multi_pkts);
         Buffer_Destroy(&stage->post_multi_in);
@@ -661,7 +669,7 @@ static int post_multi_has_space(const FlowStage *st, size_t nbytes)
         return 0;
     }
     high_water = DECODE_BLOCK * 64u;
-    if (st->post_multi_in->size >= high_water) {
+    if (st->post_multi_in->size + nbytes > high_water) {
         return 0;
     }
     return st->post_multi_in->capacity - st->post_multi_in->size >= nbytes;
@@ -690,12 +698,17 @@ static int drain_pkts_to_post_multi(FlowStage *st)
             break;
         }
 
-        fb_st = flow_buffer_try_dequeue(&st->post_multi_pkts, &pkt);
-        if (fb_st == FB_ERR_EMPTY) {
-            break;
-        }
-        if (fb_st != FB_OK || pkt == NULL) {
-            return -1;
+        if (st->post_multi_held != NULL) {
+            pkt = st->post_multi_held;
+            st->post_multi_held = NULL;
+        } else {
+            fb_st = flow_buffer_try_dequeue(&st->post_multi_pkts, &pkt);
+            if (fb_st == FB_ERR_EMPTY) {
+                break;
+            }
+            if (fb_st != FB_OK || pkt == NULL) {
+                return -1;
+            }
         }
 
         len = pkt->payload_len;
@@ -703,22 +716,19 @@ static int drain_pkts_to_post_multi(FlowStage *st)
             packet_free(pkt);
             continue;
         }
-        if (pkt->payload == NULL || len > PKG_SIZE ||
-            !post_multi_has_space(st, len)) {
-            /* Put back is not supported; treat as backpressure by re-queue. */
-            if (flow_buffer_enqueue(&st->post_multi_pkts, &pkt) != FB_OK) {
-                packet_free(pkt);
-                return -1;
-            }
+        if (pkt->payload == NULL || len > PKG_SIZE) {
+            packet_free(pkt);
+            return -1;
+        }
+        if (!post_multi_has_space(st, len)) {
+            /* Preserve order: never re-enqueue to the tail after dequeue. */
+            st->post_multi_held = pkt;
             blocked = 1;
             break;
         }
 
         if (Buffer_Write(st->post_multi_in, pkt->payload, len) != CB_OK) {
-            if (flow_buffer_enqueue(&st->post_multi_pkts, &pkt) != FB_OK) {
-                packet_free(pkt);
-                return -1;
-            }
+            st->post_multi_held = pkt;
             blocked = 1;
             break;
         }
