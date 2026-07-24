@@ -252,6 +252,36 @@ match_hash_in_dir() {
     return 1
 }
 
+# Find remote output whose sha256 matches; print path on success.
+remote_match_hash() {
+    want_hash=$1
+    prefix=$2
+    ssh $ssh_opts "$receiver_ssh" \
+        "for f in ${prefix}*; do
+           [ -f \"\$f\" ] || continue
+           h=\$(sha256sum \"\$f\" | awk '{print \$1}')
+           if [ \"\$h\" = '$want_hash' ]; then echo \"\$f\"; exit 0; fi
+         done
+         exit 1" 2>/dev/null
+}
+
+eta_seconds() {
+    # rough paced send time for largest payload at given Mbps
+    python3 - "$1" "$2" <<'PY'
+import sys
+try:
+    nbytes = int(sys.argv[1])
+    mbps = float(sys.argv[2])
+except ValueError:
+    print(60)
+    raise SystemExit
+if mbps <= 0:
+    print(60)
+else:
+    print(max(15, int(nbytes * 8 / (mbps * 1e6) + 20)))
+PY
+}
+
 if [ -z "$receiver_ssh" ] || [ -z "$receiver_ip" ] || [ "$input_count" -lt 1 ]; then
     usage
     exit 2
@@ -357,6 +387,7 @@ for codec in $codecs; do
         flow_args=
         fid=0
         nbytes_ref=NA
+        max_payload=0
         while [ "$fid" -lt "$flows" ]; do
             pout="$payload_dir/flow${fid}.bin"
             if [ "$user_files" -eq 1 ]; then
@@ -368,13 +399,32 @@ for codec in $codecs; do
                 gen_payload "$seed_path" "$pout" "$nbytes" "${label}-flow${fid}"
             fi
             sha256sum "$pout" > "$payload_dir/flow${fid}.sha256"
+            fbytes=$(wc -c < "$pout" | tr -d ' ')
             if [ "$nbytes_ref" = "NA" ]; then
-                nbytes_ref=$(wc -c < "$pout" | tr -d ' ')
+                nbytes_ref=$fbytes
             fi
+            if [ "$fbytes" -gt "$max_payload" ]; then
+                max_payload=$fbytes
+            fi
+            if [ "$user_files" -eq 1 ]; then
+                srcname=$(basename -- "$(sed -n "$((fid + 1))p" "$input_list")")
+            else
+                srcname=synthesized
+            fi
+            echo "  payload flow $fid: $fbytes bytes ($srcname)"
             flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${pout}:${rate}"
             fid=$((fid + 1))
         done
         nbytes=$nbytes_ref
+
+        # Idle must outlast the paced send of the largest flow, else recv exits early.
+        case_idle=$idle_sec
+        need_idle=$(eta_seconds "$max_payload" "$rate")
+        if [ "$need_idle" -gt "$case_idle" ]; then
+            case_idle=$need_idle
+        fi
+        echo "  idle-sec=$case_idle (auto from largest payload @ ${rate}Mbps; override with IDLE_SEC)"
+        echo "  sending (may take ~${need_idle}s for largest flow at ${rate}Mbps)..."
 
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && rm -rf '$remote_base' && mkdir -p '$remote_base'" \
@@ -383,7 +433,7 @@ for codec in $codecs; do
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
-              --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$idle_sec'" \
+              --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle'" \
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1
@@ -401,17 +451,21 @@ for codec in $codecs; do
             if ./build/wg_multi_pipeline $pace_opt --codec "$codec" --udp-send-multi \
                 $flow_args > "$sender_log" 2>&1; then
                 sender_rc=0
+                echo "  sender done (rc=0)"
+            else
+                sender_rc=$?
+                echo "  sender failed (rc=$sender_rc); see $sender_log" >&2
             fi
+            echo "  waiting for receiver idle/exit..."
             if wait "$receiver_pid"; then
                 receiver_rc=0
+            else
+                receiver_rc=$?
             fi
+            echo "  receiver done (rc=$receiver_rc)"
         fi
 
-        if [ "$fetch_out" = "1" ]; then
-            # shellcheck disable=SC2086
-            scp $ssh_opts "$receiver_ssh:$remote_prefix*" "$case_dir/" >/dev/null 2>&1 || true
-        fi
-
+        # Validate on Node4 by sha256 first (scp of large files is unreliable for PASS/FAIL).
         loss_sum=0
         loss_n=0
         e2e_sum=0
@@ -426,29 +480,25 @@ for codec in $codecs; do
             flow_status=FAIL
             hash_match=no
             matched=NA
+            fail_reason=no_match
             log_fid=$fid
 
-            if [ "$fetch_out" = "1" ] && matched=$(match_hash_in_dir "$want_hash" "$case_dir"); then
+            remote_hit=$(remote_match_hash "$want_hash" "$remote_prefix" || true)
+            if [ -n "$remote_hit" ]; then
                 flow_status=PASS
                 hash_match=yes
+                matched=$remote_hit
                 flows_pass=$((flows_pass + 1))
-                # Receiver log keys use mapped peer-map id embedded in the filename.
-                log_fid=$(printf '%s\n' "$matched" | sed -n 's/.*_flow_\([0-9][0-9]*\)\..*/\1/p')
+                fail_reason=
+                log_fid=$(printf '%s\n' "$remote_hit" | sed -n 's/.*_flow_\([0-9][0-9]*\)\..*/\1/p')
                 [ -n "$log_fid" ] || log_fid=$fid
-            elif [ "$fetch_out" != "1" ]; then
-                remote_hit=$(ssh $ssh_opts "$receiver_ssh" \
-                    "cd '$remote_repo' && for f in ${remote_prefix}*; do
-                       [ -f \"\$f\" ] || continue
-                       h=\$(sha256sum \"\$f\" | awk '{print \$1}')
-                       if [ \"\$h\" = '$want_hash' ]; then echo \"\$f\"; exit 0; fi
-                     done; exit 1" 2>/dev/null || true)
-                if [ -n "$remote_hit" ]; then
-                    flow_status=PASS
-                    hash_match=yes
-                    matched=$remote_hit
-                    flows_pass=$((flows_pass + 1))
-                    log_fid=$(printf '%s\n' "$remote_hit" | sed -n 's/.*_flow_\([0-9][0-9]*\)\..*/\1/p')
-                    [ -n "$log_fid" ] || log_fid=$fid
+            else
+                # Help diagnose: compare remote output_bytes vs payload.
+                out_bytes_guess=$(flow_csv_field "$fid" output_bytes "$receiver_log")
+                if [ "$out_bytes_guess" != "NA" ] && [ "$out_bytes_guess" != "$payload_bytes" ]; then
+                    fail_reason="size_mismatch_out=${out_bytes_guess}_want=${payload_bytes}"
+                else
+                    fail_reason="hash_mismatch_or_missing_remote_file"
                 fi
             fi
 
@@ -494,9 +544,20 @@ for codec in $codecs; do
                     ;;
             esac
 
-            echo "  flow $fid -> $flow_status  loss%=$est_loss  e2e_p95=$e2e_p95"
+            if [ "$flow_status" = "PASS" ]; then
+                echo "  flow $fid -> PASS  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes"
+            else
+                echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes  reason=$fail_reason"
+            fi
             fid=$((fid + 1))
         done
+
+        if [ "$fetch_out" = "1" ]; then
+            echo "  fetching remote outputs (optional; not used for PASS/FAIL)..."
+            # shellcheck disable=SC2086
+            scp $ssh_opts "$receiver_ssh:$remote_prefix*" "$case_dir/" >/dev/null 2>&1 || \
+                echo "  warning: scp fetch failed or partial (large files); remote hash already checked" >&2
+        fi
 
         if [ "$sender_rc" -eq 0 ] && [ "$receiver_rc" -eq 0 ] &&
             [ "$flows_pass" -eq "$flows" ]; then
