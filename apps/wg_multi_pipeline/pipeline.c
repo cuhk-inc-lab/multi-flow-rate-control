@@ -68,6 +68,11 @@ typedef struct FlowStage {
     bool                wire_tail_sent;
     bool                wire_end_sent;
     DataPacket         *post_multi_held;
+    /* Wire-send: order fingerprint across FlowManager (ingress vs drain). */
+    uint64_t            wire_ingress_bytes;
+    uint64_t            wire_ingress_fnv;
+    uint64_t            wire_drain_bytes;
+    uint64_t            wire_drain_fnv;
     /* Optional fake ingress 5-tuple (file + tuple → flow_id). */
     const FlowTuple    *ingress_tuple;
     FlowPeerMap        *peer_map;
@@ -78,6 +83,17 @@ static int flow_packets_delivered(const FlowStage *st, const FlowManager *mgr);
 static int flow_pipe_bytes_caught_up(const FlowStage *st, const FlowManager *mgr);
 static int drain_pipe_to_post_multi(FlowStage *st);
 static int drain_pkts_to_post_multi(FlowStage *st);
+
+static uint64_t wire_fnv_update(uint64_t h, const unsigned char *data, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        h ^= (uint64_t)data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
 
 
 static WgPipelineStatus enqueue_padded_tail(FlowStage *st, const Codec *codec,
@@ -733,6 +749,9 @@ static int drain_pkts_to_post_multi(FlowStage *st)
             break;
         }
 
+        st->wire_drain_bytes += (uint64_t)len;
+        st->wire_drain_fnv =
+            wire_fnv_update(st->wire_drain_fnv, pkt->payload, len);
         st->pipe_bytes_read += (uint64_t)len;
         total += (int)len;
         packet_free(pkt);
@@ -916,6 +935,11 @@ static WgPipelineStatus push_ingress_packet(FlowStage *st, FlowManager *mgr,
     }
     if (push_st != INGRESS_PUSH_OK) {
         return WG_PIPE_ERR;
+    }
+
+    if (st->wire_send_mode && data != NULL && len > 0) {
+        st->wire_ingress_bytes += (uint64_t)len;
+        st->wire_ingress_fnv = wire_fnv_update(st->wire_ingress_fnv, data, len);
     }
 
     atomic_fetch_add(&st->packets_pushed, 1);
@@ -2102,7 +2126,32 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
                     config->flows[i].flow_id,
                     (unsigned long long)txs[i].block_id,
                     (unsigned long long)txs[i].source_bytes);
+            if (stages[i].wire_ingress_bytes != stages[i].wire_drain_bytes ||
+                stages[i].wire_ingress_fnv != stages[i].wire_drain_fnv) {
+                fprintf(stderr,
+                        "wire-multi-send: flow_id=%u ORDER_CORRUPT "
+                        "ingress_bytes=%llu drain_bytes=%llu "
+                        "ingress_fnv=%llx drain_fnv=%llx "
+                        "(rebuild with deferred-queue fix / check FlowManager)\n",
+                        config->flows[i].flow_id,
+                        (unsigned long long)stages[i].wire_ingress_bytes,
+                        (unsigned long long)stages[i].wire_drain_bytes,
+                        (unsigned long long)stages[i].wire_ingress_fnv,
+                        (unsigned long long)stages[i].wire_drain_fnv);
+                status = WG_PIPE_ERR;
+            } else {
+                fprintf(stderr,
+                        "wire-multi-send: flow_id=%u order_ok "
+                        "bytes=%llu fnv=%llx\n",
+                        config->flows[i].flow_id,
+                        (unsigned long long)stages[i].wire_ingress_bytes,
+                        (unsigned long long)stages[i].wire_ingress_fnv);
+            }
         }
+    }
+
+    if (status != WG_PIPE_OK) {
+        goto cleanup_running;
     }
 
 cleanup_running:

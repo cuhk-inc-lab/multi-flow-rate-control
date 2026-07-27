@@ -342,6 +342,21 @@ fi
 if [ ! -x ./build/wg_multi_pipeline ]; then
     die "build/wg_multi_pipeline is missing; run make wg-demo first"
 fi
+
+local_rev=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+# Deferred-reorder fix required on the SENDER binary (Node1).
+if ! git merge-base --is-ancestor 5ee8fc3 HEAD 2>/dev/null; then
+    die "git HEAD ($local_rev) lacks fix 5ee8fc3; git pull && make -j"
+fi
+if ! strings ./build/wg_multi_pipeline 2>/dev/null | grep -q 'ORDER_CORRUPT'; then
+    die "build/wg_multi_pipeline looks stale (no ORDER_CORRUPT check); run: make -j"
+fi
+
+remote_rev=$(ssh $ssh_opts "$receiver_ssh" \
+    "cd '$remote_repo' && git rev-parse --short HEAD 2>/dev/null" || echo unknown)
+echo "Sender git=$local_rev  Receiver git=$remote_rev"
+echo "Note: deferred-reorder fix is sender-side; Node1 must be rebuilt after pull."
+
 case "$flows" in
     ''|*[!0-9]*) die "FLOWS must be a positive integer" ;;
 esac
@@ -625,6 +640,7 @@ for codec in $codecs; do
                 echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes  reason=$fail_reason"
                 echo "           wire_id=$fid log_id=$log_fid local_sha=$want_hash"
                 echo "           remote_sha=$remote_hash  remote_path=${log_out:-NA}"
+                echo "           recv: recovered=$recovered dropped=$dropped late=$late missing=$missing"
             fi
             fid=$((fid + 1))
         done
