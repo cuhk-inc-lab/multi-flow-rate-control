@@ -97,8 +97,6 @@ Script catalog (purpose + usage + key env):
   - `CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" ./scripts/run_wire_matrix.sh NODE4_SSH NODE4_DATA_IP input.ts`
 - Multi-flow matrix (one file per flow):
   - `CODECS="copy xor-fec" RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh NODE4_SSH NODE4_DATA_IP a.bin b.bin`
-- 6-stream iperf-like app run:
-  - `NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... ./scripts/run_iperf_like_wire.sh input.ts`
 
 ## Build & test
 

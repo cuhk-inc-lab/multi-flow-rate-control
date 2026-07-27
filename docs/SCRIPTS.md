@@ -19,12 +19,14 @@ it, and the most common command forms.
 | `scripts/run_vm_baseline.sh` | Single sender/receiver `iperf3` TCP+UDP baseline | Verify raw path capacity/loss before app tests |
 | `scripts/run_wire_matrix.sh` | Single-flow codec×rate matrix (Node1 -> Node4) | Find passing bitrate per codec |
 | `scripts/run_wire_multiflow_matrix.sh` | Multi-flow codec×rate matrix with per-flow checks | Validate concurrent flow behavior and relay load |
-| `scripts/check_wire_multi_flow.sh` | Fast smoke test for `--udp-send-multi` | Quick PASS/FAIL sanity check |
-| `scripts/run_iperf_like_wire.sh` | 6 concurrent app streams across Node1/2/3/4 | Realistic multi-node stress + charts |
-| `scripts/run_iperf_like_matrix.sh` | Sweep codec/rate over `run_iperf_like_wire.sh` | Batch comparison of many app runs |
-| `scripts/run_iperf_like_baseline.sh` | 6 concurrent `iperf3` control run | Distinguish path loss from app/codec loss |
 | `scripts/encode_multibitrate.sh` | Generate `input_1m.ts` / `input_10m.ts` / `input_20m.ts` | Prepare demo sources |
 | `scripts/run_dual_fifo.sh` | Live 3-stream FIFO demo with ffplay windows | Visual local demo of multi-flow processing |
+
+Helper (kept for multiflow relay NIC sampling):
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/iperf_like_monitor.py` | Sample NIC/CPU timeseries; used by multiflow matrix |
 
 ## Script Details
 
@@ -71,7 +73,7 @@ it, and the most common command forms.
   - one local file per flow, or
   - synthesized payloads from one seed file
 - Validates per-flow hashes on receiver side.
-- Reports estimated link Mbps and measured Node2/Node3 relay NIC Mbps.
+- Reports measured Node2/Node3 relay NIC Mbps.
 
 **Usage**
 - User files mode (recommended):
@@ -86,80 +88,6 @@ it, and the most common command forms.
 - `MONITOR_RELAYS`, `MONITOR_HZ`
 - `NODE2_SSH`, `NODE3_SSH`
 - `NODE2_IFACES`, `NODE3_IFACES`
-
----
-
-### `check_wire_multi_flow.sh`
-
-**What it does**
-- Creates 3 random payloads and runs one multi-flow sender process.
-- Validates that all three hashes are recovered.
-- Works local loopback or remote receiver mode.
-
-**Usage**
-- Local:
-  - `./scripts/check_wire_multi_flow.sh`
-- Remote Node4:
-  - `./scripts/check_wire_multi_flow.sh --remote RECEIVER_SSH RECEIVER_DATA_IP`
-
-**Key env**
-- `CODEC` (default `copy`)
-- `PORT`
-- `REMOTE_REPO`
-
----
-
-### `run_iperf_like_wire.sh`
-
-**What it does**
-- Runs 6 concurrent application streams across Node1/2/3/4.
-- Collects stream stats, latency, recovery, and per-node NIC/CPU monitor data.
-- Generates `report.md` and SVG charts via `scripts/iperf_like_report.py`.
-
-**Usage**
-- `NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... ./scripts/run_iperf_like_wire.sh INPUT_FILE`
-
-**Key env**
-- Required: `NODE2_SSH`, `NODE2_IP`, `NODE3_SSH`, `NODE3_IP`, `NODE4_SSH`, `NODE4_IP`
-- Core knobs: `CODEC`, `RATE_MBPS` or `RATE_S1..RATE_S6`
-- Timing: `DURATION_S`, `DURATION_SHORT_S`, `IDLE_SEC`, `BARRIER_SEC`
-- Networking: `PORT`, `LOOP_PORT`
-- Monitoring: `MONITOR_HZ`, `NODE*_IFACES`
-
----
-
-### `run_iperf_like_matrix.sh`
-
-**What it does**
-- Repeats `run_iperf_like_wire.sh` across codec×rate combinations.
-- Produces matrix-level markdown/CSV summary with relay peak counters.
-
-**Usage**
-- `CODECS="copy xor-fec" RATES="1 2" NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... ./scripts/run_iperf_like_matrix.sh INPUT_FILE`
-
-**Key env**
-- `CODECS`, `RATES`
-- same required node vars as `run_iperf_like_wire.sh`
-- `EXTRA_ENV` to pass extra knobs into each run
-
----
-
-### `run_iperf_like_baseline.sh`
-
-**What it does**
-- Runs the same 6-stream topology as iperf-like wire script, but using `iperf3`.
-- Serves as control experiment:
-  - baseline PASS + wire FAIL -> app/codec path issue likely
-  - baseline FAIL -> network path issue likely
-
-**Usage**
-- `NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... ./scripts/run_iperf_like_baseline.sh`
-
-**Key env**
-- `RATE_MBPS` or `RATE_S1..RATE_S6`
-- `DURATION_S`, `DURATION_SHORT_S`
-- `BASE_PORT`, `LOSS_MAX_PCT`
-- `MONITOR_HZ`, `NODE*_IFACES`
 
 ---
 
@@ -198,12 +126,9 @@ it, and the most common command forms.
 ## Suggested Workflow
 
 1. Validate path baseline:
-   - `run_vm_baseline.sh` (single path)
-   - `run_iperf_like_baseline.sh` (6-stream topology)
+   - `run_vm_baseline.sh`
 2. Validate app behavior:
    - `run_wire_matrix.sh` (single flow codec sweep)
    - `run_wire_multiflow_matrix.sh` (multi-flow)
-3. Stress realistic topology:
-   - `run_iperf_like_wire.sh`
-   - `run_iperf_like_matrix.sh`
-
+3. Optional local demo:
+   - `encode_multibitrate.sh` then `run_dual_fifo.sh`

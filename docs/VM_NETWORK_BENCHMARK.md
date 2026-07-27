@@ -155,9 +155,8 @@ DECODE_MARK=1 CODECS="copy" RATES="10" \
 
 ### Multi-flow Node1 → Node4 matrix
 
-Concurrent flows with explicit `flow_id` (same `--udp-send-multi` path as
-iperf-like, but only Node1→Node4). Writes `results.md` / `results.csv` /
-`flows.csv` under `build/wire-multiflow-*`:
+Concurrent flows with explicit `flow_id` (Node1→Node4 only). Writes
+`results.md` / `results.csv` / `flows.csv` under `build/wire-multiflow-*`:
 
 > Tip: `run_wire_multiflow_matrix.sh` also supports relay NIC monitoring
 > (Node2/Node3 peak+avg Mbps) and keeps artifacts lean by default. See
@@ -177,47 +176,6 @@ FLOWS=4 DURATION_S=10 RATES="10 20" \
 
 Both endpoints must run the same wire protocol version. Synchronize VM1 and
 VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
-
-### Concurrent iperf-like multi-destination run
-
-For the supervisor-style 6-stream concurrent test (Node1/Node2 senders,
-Node2/Node3/Node4 receivers, plus relay iface monitoring), from Node1:
-
-```bash
-NODE2_SSH=fyp1@NODE2_MGMT NODE2_IP=NODE2_DATA_IP \
-NODE3_SSH=fyp1@NODE3_MGMT NODE3_IP=NODE3_DATA_IP \
-NODE4_SSH=fyp1@NODE4_MGMT NODE4_IP=NODE4_DATA_IP \
-  ./scripts/run_iperf_like_wire.sh input.ts
-```
-
-Sweep codecs and rates:
-
-```bash
-CODECS="copy xor-fec" RATES="1 2" \
-NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... \
-  ./scripts/run_iperf_like_matrix.sh input.ts
-```
-
-Link-only control (same 6 streams, plain `iperf3 -u`):
-
-```bash
-RATE_S1=1 RATE_S2=1 RATE_S3=2 RATE_S4=2 RATE_S5=1 RATE_S6=2 \
-DURATION_S=30 DURATION_SHORT_S=20 \
-NODE2_SSH=... NODE2_IP=... NODE3_SSH=... NODE3_IP=... NODE4_SSH=... NODE4_IP=... \
-  ./scripts/run_iperf_like_baseline.sh
-```
-
-If baseline PASS and wire FAIL → suspect app/codec. If baseline also FAIL → path loss.
-
-Relay iface defaults match the lab topology (`NODE2_IFACES="ap0 station1"`,
-`NODE3_IFACES="ap1 station2"`). Override only if your names differ.
-
-Single-run knobs: `CODEC`, `RATE_MBPS`, `RATE_S1..RATE_S6`, `DURATION_S`
-(default 20), `DURATION_SHORT_S` (default 15).
-Results land under `build/iperf-like-wire-*` (or `build/iperf-like-matrix-*`):
-`report.md` (CPU/RX/TX SVG charts + per-stream loss/recovery), `summary.md`,
-`streams.csv`, `logs/`, `monitor/`, `charts/`, `out/`.
-
 
 ## 4. Report
 
