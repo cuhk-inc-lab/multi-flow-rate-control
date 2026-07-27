@@ -166,7 +166,10 @@ Stderr prints `tuple … => flow_id=N`. File chunks use `ingress_push_tuple` (sa
 The tuple is only the simulated ingress key; `wire_host:wire_port` is the real next hop.
 Output file naming (receiver writes one file per flow):
 
-`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<flow_id>.ts`
+`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<mapped_id>.<suffix>`
+
+Default suffix is `.ts`. Override per sender `--flow` id with
+`--out-suffix <flow_id>:<ext>` on `--udp-recv` (e.g. `--out-suffix 0:.txt --out-suffix 1:.ts`).
 
 Because the UDP sender source port may vary, use wildcard when validating:
 

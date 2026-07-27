@@ -94,7 +94,10 @@ Each `--flow` spec format is:
 receiver output includes `flow_id`). The receiver writes one output file per
 flow keyed by the sender peer (IP+port) and `flow_id`, for example:
 
-`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<flow_id>.ts`
+`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<mapped_id>.<suffix>`
+
+Use `--out-suffix <flow_id>:<ext>` on the receiver to match each sender input
+(e.g. `.txt` / `.ts`). Default remains `.ts`.
 
 Example: 2 flows (VM1 -> VM2) with `copy` codec.
 

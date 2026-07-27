@@ -453,6 +453,7 @@ for codec in $codecs; do
         echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps ==="
 
         flow_args=
+        out_suffix_args=
         fid=0
         nbytes_ref=NA
         max_payload=0
@@ -476,9 +477,15 @@ for codec in $codecs; do
             fi
             if [ "$user_files" -eq 1 ]; then
                 srcname=$(basename -- "$(sed -n "$((fid + 1))p" "$input_list")")
+                case "$srcname" in
+                    *.*) flow_ext=".${srcname##*.}" ;;
+                    *)   flow_ext= ;;
+                esac
             else
                 srcname=synthesized
+                flow_ext=.bin
             fi
+            out_suffix_args="$out_suffix_args --out-suffix ${fid}:${flow_ext}"
             echo "  payload flow $fid: $fbytes bytes ($srcname)"
             flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${pout}:${rate}"
             fid=$((fid + 1))
@@ -501,7 +508,8 @@ for codec in $codecs; do
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
-              --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle'" \
+              --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle' \
+              $out_suffix_args" \
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1

@@ -286,7 +286,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:src_ip:src_port:dst_ip:dst_port:host:port:input[:rate-mbps]> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N] [--decode-mark]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
@@ -626,6 +626,15 @@ int main(int argc, char **argv)
         }
         output_path = argv[argi + 2];
         argi += 3;
+        cfg = (WireUdpRecvConfig){
+            .port = (uint16_t)port,
+            .output_path = output_path,
+            .codec_kind = codec_kind,
+            .idle_sec = idle_sec,
+            .best_effort = best_effort,
+            .max_flows = max_flows,
+            .decode_mark = decode_mark,
+        };
         while (argi < argc) {
             if (strcmp(argv[argi], "--idle-sec") == 0) {
                 if (argi + 1 >= argc) {
@@ -637,12 +646,13 @@ int main(int argc, char **argv)
                     print_usage(argv[0]);
                     return EXIT_FAILURE;
                 }
+                cfg.idle_sec = idle_sec;
                 argi += 2;
             } else if (strcmp(argv[argi], "--best-effort") == 0) {
-                best_effort = 1;
+                cfg.best_effort = 1;
                 argi++;
             } else if (strcmp(argv[argi], "--decode-mark") == 0) {
-                decode_mark = 1;
+                cfg.decode_mark = 1;
                 argi++;
             } else if (strcmp(argv[argi], "--max-flows") == 0) {
                 if (argi + 1 >= argc) {
@@ -654,21 +664,65 @@ int main(int argc, char **argv)
                     print_usage(argv[0]);
                     return EXIT_FAILURE;
                 }
+                cfg.max_flows = max_flows;
+                argi += 2;
+            } else if (strcmp(argv[argi], "--out-suffix") == 0) {
+                const char *spec;
+                const char *colon;
+                unsigned long fid;
+                const char *ext;
+                size_t ext_len;
+                size_t max_ids;
+                char idbuf[32];
+                size_t id_len;
+
+                if (argi + 1 >= argc) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                spec = argv[argi + 1];
+                colon = strchr(spec, ':');
+                if (colon == NULL || colon == spec) {
+                    fprintf(stderr,
+                            "--out-suffix expects <flow_id>:<ext> (ext may be empty)\n");
+                    return EXIT_FAILURE;
+                }
+                id_len = (size_t)(colon - spec);
+                if (id_len >= sizeof(idbuf)) {
+                    fprintf(stderr, "invalid --out-suffix flow_id\n");
+                    return EXIT_FAILURE;
+                }
+                memcpy(idbuf, spec, id_len);
+                idbuf[id_len] = '\0';
+                fid = strtoul(idbuf, &end, 10);
+                max_ids = sizeof(cfg.out_suffix_set) / sizeof(cfg.out_suffix_set[0]);
+                if (end == idbuf || *end != '\0' || fid >= max_ids) {
+                    fprintf(stderr, "invalid --out-suffix flow_id (0..%zu)\n",
+                            max_ids - 1u);
+                    return EXIT_FAILURE;
+                }
+                ext = colon + 1;
+                if (ext[0] != '\0' && ext[0] != '.') {
+                    if (snprintf(cfg.out_suffix_by_flow[fid],
+                                 sizeof(cfg.out_suffix_by_flow[fid]), ".%s",
+                                 ext) < 0) {
+                        return EXIT_FAILURE;
+                    }
+                } else {
+                    ext_len = strlen(ext);
+                    if (ext_len >= sizeof(cfg.out_suffix_by_flow[fid])) {
+                        fprintf(stderr, "--out-suffix extension too long\n");
+                        return EXIT_FAILURE;
+                    }
+                    memcpy(cfg.out_suffix_by_flow[fid], ext, ext_len + 1u);
+                }
+                cfg.out_suffix_set[fid] = 1;
                 argi += 2;
             } else {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
         }
-        cfg = (WireUdpRecvConfig){
-            .port = (uint16_t)port,
-            .output_path = output_path,
-            .codec_kind = codec_kind,
-            .idle_sec = idle_sec,
-            .best_effort = best_effort,
-            .max_flows = max_flows,
-            .decode_mark = decode_mark,
-        };
         return wire_udp_recv(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 

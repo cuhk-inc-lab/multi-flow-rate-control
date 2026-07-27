@@ -1082,20 +1082,36 @@ static int wire_flow_format_peer_tag(const WireFlowKey *key, char *out, size_t o
 }
 
 static int wire_flow_output_path(const char *prefix, const WireFlowKey *key,
-                                 char *out, size_t out_len)
+                                 const char *suffix, char *out, size_t out_len)
 {
     char tag[128];
 
     if (prefix == NULL || key == NULL || out == NULL) {
         return -1;
     }
+    if (suffix == NULL) {
+        suffix = ".ts";
+    }
     if (wire_flow_format_peer_tag(key, tag, sizeof(tag)) != 0) {
         return -1;
     }
-    if (snprintf(out, out_len, "%s%s.ts", prefix, tag) < 0 || strlen(out) >= out_len) {
+    if (snprintf(out, out_len, "%s%s%s", prefix, tag, suffix) < 0 ||
+        strlen(out) >= out_len) {
         return -1;
     }
     return 0;
+}
+
+static const char *wire_recv_suffix_for_flow(const WireUdpRecvConfig *config,
+                                            uint32_t wire_flow_id)
+{
+    if (config != NULL &&
+        wire_flow_id < (uint32_t)(sizeof(config->out_suffix_set) /
+                                 sizeof(config->out_suffix_set[0])) &&
+        config->out_suffix_set[wire_flow_id]) {
+        return config->out_suffix_by_flow[wire_flow_id];
+    }
+    return ".ts";
 }
 
 static WireFlowCtx *wire_flow_find(WireFlowCtx flows[], size_t max_flows,
@@ -1444,10 +1460,12 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             flow = wire_flow_find(flows, max_flows, &key);
             if (flow == NULL) {
                 if (multi_mode) {
-                    char path[512];
+                    char        path[512];
+                    const char *suffix =
+                        wire_recv_suffix_for_flow(config, header.flow_id);
 
-                    if (wire_flow_output_path(config->output_path, &key, path,
-                                                sizeof(path)) != 0) {
+                    if (wire_flow_output_path(config->output_path, &key, suffix,
+                                              path, sizeof(path)) != 0) {
                         continue;
                     }
                     flow = wire_flow_alloc(flows, max_flows, &key, path,

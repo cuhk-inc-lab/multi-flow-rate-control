@@ -25,6 +25,13 @@ typedef struct WireUdpRecvConfig {
     uint32_t    max_flows;
     /* Demo/teaching: after Codec_decode path, append a text mark into the output. */
     int         decode_mark;
+    /*
+     * Optional per sender wire-flow_id output suffix (includes leading '.').
+     * When out_suffix_set[id] is set, use out_suffix_by_flow[id] (may be empty).
+     * Otherwise default to ".ts" for prefix-mode multi-flow outputs.
+     */
+    char        out_suffix_by_flow[8][16];
+    unsigned char out_suffix_set[8];
 } WireUdpRecvConfig;
 
 typedef struct WireUdpTx {
