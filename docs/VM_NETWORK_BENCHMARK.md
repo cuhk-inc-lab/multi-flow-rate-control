@@ -3,6 +3,9 @@
 Use two VMs for the first test: VM1 sends and VM2 receives. The remaining VMs
 are useful for repeat runs or later multi-hop and multi-flow tests.
 
+For a full script catalog (what each shell script does, required env, and
+examples), see **[SCRIPTS.md](SCRIPTS.md)**.
+
 ## 1. Establish the network baseline
 
 On VM2, start one persistent `iperf3` server per port in separate terminals:
@@ -155,6 +158,11 @@ DECODE_MARK=1 CODECS="copy" RATES="10" \
 Concurrent flows with explicit `flow_id` (same `--udp-send-multi` path as
 iperf-like, but only Node1→Node4). Writes `results.md` / `results.csv` /
 `flows.csv` under `build/wire-multiflow-*`:
+
+> Tip: `run_wire_multiflow_matrix.sh` also supports relay NIC monitoring
+> (Node2/Node3 peak+avg Mbps) and keeps artifacts lean by default. See
+> **[SCRIPTS.md](SCRIPTS.md)** for all toggles (`MONITOR_RELAYS`, `FETCH_OUTPUT`,
+> `KEEP_REMOTE_OUTPUT`, interface overrides, etc.).
 
 ```bash
 # One local file per flow (recommended)
