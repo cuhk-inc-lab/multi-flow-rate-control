@@ -2022,7 +2022,14 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
 
         mgr.flows[fid].output_fd = -1;
         mgr.flows[fid].relay_queue = &stages[i].post_multi_pkts;
-        flow_context_set_pacing(&mgr.flows[fid], config->pacing_enabled);
+        /*
+         * Wire TX already paces with per-flow source_rate_mbps. FlowManager
+         * enqueue-timestamp pacing causes multi-second worker sleeps after
+         * backpressure gaps (file ingest timestamps span wall-clock stalls),
+         * which looks like the path "went quiet" mid-transfer.
+         */
+        (void)config->pacing_enabled;
+        flow_context_set_pacing(&mgr.flows[fid], 0);
     }
 
     if (flow_manager_start(&mgr) != FM_OK) {
@@ -2034,80 +2041,107 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
             "wire-multi-send: %u flows via FlowManager (local-multi style) -> wire UDP%s\n",
             config->flow_count,
             config->peer_map != NULL ? " [tuple→flow_id]" : "");
+    fprintf(stderr,
+            "wire-multi-send: FlowManager pacing off (wire TX source_rate_mbps only)\n");
 
-    for (;;) {
-        int progress = 0;
+    {
+        uint64_t last_progress_log_ns = 0;
 
-        for (i = 0; i < config->flow_count; i++) {
-            FlowStage *st = &stages[i];
-            int        dr;
+        for (;;) {
+            int      progress = 0;
+            uint64_t now_ns;
 
-            dr = drain_pkts_to_post_multi(st);
-            if (dr > 0 || dr == -2) {
-                progress = 1;
-            } else if (dr < 0) {
-                fprintf(stderr,
-                        "wire-multi-send: drain failed for flow_id=%u\n",
-                        config->flows[i].flow_id);
-                status = WG_PIPE_ERR;
-                goto cleanup_running;
-            }
+            for (i = 0; i < config->flow_count; i++) {
+                FlowStage *st = &stages[i];
+                int        dr;
 
-            if (finish_segment_input(st, &mgr, &progress) != WG_PIPE_OK) {
-                fprintf(stderr,
-                        "wire-multi-send: finish_segment failed for flow_id=%u\n",
-                        config->flows[i].flow_id);
-                status = WG_PIPE_ERR;
-                goto cleanup_running;
-            }
-
-            if (process_flow_wire_send(st, codec, &txs[i], work, &progress) !=
-                WG_PIPE_OK) {
-                fprintf(stderr,
-                        "wire-multi-send: wire send failed for flow_id=%u\n",
-                        config->flows[i].flow_id);
-                status = WG_PIPE_ERR;
-                goto cleanup_running;
-            }
-
-            if (!st->ingest_done) {
-                WgPipelineStatus ingest_st = WG_PIPE_OK;
-
-                if (flow_can_accept_ingress(st, &mgr)) {
-                    ingest_st = pump_file_ingress(st, &mgr);
-                }
-                if (ingest_st == WG_PIPE_OK) {
-                    if (flow_can_accept_ingress(st, &mgr)) {
+                dr = drain_pkts_to_post_multi(st);
+                if (dr > 0) {
+                    progress = 1;
+                } else if (dr == -2) {
+                    /* Backpressure: only count as progress if we can actually send. */
+                    if (wire_udp_tx_ready(&txs[i])) {
                         progress = 1;
                     }
-                } else {
+                } else if (dr < 0) {
                     fprintf(stderr,
-                            "wire-multi-send: ingress failed for flow_id=%u\n",
+                            "wire-multi-send: drain failed for flow_id=%u\n",
                             config->flows[i].flow_id);
                     status = WG_PIPE_ERR;
                     goto cleanup_running;
                 }
+
+                if (finish_segment_input(st, &mgr, &progress) != WG_PIPE_OK) {
+                    fprintf(stderr,
+                            "wire-multi-send: finish_segment failed for flow_id=%u\n",
+                            config->flows[i].flow_id);
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
+
+                if (process_flow_wire_send(st, codec, &txs[i], work, &progress) !=
+                    WG_PIPE_OK) {
+                    fprintf(stderr,
+                            "wire-multi-send: wire send failed for flow_id=%u\n",
+                            config->flows[i].flow_id);
+                    status = WG_PIPE_ERR;
+                    goto cleanup_running;
+                }
+
+                if (!st->ingest_done) {
+                    WgPipelineStatus ingest_st = WG_PIPE_OK;
+                    uint64_t         pushed_before =
+                        atomic_load(&st->packets_pushed);
+
+                    if (flow_can_accept_ingress(st, &mgr)) {
+                        ingest_st = pump_file_ingress(st, &mgr);
+                    }
+                    if (ingest_st != WG_PIPE_OK) {
+                        fprintf(stderr,
+                                "wire-multi-send: ingress failed for flow_id=%u\n",
+                                config->flows[i].flow_id);
+                        status = WG_PIPE_ERR;
+                        goto cleanup_running;
+                    }
+                    if (atomic_load(&st->packets_pushed) > pushed_before) {
+                        progress = 1;
+                    }
+                }
             }
-        }
 
-        {
-            bool all_done = true;
+            {
+                bool all_done = true;
 
-            for (i = 0; i < config->flow_count; i++) {
-                if (!wire_flow_stage_quiescent(&stages[i], &mgr)) {
-                    all_done = false;
+                for (i = 0; i < config->flow_count; i++) {
+                    if (!wire_flow_stage_quiescent(&stages[i], &mgr)) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                if (all_done) {
                     break;
                 }
             }
-            if (all_done) {
-                break;
+
+            now_ns = wire_realtime_nanoseconds();
+            if (last_progress_log_ns == 0 ||
+                now_ns - last_progress_log_ns >= 2000000000ull) {
+                last_progress_log_ns = now_ns;
+                fprintf(stderr, "wire-multi-send: progress");
+                for (i = 0; i < config->flow_count; i++) {
+                    fprintf(stderr, " f%u:in=%llu/drain=%llu",
+                            config->flows[i].flow_id,
+                            (unsigned long long)stages[i].wire_ingress_bytes,
+                            (unsigned long long)stages[i].wire_drain_bytes);
+                }
+                fprintf(stderr, "\n");
             }
-        }
 
-        if (!progress) {
-            struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000L};
+            if (!progress) {
+                struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000L};
 
-            nanosleep(&delay, NULL);
+                nanosleep(&delay, NULL);
+            }
         }
     }
 

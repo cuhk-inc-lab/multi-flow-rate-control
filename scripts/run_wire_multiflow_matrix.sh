@@ -504,6 +504,7 @@ for codec in $codecs; do
         fi
         echo "  idle-sec=$case_idle (auto from largest payload @ ${rate}Mbps; override with IDLE_SEC)"
         echo "  sending (may take ~${need_idle}s for largest flow at ${rate}Mbps)..."
+        echo "  tip: mid-path speedometer should stay near ${rate}Mbps until send finishes; quiet path = stall"
 
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && rm -rf '$remote_base' && mkdir -p '$remote_base'" \
