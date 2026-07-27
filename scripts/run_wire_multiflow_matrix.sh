@@ -363,6 +363,10 @@ esac
 if [ "$flows" -lt 1 ]; then
     die "FLOWS must be >= 1"
 fi
+# Must match MF_MAX_FLOWS / WIRE_MAX_FLOWS in the binary (currently 8).
+if [ "$flows" -gt 8 ]; then
+    die "FLOWS=$flows exceeds binary max_flows limit 8"
+fi
 
 mkdir -p "$result_dir/logs" "$result_dir/payloads" "$result_dir/out" \
     || die "cannot create $result_dir"

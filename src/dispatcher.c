@@ -174,6 +174,7 @@ void *dispatcher_thread(void *arg)
         DataPacket *pkt = NULL;
         MixedQueueStatus mq_st;
         int progress = 0;
+        uint64_t wake_seen;
 
         progress |= drain_deferred(mgr);
 
@@ -196,9 +197,26 @@ void *dispatcher_thread(void *arg)
             break;
         }
 
+        /*
+         * Deferred packets wait on per-flow queue space. Snapshot the wake
+         * generation, retry drain (in case a worker already freed a slot and
+         * signaled), then wait only if no newer wake arrived.
+         */
         if (deferred_total(mgr) > 0) {
             pthread_mutex_lock(&mgr->dispatch_wake_mtx);
-            pthread_cond_wait(&mgr->dispatch_wake_cv, &mgr->dispatch_wake_mtx);
+            wake_seen = mgr->dispatch_wake_gen;
+            pthread_mutex_unlock(&mgr->dispatch_wake_mtx);
+
+            if (drain_deferred(mgr)) {
+                continue;
+            }
+
+            pthread_mutex_lock(&mgr->dispatch_wake_mtx);
+            while (flow_manager_is_running(mgr) && deferred_total(mgr) > 0 &&
+                   mgr->dispatch_wake_gen == wake_seen) {
+                pthread_cond_wait(&mgr->dispatch_wake_cv,
+                                  &mgr->dispatch_wake_mtx);
+            }
             pthread_mutex_unlock(&mgr->dispatch_wake_mtx);
             continue;
         }

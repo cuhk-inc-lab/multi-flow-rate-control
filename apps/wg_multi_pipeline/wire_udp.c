@@ -1306,7 +1306,10 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     if (max_flows == 0) {
         max_flows = 1;
     } else if (max_flows > WIRE_MAX_FLOWS) {
-        max_flows = WIRE_MAX_FLOWS;
+        fprintf(stderr,
+                "udp-recv: --max-flows %u exceeds compile limit %u\n",
+                (unsigned)config->max_flows, (unsigned)WIRE_MAX_FLOWS);
+        return -1;
     }
     multi_mode = max_flows > 1;
 
@@ -1438,6 +1441,32 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                 goto cleanup;
             }
             last_receive = monotonic_seconds();
+
+            /*
+             * Validate the wire header before peer-map allocation / opening
+             * output files so junk UDP cannot exhaust max_flows.
+             */
+            if (wire_header_decode(&header, datagram, (size_t)received) != 0) {
+                continue;
+            }
+            if (header.type == WIRE_TYPE_DATA) {
+                if ((size_t)received != WIRE_HEADER_SIZE + header.payload_len ||
+                    header.payload_len != PKG_SIZE ||
+                    header.shard_count != expected_shards ||
+                    header.shard_index >= expected_shards ||
+                    header.valid_len == 0 || header.valid_len > input_size) {
+                    continue;
+                }
+            } else if (header.type == WIRE_TYPE_END) {
+                if ((size_t)received != WIRE_HEADER_SIZE ||
+                    header.payload_len != 0 ||
+                    header.shard_count != expected_shards) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
             if (flow_tuple_set(&tuple,
                                (struct sockaddr *)&peer_addr, peer_len,
                                (struct sockaddr *)&local_addr, local_len,
@@ -1446,13 +1475,6 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             }
             mapped_flow_id = flow_peer_map_lookup(flow_map, &tuple);
             if (mapped_flow_id == (uint32_t)-1) {
-                continue;
-            }
-            if (wire_header_decode(&header, datagram, (size_t)received) != 0) {
-                continue;
-            }
-            if (header.type == WIRE_TYPE_DATA &&
-                (size_t)received != WIRE_HEADER_SIZE + header.payload_len) {
                 continue;
             }
 

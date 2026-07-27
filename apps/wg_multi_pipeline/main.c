@@ -1,5 +1,6 @@
 #include "pipeline.h"
 #include "wire_udp.h"
+#include "stream_config.h"
 
 #include "flow_peer_map.h"
 
@@ -286,7 +287,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
             "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:src_ip:src_port:dst_ip:dst_port:host:port:input[:rate-mbps]> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
@@ -660,8 +661,10 @@ int main(int argc, char **argv)
                     return EXIT_FAILURE;
                 }
                 max_flows = (unsigned)strtoul(argv[argi + 1], NULL, 10);
-                if (max_flows == 0) {
-                    print_usage(argv[0]);
+                if (max_flows == 0 || max_flows > MF_MAX_FLOWS) {
+                    fprintf(stderr,
+                            "--max-flows must be 1..%u\n",
+                            (unsigned)MF_MAX_FLOWS);
                     return EXIT_FAILURE;
                 }
                 cfg.max_flows = max_flows;
@@ -755,8 +758,10 @@ int main(int argc, char **argv)
                     return EXIT_FAILURE;
                 }
                 max_flows = (unsigned)strtoul(argv[argi + 1], NULL, 10);
-                if (max_flows == 0) {
-                    print_usage(argv[0]);
+                if (max_flows == 0 || max_flows > MF_MAX_FLOWS) {
+                    fprintf(stderr,
+                            "--max-flows must be 1..%u\n",
+                            (unsigned)MF_MAX_FLOWS);
                     return EXIT_FAILURE;
                 }
                 argi += 2;

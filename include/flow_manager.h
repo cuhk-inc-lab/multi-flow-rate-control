@@ -42,6 +42,7 @@ typedef struct FlowManager {
     pthread_t         dispatcher_thread;
     pthread_mutex_t   dispatch_wake_mtx;
     pthread_cond_t    dispatch_wake_cv;
+    uint64_t          dispatch_wake_gen;
     int               running;
     int               shutdown_requested;
     int               dispatcher_started;

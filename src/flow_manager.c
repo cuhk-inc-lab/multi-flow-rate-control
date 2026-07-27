@@ -218,6 +218,7 @@ void flow_manager_dispatch_wake(FlowManager *mgr)
     }
 
     pthread_mutex_lock(&mgr->dispatch_wake_mtx);
+    mgr->dispatch_wake_gen++;
     pthread_cond_broadcast(&mgr->dispatch_wake_cv);
     pthread_mutex_unlock(&mgr->dispatch_wake_mtx);
 }
