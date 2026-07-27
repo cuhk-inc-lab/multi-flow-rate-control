@@ -39,7 +39,7 @@ rates=${RATES:-"10 20"}
 dur_s=${DURATION_S:-10}
 idle_sec=${IDLE_SEC:-10}
 port_base=${PORT_BASE:-9100}
-keep_remote=${KEEP_REMOTE_OUTPUT:-0}
+keep_remote=${KEEP_REMOTE_OUTPUT:-1}
 fetch_out=${FETCH_OUTPUT:-0}
 use_no_pace=${USE_NO_PACE:-0}
 monitor_relays=${MONITOR_RELAYS:-1}
@@ -96,7 +96,7 @@ Env:
   DURATION_S=10           seed mode only (payload ≈ rate × duration)
   IDLE_SEC=10
   PORT_BASE=9100
-  KEEP_REMOTE_OUTPUT=0   keep remote out_* (default: delete after hash check)
+  KEEP_REMOTE_OUTPUT=1   keep remote out_* (set 0 to delete after hash check)
   FETCH_OUTPUT=0         scp outputs into result dir (default: off; large)
   USE_NO_PACE=0
   MONITOR_RELAYS=1       sample Node2/Node3 NIC bitrate during each case
@@ -324,21 +324,6 @@ else:
     loss = f"{max(0.0, 100.0 * (1.0 - arrived / exp)):.4f}"
 
 print(loss, pct(late, exp), pct(dropped, blocks), pct(recovered, blocks))
-PY
-}
-
-# Link (wire) Mbps ≈ source_mbps × (shards × UDP datagram) / source_block
-# UDP datagram = WIRE_HEADER(44) + PKG(188) = 232; source_block = 752.
-link_mbps() {
-    python3 - "$1" "$2" "$3" <<'PY'
-import sys
-codec = sys.argv[1].strip().lower()
-src = float(sys.argv[2])
-flows = int(sys.argv[3])
-shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6}.get(codec, 8)
-# wire expansion over paced source bytes
-ratio = (shards * 232.0) / 752.0
-print(f"{src * flows * ratio:.1f}")
 PY
 }
 
@@ -652,20 +637,20 @@ fi
         echo "- **Mode:** seed synthesize FLOWS=$flows DURATION_S=${dur_s}s seed=\`$seed_path\`"
     fi
     echo "- **PASS:** sha256 match on receiver for every flow"
-    echo "- **Link Mbps (est.):** flows × source × (shards×232)/752"
+    # Link Mbps estimate removed (we only report measured relay NIC Mbps).
     if [ "$monitor_relays" = "1" ]; then
         echo "- **Measured:** Node2 \`$node2_ssh\` ($node2_ifaces) / Node3 \`$node3_ssh\` ($node3_ifaces) NIC peak/avg Mbps"
     fi
     echo
     echo "## Results"
     echo
-    echo "| Codec | Src | Link est. | N2 peak | N2 avg | N3 peak | N3 avg | Status | Loss % | E2E p95 | Notes |"
-    echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |"
+    echo "| Codec | Src | N2 peak | N2 avg | N3 peak | N3 avg | Status | Loss % | E2E p95 | Notes |"
+    echo "| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |"
 } > "$markdown"
 
-echo "codec,src_mbps_per_flow,link_mbps_est,n2_peak_mbps,n2_avg_mbps,n3_peak_mbps,n3_avg_mbps,flows,status,flows_pass,loss_pct,e2e_p95_us,elapsed_s,sender_rc,receiver_rc,notes" \
+echo "codec,src_mbps_per_flow,n2_peak_mbps,n2_avg_mbps,n3_peak_mbps,n3_avg_mbps,flows,status,flows_pass,loss_pct,e2e_p95_us,elapsed_s,sender_rc,receiver_rc,notes" \
     > "$csv"
-echo "codec,src_mbps,link_mbps_per_flow,flow_id,status,loss_pct,payload_bytes,output_bytes,e2e_p95_us,fail_reason" \
+echo "codec,src_mbps,flow_id,status,loss_pct,payload_bytes,output_bytes,e2e_p95_us,fail_reason" \
     > "$flows_csv"
 
 case_number=0
@@ -687,9 +672,7 @@ for codec in $codecs; do
             mkdir -p "$case_dir"
         fi
 
-        case_link=$(link_mbps "$codec" "$rate" "$flows")
-        case_link_per_flow=$(link_mbps "$codec" "$rate" 1)
-        echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps src / ${case_link}Mbps link ==="
+        echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps src ==="
 
         flow_args=
         out_suffix_args=
@@ -821,7 +804,7 @@ for codec in $codecs; do
             set -- $(monitor_mbps_summary "$n3_local_csv")
             n3_peak=${1:-NA}
             n3_avg=${2:-NA}
-            echo "  measured: N2 peak/avg=${n2_peak}/${n2_avg} Mbps  N3 peak/avg=${n3_peak}/${n3_avg} Mbps  (est link ${case_link})"
+            echo "  measured: N2 peak/avg=${n2_peak}/${n2_avg} Mbps  N3 peak/avg=${n3_peak}/${n3_avg} Mbps"
         fi
 
         loss_sum=0
@@ -898,7 +881,7 @@ for codec in $codecs; do
                 "$dropped" "$recovered" "$recv_blocks" "$expect_blocks")
             est_loss=${1:-NA}
 
-            echo "$codec,$rate,$case_link_per_flow,$fid,$flow_status,$est_loss,$payload_bytes,$out_bytes,$e2e_p95,$fail_reason" \
+            echo "$codec,$rate,$fid,$flow_status,$est_loss,$payload_bytes,$out_bytes,$e2e_p95,$fail_reason" \
                 >> "$flows_csv"
 
             case "$est_loss" in
@@ -953,9 +936,9 @@ for codec in $codecs; do
             case_notes="—"
         fi
 
-        echo "$codec,$rate,$case_link,$n2_peak,$n2_avg,$n3_peak,$n3_avg,$flows,$status,$flows_pass/$flows,$loss_display,$e2e_avg,$case_elapsed,$sender_rc,$receiver_rc,$case_notes" \
+        echo "$codec,$rate,$n2_peak,$n2_avg,$n3_peak,$n3_avg,$flows,$status,$flows_pass/$flows,$loss_display,$e2e_avg,$case_elapsed,$sender_rc,$receiver_rc,$case_notes" \
             >> "$csv"
-        echo "| $codec | $rate | $case_link | $n2_peak | $n2_avg | $n3_peak | $n3_avg | $status | $loss_display | $e2e_avg | $case_notes |" \
+        echo "| $codec | $rate | $n2_peak | $n2_avg | $n3_peak | $n3_avg | $status | $loss_display | $e2e_avg | $case_notes |" \
             >> "$markdown"
 
         if [ "$status" != "PASS" ]; then
@@ -966,7 +949,7 @@ for codec in $codecs; do
         if [ "$status" = "PASS" ]; then
             case_pass=$((case_pass + 1))
         fi
-        echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  link_est=${case_link}  N2=${n2_peak}/${n2_avg}  N3=${n3_peak}/${n3_avg}  loss%=$loss_display"
+        echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  N2=${n2_peak}/${n2_avg}  N3=${n3_peak}/${n3_avg}  loss%=$loss_display"
 
         if [ "$keep_remote" != "1" ]; then
             ssh $ssh_opts "$receiver_ssh" "rm -rf '$remote_base'" >/dev/null 2>&1 || true
