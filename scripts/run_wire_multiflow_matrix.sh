@@ -12,13 +12,13 @@
 #   FLOWS=4 DURATION_S=10 RATES="10 20" \
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 seed.ts
 #
-# Artifacts under build/wire-multiflow-<ts>/:
-#   results.md   — run config, case summary, per-case/per-flow tables, metric notes
-#   results.csv  — one row per codec×rate case (bitrates, timing, RCs)
-#   flows.csv    — one row per flow (loss, latency, sender order check)
+# Artifacts under build/wire-multiflow-<ts>/ (kept lean):
+#   results.md   — compact summary (source/link Mbps, loss, latency)
+#   results.csv  — one row per case
+#   flows.csv    — one row per flow
 #   logs/        — sender/receiver logs
-#   payloads/    — copies/hashes of per-flow inputs
-#   out/         — fetched receiver outputs (optional)
+#   payloads/    — sha256 + tiny seed files only (no copies of user inputs)
+#   out/         — only if FETCH_OUTPUT=1
 
 set -u
 
@@ -35,8 +35,8 @@ rates=${RATES:-"10 20"}
 dur_s=${DURATION_S:-10}
 idle_sec=${IDLE_SEC:-10}
 port_base=${PORT_BASE:-9100}
-keep_remote=${KEEP_REMOTE_OUTPUT:-1}
-fetch_out=${FETCH_OUTPUT:-1}
+keep_remote=${KEEP_REMOTE_OUTPUT:-0}
+fetch_out=${FETCH_OUTPUT:-0}
 use_no_pace=${USE_NO_PACE:-0}
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_dir=${RESULT_DIR:-"build/wire-multiflow-$timestamp"}
@@ -86,8 +86,8 @@ Env:
   DURATION_S=10           seed mode only (payload ≈ rate × duration)
   IDLE_SEC=10
   PORT_BASE=9100
-  KEEP_REMOTE_OUTPUT=1
-  FETCH_OUTPUT=1
+  KEEP_REMOTE_OUTPUT=0   keep remote out_* (default: delete after hash check)
+  FETCH_OUTPUT=0         scp outputs into result dir (default: off; large)
   USE_NO_PACE=0
   RECEIVER_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/wire-multiflow-<timestamp>
@@ -258,8 +258,11 @@ loss_stats() {
     late=$5
     dropped=$6
     recovered=$7
+    recv_blocks=$8
+    expect_blocks=$9
 
-    python3 - "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" "$dropped" "$recovered" <<'PY'
+    python3 - "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" "$dropped" "$recovered" \
+        "$recv_blocks" "$expect_blocks" <<'PY'
 import math, sys
 
 codec = sys.argv[1].strip().lower()
@@ -282,7 +285,11 @@ seen = as_int(sys.argv[4])
 late = as_int(sys.argv[5])
 dropped = as_int(sys.argv[6])
 recovered = as_int(sys.argv[7])
+recv_blocks = as_int(sys.argv[8])
+expect_blocks = as_int(sys.argv[9])
 blocks = math.ceil(payload / 752) if payload > 0 else 0
+if blocks <= 0 and expect_blocks is not None and expect_blocks > 0:
+    blocks = expect_blocks
 exp = blocks * shards if blocks > 0 else 0
 
 def pct(num, den):
@@ -292,16 +299,53 @@ def pct(num, den):
 
 arrived = seen if seen is not None else datagrams
 if arrived is None or exp <= 0:
-    loss = "NA"
+    # Incomplete flow: estimate from received_blocks / expected_blocks.
+    if recv_blocks is not None and expect_blocks is not None and expect_blocks > 0:
+        loss = f"{max(0.0, 100.0 * (1.0 - recv_blocks / expect_blocks)):.4f}"
+    elif recv_blocks is not None and blocks > 0:
+        loss = f"{max(0.0, 100.0 * (1.0 - recv_blocks / blocks)):.4f}"
+    else:
+        loss = "NA"
 else:
-    loss_v = max(0.0, 100.0 * (1.0 - arrived / exp))
-    if late is not None and seen is not None:
-        # seen already includes late as arrived when present
-        pass
-    loss = f"{loss_v:.4f}"
+    loss = f"{max(0.0, 100.0 * (1.0 - arrived / exp)):.4f}"
 
 print(loss, pct(late, exp), pct(dropped, blocks), pct(recovered, blocks))
 PY
+}
+
+# Link (wire) Mbps ≈ source_mbps × (shards × UDP datagram) / source_block
+# UDP datagram = WIRE_HEADER(44) + PKG(188) = 232; source_block = 752.
+link_mbps() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import sys
+codec = sys.argv[1].strip().lower()
+src = float(sys.argv[2])
+flows = int(sys.argv[3])
+shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6}.get(codec, 8)
+# wire expansion over paced source bytes
+ratio = (shards * 232.0) / 752.0
+print(f"{src * flows * ratio:.1f}")
+PY
+}
+
+source_agg_mbps() {
+    awk -v f="$1" -v r="$2" 'BEGIN{printf "%.0f", f*r}'
+}
+
+# udp-recv: flow N incomplete: received_blocks=… expected_blocks=… missing_groups=…
+flow_incomplete_field() {
+    flow_id=$1
+    key=$2
+    file=$3
+    awk -v fid="$flow_id" -v wanted="$key" '
+        $1 == "udp-recv:" && $2 == "flow" && $3 == fid && $4 == "incomplete:" {
+            for (i = 5; i <= NF; i++) {
+                split($i, field, "=")
+                if (field[1] == wanted) value = field[2]
+            }
+        }
+        END { print value == "" ? "NA" : value }
+    ' "$file"
 }
 
 match_hash_in_dir() {
@@ -456,7 +500,7 @@ if [ "$flows" -gt 8 ]; then
     die "FLOWS=$flows exceeds binary max_flows limit 8"
 fi
 
-mkdir -p "$result_dir/logs" "$result_dir/payloads" "$result_dir/out" \
+mkdir -p "$result_dir/logs" "$result_dir/payloads" \
     || die "cannot create $result_dir"
 input_list="$result_dir/input_files.txt"
 : > "$input_list"
@@ -475,8 +519,8 @@ fi
 csv="$result_dir/results.csv"
 flows_csv="$result_dir/flows.csv"
 markdown="$result_dir/results.md"
-case_details="$result_dir/case_details.partial"
-: > "$case_details"
+fail_notes="$result_dir/fail_notes.partial"
+: > "$fail_notes"
 
 ssh $ssh_opts "$receiver_ssh" \
     "cd '$remote_repo' && test -x $bin_rel" \
@@ -488,57 +532,35 @@ if [ "$use_no_pace" = "1" ]; then
 fi
 
 {
-    echo "# Wire multi-flow benchmark (Node1 → Node4)"
+    echo "# Wire multi-flow (Node1 → Node4)"
     echo
-    echo "## Run configuration"
-    echo
-    echo "- **Started:** $run_started_at"
-    echo "- **Result dir:** \`$result_dir\`"
-    echo "- **Sender:** $sender_host (git \`$local_rev\`)"
-    echo "- **Receiver:** $receiver_ssh → $receiver_ip (git \`$remote_rev\`)"
-    echo "- **Binary:** \`$bin_rel\`"
-    echo "- **Flows:** $flows concurrent (\`--udp-send-multi\`, flow_id 0..$((flows - 1)))"
-    echo "- **Codecs:** $codecs"
-    echo "- **Per-flow target rate:** $rates Mbps"
-    echo "- **Aggregate target (all flows):** flows × per-flow rate"
-    if [ "$use_no_pace" = "1" ]; then
-        echo "- **Pacing:** \`--no-pace\` on CLI (wire multi-send still uses FlowManager pacing off + wire TX rate)"
-    else
-        echo "- **Pacing:** default (wire multi-send: FlowManager off, wire TX \`source_rate_mbps\` only)"
-    fi
-    echo "- **UDP port base:** $port_base (one port per case)"
-    echo "- **Receiver idle:** ${idle_sec}s default (auto-extended per case from largest payload)"
-    echo "- **PASS criteria:** every flow sha256-matches its payload on Node4"
-    echo
+    echo "- **When:** $run_started_at | sender \`$local_rev\` / recv \`$remote_rev\`"
+    echo "- **Path:** $sender_host → $receiver_ssh ($receiver_ip)"
+    echo "- **Flows:** $flows concurrent | codecs: $codecs | source rates: $rates Mbps/flow"
     if [ "$user_files" -eq 1 ]; then
-        echo "### Input files (one flow each)"
-        echo
-        echo "| Flow | File | Size | sha256 |"
-        echo "| ---: | --- | ---: | --- |"
+        echo "- **Inputs:**"
         fid=0
         while [ "$fid" -lt "$flows" ]; do
             fpath=$(sed -n "$((fid + 1))p" "$input_list")
             fbytes=$(wc -c < "$fpath" | tr -d ' ')
-            fhash=$(sha256sum "$fpath" | awk '{print $1}')
-            fhash_short=$(echo "$fhash" | cut -c1-16)
-            echo "| $fid | \`$fpath\` | $(human_bytes "$fbytes") | \`${fhash_short}…\` |"
+            echo "  - flow $fid: \`$(basename -- "$fpath")\` ($(human_bytes "$fbytes"))"
             fid=$((fid + 1))
         done
-        echo
     else
-        echo "- **Mode:** seed synthesize (\`FLOWS=$flows\`, \`DURATION_S=${dur_s}s\`, payload ≈ rate × duration)"
-        echo "- **Seed:** \`$seed_path\`"
-        echo
+        echo "- **Mode:** seed synthesize FLOWS=$flows DURATION_S=${dur_s}s seed=\`$seed_path\`"
     fi
-    echo "## Case summary"
+    echo "- **PASS:** sha256 match on receiver for every flow"
+    echo "- **Link Mbps:** aggregate wire rate ≈ flows × source × (shards×232)/752 (UDP+header)"
     echo
-    echo "| Case | Codec | Mbps/flow | Agg Mbps | Max payload | Est. send s | Elapsed s | Snd RC | Rcv RC | Status | PASS | Loss avg % | E2E p95 µs | Jit p95 µs |"
-    echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |"
+    echo "## Results"
+    echo
+    echo "| Codec | Src Mbps | Link Mbps | Status | Loss % | E2E p95 µs | Notes |"
+    echo "| --- | ---: | ---: | --- | ---: | ---: | --- |"
 } > "$markdown"
 
-echo "codec,per_flow_mbps,flows,case_label,status,flows_pass,flows_total,agg_target_mbps,payload_bytes_per_flow,max_payload_bytes,est_send_s,elapsed_s,sender_rc,receiver_rc,est_loss_pct_avg,e2e_p95_us_avg,jitter_p95_us_avg" \
+echo "codec,src_mbps_per_flow,link_mbps,flows,status,flows_pass,loss_pct,e2e_p95_us,elapsed_s,sender_rc,receiver_rc,notes" \
     > "$csv"
-echo "codec,per_flow_mbps,case_label,flow_id,log_fid,status,hash_match,payload_bytes,output_bytes,target_mbps,eff_mbps,datagrams,seen_datagrams,late,duplicates,malformed,decoded_blocks,est_dgram_loss_pct,late_pct,group_drop_pct,recovered_pct,recovered_groups,dropped_groups,missing_data_shards,e2e_p50_us,e2e_p95_us,e2e_p99_us,jitter_p95_us,encode_p95_us,decode_p95_us,sender_blocks,sender_source_bytes,sender_order_ok,fail_reason,matched_output" \
+echo "codec,src_mbps,link_mbps_per_flow,flow_id,status,loss_pct,payload_bytes,output_bytes,e2e_p95_us,fail_reason" \
     > "$flows_csv"
 
 case_number=0
@@ -555,9 +577,14 @@ for codec in $codecs; do
         remote_prefix="$remote_base/out_"
         receiver_log="$result_dir/logs/$label-receiver.log"
         sender_log="$result_dir/logs/$label-sender.log"
-        mkdir -p "$case_dir" "$payload_dir"
+        mkdir -p "$payload_dir"
+        if [ "$fetch_out" = "1" ]; then
+            mkdir -p "$case_dir"
+        fi
 
-        echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps ==="
+        case_link=$(link_mbps "$codec" "$rate" "$flows")
+        case_link_per_flow=$(link_mbps "$codec" "$rate" 1)
+        echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps src / ${case_link}Mbps link ==="
 
         flow_args=
         out_suffix_args=
@@ -565,36 +592,39 @@ for codec in $codecs; do
         nbytes_ref=NA
         max_payload=0
         while [ "$fid" -lt "$flows" ]; do
-            pout="$payload_dir/flow${fid}.bin"
             if [ "$user_files" -eq 1 ]; then
                 src=$(sed -n "$((fid + 1))p" "$input_list")
-                cp -f -- "$src" "$pout"
+                # Hash in place — do not copy large user files into build/.
+                send_path=$src
+                sha256sum "$src" | awk '{print $1}' > "$payload_dir/flow${fid}.sha256"
+                fbytes=$(wc -c < "$src" | tr -d ' ')
+                printf '%s\n' "$fbytes" > "$payload_dir/flow${fid}.bytes"
+                printf '%s\n' "$src" > "$payload_dir/flow${fid}.path"
+                srcname=$(basename -- "$src")
+                case "$srcname" in
+                    *.*) flow_ext=".${srcname##*.}" ;;
+                    *)   flow_ext= ;;
+                esac
             else
+                send_path="$payload_dir/flow${fid}.bin"
                 nbytes=$(bytes_for "$rate" "$dur_s")
                 nbytes_ref=$nbytes
-                gen_payload "$seed_path" "$pout" "$nbytes" "${label}-flow${fid}"
+                gen_payload "$seed_path" "$send_path" "$nbytes" "${label}-flow${fid}"
+                sha256sum "$send_path" | awk '{print $1}' > "$payload_dir/flow${fid}.sha256"
+                fbytes=$nbytes
+                printf '%s\n' "$fbytes" > "$payload_dir/flow${fid}.bytes"
+                srcname=synthesized
+                flow_ext=.bin
             fi
-            sha256sum "$pout" > "$payload_dir/flow${fid}.sha256"
-            fbytes=$(wc -c < "$pout" | tr -d ' ')
             if [ "$nbytes_ref" = "NA" ]; then
                 nbytes_ref=$fbytes
             fi
             if [ "$fbytes" -gt "$max_payload" ]; then
                 max_payload=$fbytes
             fi
-            if [ "$user_files" -eq 1 ]; then
-                srcname=$(basename -- "$(sed -n "$((fid + 1))p" "$input_list")")
-                case "$srcname" in
-                    *.*) flow_ext=".${srcname##*.}" ;;
-                    *)   flow_ext= ;;
-                esac
-            else
-                srcname=synthesized
-                flow_ext=.bin
-            fi
             out_suffix_args="$out_suffix_args --out-suffix ${fid}:${flow_ext}"
             echo "  payload flow $fid: $fbytes bytes ($srcname)"
-            flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${pout}:${rate}"
+            flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${send_path}:${rate}"
             fid=$((fid + 1))
         done
         nbytes=$nbytes_ref
@@ -605,9 +635,8 @@ for codec in $codecs; do
         if [ "$need_idle" -gt "$case_idle" ]; then
             case_idle=$need_idle
         fi
-        echo "  idle-sec=$case_idle (auto from largest payload @ ${rate}Mbps; override with IDLE_SEC)"
-        echo "  sending (may take ~${need_idle}s for largest flow at ${rate}Mbps)..."
-        echo "  tip: mid-path speedometer should stay near ${rate}Mbps until send finishes; quiet path = stall"
+        echo "  idle-sec=$case_idle (auto from largest payload @ ${rate}Mbps src)"
+        echo "  sending (may take ~${need_idle}s)..."
 
         case_start=$(date +%s)
 
@@ -654,40 +683,23 @@ for codec in $codecs; do
         case_end=$(date +%s)
         case_elapsed=$((case_end - case_start))
 
-        # Validate on Node4 by sha256 first (scp of large files is unreliable for PASS/FAIL).
         loss_sum=0
         loss_n=0
         e2e_sum=0
         e2e_n=0
-        jit_sum=0
-        jit_n=0
-
-        {
-            echo
-            echo "### $label"
-            echo
-            echo "- UDP port **$port** | idle **${case_idle}s** | est. paced send **~${need_idle}s** | wall **${case_elapsed}s**"
-            echo "- Target: **${rate} Mbps/flow** × **$flows flows** → **$(awk -v f="$flows" -v r="$rate" 'BEGIN{print f*r}') Mbps** aggregate"
-            echo "- Sender rc=$sender_rc | Receiver rc=$receiver_rc"
-            echo
-            echo "| Wire | Log | Status | Payload | Out | Target Mbps | Eff Mbps | Loss % | Late % | Recov % | E2E p50 | E2E p95 | E2E p99 | Jit p95 | Enc p95 | Dec p95 | Order |"
-            echo "| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
-        } >> "$case_details"
+        case_notes=
+        loss_display=NA
 
         fid=0
         while [ "$fid" -lt "$flows" ]; do
-            want_hash=$(awk '{print $1}' "$payload_dir/flow${fid}.sha256")
-            payload_bytes=$(wc -c < "$payload_dir/flow${fid}.bin" | tr -d ' ')
+            want_hash=$(tr -d ' \n' < "$payload_dir/flow${fid}.sha256")
+            payload_bytes=$(tr -d ' \n' < "$payload_dir/flow${fid}.bytes")
             flow_status=FAIL
-            hash_match=no
-            matched=NA
             fail_reason=no_match
-            # Sender --flow id → receiver peer_map / log id (may differ).
             log_fid=$(wire_to_log_fid "$fid" "$receiver_log")
 
             remote_hit=
             remote_hash=NA
-            # Prefer the exact path from the receiver log (relative to remote_repo).
             log_out=$(flow_output_path "$log_fid" "$receiver_log")
             if [ -n "$log_out" ] && [ "$log_out" != "NA" ]; then
                 remote_hash=$(remote_sha256 "$log_out" || true)
@@ -695,7 +707,6 @@ for codec in $codecs; do
                     remote_hit=$log_out
                 fi
             fi
-            # Fallback: scan prefix glob (absolute paths under remote_base).
             if [ -z "$remote_hit" ]; then
                 remote_hit=$(remote_match_hash "$want_hash" "$remote_prefix" || true)
                 if [ -n "$remote_hit" ]; then
@@ -707,63 +718,57 @@ for codec in $codecs; do
                 fi
             fi
 
+            recv_blocks=$(flow_incomplete_field "$log_fid" received_blocks "$receiver_log")
+            expect_blocks=$(flow_incomplete_field "$log_fid" expected_blocks "$receiver_log")
+            missing_groups=$(flow_incomplete_field "$log_fid" missing_groups "$receiver_log")
+
             if [ -n "$remote_hit" ]; then
                 flow_status=PASS
-                hash_match=yes
-                matched=$remote_hit
                 flows_pass=$((flows_pass + 1))
                 fail_reason=
             else
                 out_bytes_guess=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
-                if [ "$out_bytes_guess" != "NA" ] && [ "$out_bytes_guess" != "$payload_bytes" ]; then
+                if [ "$recv_blocks" != "NA" ]; then
+                    fail_reason="incomplete_recv=${recv_blocks}/${expect_blocks}_missing_groups=${missing_groups}"
+                elif [ "$out_bytes_guess" != "NA" ] && [ "$out_bytes_guess" != "$payload_bytes" ]; then
                     fail_reason="size_mismatch_out=${out_bytes_guess}_want=${payload_bytes}"
                 elif [ "$remote_hash" != "NA" ] && [ -n "$remote_hash" ] &&
                     [ "$remote_hash" != "$want_hash" ]; then
                     fail_reason="content_hash_mismatch"
                 else
-                    fail_reason="hash_mismatch_or_missing_remote_file"
+                    fail_reason="missing_or_incomplete"
                 fi
+                if [ -n "$case_notes" ]; then
+                    case_notes="$case_notes; "
+                fi
+                case_notes="${case_notes}f${fid}:${fail_reason}"
             fi
 
             datagrams=$(flow_csv_field "$log_fid" datagrams "$receiver_log")
             seen=$(flow_csv_field "$log_fid" seen_datagrams "$receiver_log")
             late=$(flow_csv_field "$log_fid" late "$receiver_log")
-            duplicates=$(flow_csv_field "$log_fid" duplicates "$receiver_log")
-            malformed=$(flow_csv_field "$log_fid" malformed "$receiver_log")
-            decoded_blocks=$(flow_csv_field "$log_fid" decoded_blocks "$receiver_log")
             recovered=$(flow_csv_field "$log_fid" recovered_groups "$receiver_log")
             dropped=$(flow_csv_field "$log_fid" dropped_groups "$receiver_log")
-            missing=$(flow_csv_field "$log_fid" missing_data_shards "$receiver_log")
             out_bytes=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
-            e2e_p50=$(flow_latency_stat "$log_fid" end_to_end p50_us "$receiver_log")
-            e2e_p95=$(flow_latency_stat "$log_fid" end_to_end p95_us "$receiver_log")
-            e2e_p99=$(flow_latency_stat "$log_fid" end_to_end p99_us "$receiver_log")
-            jit_p95=$(flow_latency_stat "$log_fid" end_to_end_jitter p95_us "$receiver_log")
-            enc_p95=$(flow_latency_stat "$log_fid" encode p95_us "$receiver_log")
-            dec_p95=$(flow_latency_stat "$log_fid" decode p95_us "$receiver_log")
-            sender_blocks=$(sender_flow_field "$fid" blocks "$sender_log")
-            sender_source_bytes=$(sender_flow_field "$fid" source_bytes "$sender_log")
-            sender_order=$(sender_flow_field "$fid" order "$sender_log")
-            eff_mbps=$(throughput_mbps "$payload_bytes" "$case_elapsed")
+            e2e_p95=$(flow_latency_field "$log_fid" end_to_end p95_us "$receiver_log")
 
             # shellcheck disable=SC2086
-            set -- $(loss_stats "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" "$dropped" "$recovered")
+            set -- $(loss_stats "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" \
+                "$dropped" "$recovered" "$recv_blocks" "$expect_blocks")
             est_loss=${1:-NA}
-            late_pct=${2:-NA}
-            drop_pct=${3:-NA}
-            rec_pct=${4:-NA}
 
-            echo "$codec,$rate,$label,$fid,$log_fid,$flow_status,$hash_match,$payload_bytes,$out_bytes,$rate,$eff_mbps,$datagrams,$seen,$late,$duplicates,$malformed,$decoded_blocks,$est_loss,$late_pct,$drop_pct,$rec_pct,$recovered,$dropped,$missing,$e2e_p50,$e2e_p95,$e2e_p99,$jit_p95,$enc_p95,$dec_p95,$sender_blocks,$sender_source_bytes,$sender_order,$fail_reason,$matched" \
+            echo "$codec,$rate,$case_link_per_flow,$fid,$flow_status,$est_loss,$payload_bytes,$out_bytes,$e2e_p95,$fail_reason" \
                 >> "$flows_csv"
-
-            echo "| $fid | $log_fid | $flow_status | $(human_bytes "$payload_bytes") | ${out_bytes:-NA} | $rate | $eff_mbps | $est_loss | $late_pct | $rec_pct | $e2e_p50 | $e2e_p95 | $e2e_p99 | $jit_p95 | $enc_p95 | $dec_p95 | $sender_order |" \
-                >> "$case_details"
 
             case "$est_loss" in
                 NA|'') ;;
                 *)
                     loss_sum=$(awk -v a="$loss_sum" -v b="$est_loss" 'BEGIN{print a+b}')
                     loss_n=$((loss_n + 1))
+                    # Prefer the largest flow's loss for the case display.
+                    if [ "$payload_bytes" -eq "$max_payload" ]; then
+                        loss_display=$est_loss
+                    fi
                     ;;
             esac
             case "$e2e_p95" in
@@ -773,37 +778,22 @@ for codec in $codecs; do
                     e2e_n=$((e2e_n + 1))
                     ;;
             esac
-            case "$jit_p95" in
-                NA|'') ;;
-                *)
-                    jit_sum=$(awk -v a="$jit_sum" -v b="$jit_p95" 'BEGIN{print a+b}')
-                    jit_n=$((jit_n + 1))
-                    ;;
-            esac
 
             if [ "$flow_status" = "PASS" ]; then
-                echo "  flow $fid -> PASS  loss%=$est_loss  e2e_p95=$e2e_p95  eff=${eff_mbps}Mbps  order=$sender_order"
+                echo "  flow $fid -> PASS  loss%=$est_loss  e2e_p95=$e2e_p95"
             else
-                echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  out_bytes=$out_bytes  reason=$fail_reason"
-                echo "           wire_id=$fid log_id=$log_fid local_sha=$want_hash"
-                echo "           remote_sha=$remote_hash  remote_path=${log_out:-NA}"
-                echo "           recv: recovered=$recovered dropped=$dropped late=$late missing=$missing order=$sender_order"
+                echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  reason=$fail_reason"
+                echo "           wire_id=$fid log_id=$log_fid out_bytes=$out_bytes"
+                echo "           recv_blocks=$recv_blocks expect=$expect_blocks missing_groups=$missing_groups"
             fi
             fid=$((fid + 1))
         done
 
-        if [ "$flows_pass" -lt "$flows" ]; then
-            {
-                echo
-                echo "**Failures:** see console / \`logs/$label-receiver.log\` / \`logs/$label-sender.log\`"
-            } >> "$case_details"
-        fi
-
         if [ "$fetch_out" = "1" ]; then
-            echo "  fetching remote outputs (optional; not used for PASS/FAIL)..."
+            echo "  fetching remote outputs..."
             # shellcheck disable=SC2086
             scp $ssh_opts "$receiver_ssh:$remote_prefix*" "$case_dir/" >/dev/null 2>&1 || \
-                echo "  warning: scp fetch failed or partial (large files); remote hash already checked" >&2
+                echo "  warning: scp fetch failed or partial" >&2
         fi
 
         if [ "$sender_rc" -eq 0 ] && [ "$receiver_rc" -eq 0 ] &&
@@ -811,30 +801,31 @@ for codec in $codecs; do
             status=PASS
         fi
 
-        loss_avg=NA
-        e2e_avg=NA
-        jit_avg=NA
-        if [ "$loss_n" -gt 0 ]; then
-            loss_avg=$(awk -v s="$loss_sum" -v n="$loss_n" 'BEGIN{printf "%.4f", s/n}')
+        if [ "$loss_display" = "NA" ] && [ "$loss_n" -gt 0 ]; then
+            loss_display=$(awk -v s="$loss_sum" -v n="$loss_n" 'BEGIN{printf "%.4f", s/n}')
         fi
+        e2e_avg=NA
         if [ "$e2e_n" -gt 0 ]; then
             e2e_avg=$(awk -v s="$e2e_sum" -v n="$e2e_n" 'BEGIN{printf "%.3f", s/n}')
         fi
-        if [ "$jit_n" -gt 0 ]; then
-            jit_avg=$(awk -v s="$jit_sum" -v n="$jit_n" 'BEGIN{printf "%.3f", s/n}')
+        if [ -z "$case_notes" ]; then
+            case_notes="—"
         fi
 
-        agg=$(awk -v f="$flows" -v r="$rate" 'BEGIN{print f*r}')
-        echo "$codec,$rate,$flows,$label,$status,$flows_pass,$flows,$agg,$nbytes,$max_payload,$need_idle,$case_elapsed,$sender_rc,$receiver_rc,$loss_avg,$e2e_avg,$jit_avg" \
+        echo "$codec,$rate,$case_link,$flows,$status,$flows_pass/$flows,$loss_display,$e2e_avg,$case_elapsed,$sender_rc,$receiver_rc,$case_notes" \
             >> "$csv"
-        echo "| $label | $codec | $rate | $agg | $(human_bytes "$max_payload") | $need_idle | $case_elapsed | $sender_rc | $receiver_rc | $status | $flows_pass/$flows | $loss_avg | $e2e_avg | $jit_avg |" \
+        echo "| $codec | $rate | $case_link | $status | $loss_display | $e2e_avg | $case_notes |" \
             >> "$markdown"
+
+        if [ "$status" != "PASS" ]; then
+            echo "- \`$label\`: $case_notes (snd=$sender_rc rcv=$receiver_rc)" >> "$fail_notes"
+        fi
 
         case_total=$((case_total + 1))
         if [ "$status" = "PASS" ]; then
             case_pass=$((case_pass + 1))
         fi
-        echo "  -> case $status ($flows_pass/$flows flows)"
+        echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  link=${case_link}Mbps  loss%=$loss_display"
 
         if [ "$keep_remote" != "1" ]; then
             ssh $ssh_opts "$receiver_ssh" "rm -rf '$remote_base'" >/dev/null 2>&1 || true
@@ -846,38 +837,25 @@ done
 
 {
     echo
-    echo "## Case details"
-    cat "$case_details"
-    echo
-    echo "## Artifacts"
+    echo "## Summary"
     echo
     echo "- Cases PASS: **$case_pass / $case_total**"
-    echo "- \`results.csv\` — per codec×rate aggregate (bitrates, timing, RCs)"
-    echo "- \`flows.csv\` — per-flow rows (loss, latency, sender order check)"
-    echo "- Logs: \`logs/<case>-sender.log\`, \`logs/<case>-receiver.log\`"
-    echo "- Payloads: \`payloads/<case>/flowN.bin\` + sha256"
-    if [ "$fetch_out" = "1" ]; then
-        echo "- Local outputs (optional fetch): \`out/<case>/\`"
+    if [ -s "$fail_notes" ]; then
+        echo
+        echo "### Failures"
+        echo
+        cat "$fail_notes"
+        echo
     fi
-    if [ "$keep_remote" = "1" ]; then
-        echo "- Remote outputs: \`$remote_repo/build/wire-multiflow-${timestamp}-*/\` on $receiver_ssh"
-    fi
-    echo
-    echo "### Metric notes"
-    echo
-    echo "- **Target Mbps** — per-flow \`source_rate_mbps\` from sender (\`--flow id:host:port:file:rate\`)"
-    echo "- **Agg Mbps** — flows × per-flow rate (concurrent multi-send)"
-    echo "- **Eff Mbps** — payload bytes ÷ wall-clock case time (includes idle wait; not wire-only)"
-    echo "- **Loss %** — estimated from expected FEC shards vs \`seen_datagrams\`"
-    echo "- **Order** — sender \`order_ok\` / \`ORDER_CORRUPT\` (FlowManager ingress vs drain fingerprint)"
-    echo "- Mid-path speedometer ≈ per-flow target until send completes; quiet path mid-transfer = stall"
+    echo "Kept under \`$result_dir\`:"
+    echo "- \`results.md\` / \`results.csv\` / \`flows.csv\`"
+    echo "- \`logs/\` (sender + receiver)"
+    echo "- \`payloads/\` (sha256 only for user files; tiny seeds if synthesized)"
 } >> "$markdown"
+rm -f "$fail_notes"
 
 echo
 echo "Done. Cases PASS $case_pass / $case_total"
 echo "  Report: $markdown"
-echo "  CSV:    $csv"
-echo "  Flows:  $flows_csv"
-echo "  Logs:   $result_dir/logs/"
 echo
 cat "$markdown"
