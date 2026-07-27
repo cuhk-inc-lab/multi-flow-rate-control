@@ -13,14 +13,18 @@
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 seed.ts
 #
 # Artifacts under build/wire-multiflow-<ts>/ (kept lean):
-#   results.md   — compact summary (source/link Mbps, loss, latency)
+#   results.md   — compact summary (est. + measured link Mbps, loss, latency)
 #   results.csv  — one row per case
 #   flows.csv    — one row per flow
 #   logs/        — sender/receiver logs
+#   monitor/     — Node2/Node3 NIC timeseries (real relay bitrate)
 #   payloads/    — sha256 + tiny seed files only (no copies of user inputs)
 #   out/         — only if FETCH_OUTPUT=1
 
 set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+monitor_py="$script_dir/iperf_like_monitor.py"
 
 receiver_ssh=${1:-}
 receiver_ip=${2:-}
@@ -38,6 +42,12 @@ port_base=${PORT_BASE:-9100}
 keep_remote=${KEEP_REMOTE_OUTPUT:-0}
 fetch_out=${FETCH_OUTPUT:-0}
 use_no_pace=${USE_NO_PACE:-0}
+monitor_relays=${MONITOR_RELAYS:-1}
+monitor_hz=${MONITOR_HZ:-1}
+node2_ssh=${NODE2_SSH:-"fyp1@10.10.10.162"}
+node3_ssh=${NODE3_SSH:-"fyp1@10.10.10.163"}
+node2_ifaces=${NODE2_IFACES:-"ap0 station1"}
+node3_ifaces=${NODE3_IFACES:-"ap1 station2"}
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_dir=${RESULT_DIR:-"build/wire-multiflow-$timestamp"}
 ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
@@ -89,6 +99,10 @@ Env:
   KEEP_REMOTE_OUTPUT=0   keep remote out_* (default: delete after hash check)
   FETCH_OUTPUT=0         scp outputs into result dir (default: off; large)
   USE_NO_PACE=0
+  MONITOR_RELAYS=1       sample Node2/Node3 NIC bitrate during each case
+  MONITOR_HZ=1
+  NODE2_SSH=fyp1@10.10.10.162   NODE2_IFACES="ap0 station1"
+  NODE3_SSH=fyp1@10.10.10.163   NODE3_IFACES="ap1 station2"
   RECEIVER_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/wire-multiflow-<timestamp>
 EOF
@@ -328,6 +342,78 @@ print(f"{src * flows * ratio:.1f}")
 PY
 }
 
+# From iface CSV: print "peak_mbps avg_mbps" (max(rx,tx) per sample; avg only when >=1Mbps).
+monitor_mbps_summary() {
+    csv=$1
+    if [ ! -f "$csv" ]; then
+        echo "NA NA"
+        return
+    fi
+    python3 - "$csv" <<'PY'
+import csv, sys
+path = sys.argv[1]
+peaks = []
+active = []
+try:
+    with open(path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("iface") == "__cpu__":
+                continue
+            rx = float(row.get("rx_bps") or 0)
+            tx = float(row.get("tx_bps") or 0)
+            m = max(rx, tx) / 1e6
+            peaks.append(m)
+            if m >= 1.0:
+                active.append(m)
+except OSError:
+    print("NA NA")
+    raise SystemExit
+if not peaks:
+    print("NA NA")
+else:
+    peak = max(peaks)
+    avg = (sum(active) / len(active)) if active else 0.0
+    print(f"{peak:.1f} {avg:.1f}")
+PY
+}
+
+start_relay_monitor() {
+    host=$1
+    ifaces=$2
+    remote_csv=$3
+    local_csv=$4
+
+    if [ ! -f "$monitor_py" ]; then
+        echo ""
+        return
+    fi
+    # shellcheck disable=SC2086
+    if ! scp $ssh_opts "$monitor_py" "$host:/tmp/iperf_like_monitor.py" >/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+    pid=$(ssh $ssh_opts "$host" \
+        "rm -f '$remote_csv'; nohup python3 /tmp/iperf_like_monitor.py '$ifaces' '$monitor_hz' '$remote_csv' >/dev/null 2>&1 & echo \$!" \
+        2>/dev/null || true)
+    printf '%s\n' "$pid"
+}
+
+stop_relay_monitor() {
+    host=$1
+    pid=$2
+    remote_csv=$3
+    local_csv=$4
+
+    if [ -n "${pid:-}" ]; then
+        ssh $ssh_opts "$host" "kill $pid 2>/dev/null || true" >/dev/null 2>&1 || true
+        sleep 0.3
+        ssh $ssh_opts "$host" "kill -9 $pid 2>/dev/null || true" >/dev/null 2>&1 || true
+    fi
+    # shellcheck disable=SC2086
+    scp $ssh_opts "$host:$remote_csv" "$local_csv" >/dev/null 2>&1 || true
+    ssh $ssh_opts "$host" "rm -f '$remote_csv'" >/dev/null 2>&1 || true
+}
+
 source_agg_mbps() {
     awk -v f="$1" -v r="$2" 'BEGIN{printf "%.0f", f*r}'
 }
@@ -500,7 +586,7 @@ if [ "$flows" -gt 8 ]; then
     die "FLOWS=$flows exceeds binary max_flows limit 8"
 fi
 
-mkdir -p "$result_dir/logs" "$result_dir/payloads" \
+mkdir -p "$result_dir/logs" "$result_dir/payloads" "$result_dir/monitor" \
     || die "cannot create $result_dir"
 input_list="$result_dir/input_files.txt"
 : > "$input_list"
@@ -526,6 +612,22 @@ ssh $ssh_opts "$receiver_ssh" \
     "cd '$remote_repo' && test -x $bin_rel" \
     || die "Node4 is not reachable with key-based SSH, or its binary is missing"
 
+if [ "$monitor_relays" = "1" ]; then
+    if [ ! -f "$monitor_py" ]; then
+        echo "warning: missing $monitor_py; relay measure disabled" >&2
+        monitor_relays=0
+    else
+        echo "Relay monitors: Node2=$node2_ssh ($node2_ifaces)  Node3=$node3_ssh ($node3_ifaces)"
+        # Soft check — do not abort matrix if a relay is briefly unreachable.
+        if ! ssh $ssh_opts "$node2_ssh" "true" >/dev/null 2>&1; then
+            echo "warning: cannot SSH Node2 ($node2_ssh); N2 measure will be NA" >&2
+        fi
+        if ! ssh $ssh_opts "$node3_ssh" "true" >/dev/null 2>&1; then
+            echo "warning: cannot SSH Node3 ($node3_ssh); N3 measure will be NA" >&2
+        fi
+    fi
+fi
+
 pace_opt=
 if [ "$use_no_pace" = "1" ]; then
     pace_opt="--no-pace"
@@ -550,15 +652,18 @@ fi
         echo "- **Mode:** seed synthesize FLOWS=$flows DURATION_S=${dur_s}s seed=\`$seed_path\`"
     fi
     echo "- **PASS:** sha256 match on receiver for every flow"
-    echo "- **Link Mbps:** aggregate wire rate ≈ flows × source × (shards×232)/752 (UDP+header)"
+    echo "- **Link Mbps (est.):** flows × source × (shards×232)/752"
+    if [ "$monitor_relays" = "1" ]; then
+        echo "- **Measured:** Node2 \`$node2_ssh\` ($node2_ifaces) / Node3 \`$node3_ssh\` ($node3_ifaces) NIC peak/avg Mbps"
+    fi
     echo
     echo "## Results"
     echo
-    echo "| Codec | Src Mbps | Link Mbps | Status | Loss % | E2E p95 µs | Notes |"
-    echo "| --- | ---: | ---: | --- | ---: | ---: | --- |"
+    echo "| Codec | Src | Link est. | N2 peak | N2 avg | N3 peak | N3 avg | Status | Loss % | E2E p95 | Notes |"
+    echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |"
 } > "$markdown"
 
-echo "codec,src_mbps_per_flow,link_mbps,flows,status,flows_pass,loss_pct,e2e_p95_us,elapsed_s,sender_rc,receiver_rc,notes" \
+echo "codec,src_mbps_per_flow,link_mbps_est,n2_peak_mbps,n2_avg_mbps,n3_peak_mbps,n3_avg_mbps,flows,status,flows_pass,loss_pct,e2e_p95_us,elapsed_s,sender_rc,receiver_rc,notes" \
     > "$csv"
 echo "codec,src_mbps,link_mbps_per_flow,flow_id,status,loss_pct,payload_bytes,output_bytes,e2e_p95_us,fail_reason" \
     > "$flows_csv"
@@ -639,6 +744,12 @@ for codec in $codecs; do
         echo "  sending (may take ~${need_idle}s)..."
 
         case_start=$(date +%s)
+        n2_mon_pid=
+        n3_mon_pid=
+        n2_remote_csv="/tmp/wire-mf-${timestamp}-${label}-n2.csv"
+        n3_remote_csv="/tmp/wire-mf-${timestamp}-${label}-n3.csv"
+        n2_local_csv="$result_dir/monitor/${label}-node2.csv"
+        n3_local_csv="$result_dir/monitor/${label}-node3.csv"
 
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && rm -rf '$remote_base' && mkdir -p '$remote_base'" \
@@ -652,6 +763,15 @@ for codec in $codecs; do
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1
+
+        if [ "$monitor_relays" = "1" ]; then
+            n2_mon_pid=$(start_relay_monitor "$node2_ssh" "$node2_ifaces" \
+                "$n2_remote_csv" "$n2_local_csv")
+            n3_mon_pid=$(start_relay_monitor "$node3_ssh" "$node3_ifaces" \
+                "$n3_remote_csv" "$n3_local_csv")
+            echo "  monitors: n2_pid=${n2_mon_pid:-NA} n3_pid=${n3_mon_pid:-NA}"
+            sleep 1
+        fi
 
         sender_rc=1
         receiver_rc=1
@@ -680,8 +800,29 @@ for codec in $codecs; do
             echo "  receiver done (rc=$receiver_rc)"
         fi
 
+        if [ "$monitor_relays" = "1" ]; then
+            stop_relay_monitor "$node2_ssh" "${n2_mon_pid:-}" "$n2_remote_csv" "$n2_local_csv"
+            stop_relay_monitor "$node3_ssh" "${n3_mon_pid:-}" "$n3_remote_csv" "$n3_local_csv"
+        fi
+
         case_end=$(date +%s)
         case_elapsed=$((case_end - case_start))
+
+        n2_peak=NA
+        n2_avg=NA
+        n3_peak=NA
+        n3_avg=NA
+        if [ "$monitor_relays" = "1" ]; then
+            # shellcheck disable=SC2086
+            set -- $(monitor_mbps_summary "$n2_local_csv")
+            n2_peak=${1:-NA}
+            n2_avg=${2:-NA}
+            # shellcheck disable=SC2086
+            set -- $(monitor_mbps_summary "$n3_local_csv")
+            n3_peak=${1:-NA}
+            n3_avg=${2:-NA}
+            echo "  measured: N2 peak/avg=${n2_peak}/${n2_avg} Mbps  N3 peak/avg=${n3_peak}/${n3_avg} Mbps  (est link ${case_link})"
+        fi
 
         loss_sum=0
         loss_n=0
@@ -812,9 +953,9 @@ for codec in $codecs; do
             case_notes="—"
         fi
 
-        echo "$codec,$rate,$case_link,$flows,$status,$flows_pass/$flows,$loss_display,$e2e_avg,$case_elapsed,$sender_rc,$receiver_rc,$case_notes" \
+        echo "$codec,$rate,$case_link,$n2_peak,$n2_avg,$n3_peak,$n3_avg,$flows,$status,$flows_pass/$flows,$loss_display,$e2e_avg,$case_elapsed,$sender_rc,$receiver_rc,$case_notes" \
             >> "$csv"
-        echo "| $codec | $rate | $case_link | $status | $loss_display | $e2e_avg | $case_notes |" \
+        echo "| $codec | $rate | $case_link | $n2_peak | $n2_avg | $n3_peak | $n3_avg | $status | $loss_display | $e2e_avg | $case_notes |" \
             >> "$markdown"
 
         if [ "$status" != "PASS" ]; then
@@ -825,7 +966,7 @@ for codec in $codecs; do
         if [ "$status" = "PASS" ]; then
             case_pass=$((case_pass + 1))
         fi
-        echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  link=${case_link}Mbps  loss%=$loss_display"
+        echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  link_est=${case_link}  N2=${n2_peak}/${n2_avg}  N3=${n3_peak}/${n3_avg}  loss%=$loss_display"
 
         if [ "$keep_remote" != "1" ]; then
             ssh $ssh_opts "$receiver_ssh" "rm -rf '$remote_base'" >/dev/null 2>&1 || true
@@ -850,6 +991,9 @@ done
     echo "Kept under \`$result_dir\`:"
     echo "- \`results.md\` / \`results.csv\` / \`flows.csv\`"
     echo "- \`logs/\` (sender + receiver)"
+    if [ "$monitor_relays" = "1" ]; then
+        echo "- \`monitor/<case>-node{2,3}.csv\` — real relay NIC Mbps"
+    fi
     echo "- \`payloads/\` (sha256 only for user files; tiny seeds if synthesized)"
 } >> "$markdown"
 rm -f "$fail_notes"
