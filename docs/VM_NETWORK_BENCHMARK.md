@@ -174,6 +174,17 @@ FLOWS=4 DURATION_S=10 RATES="10 20" \
   ./scripts/run_wire_multiflow_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP seed.ts
 ```
 
+Optional teaching mode (same as single-flow matrix): append a `[WG_DECODE_MARK]`
+footer after `Codec_decode`. Hash will not match; successful cases report
+`MARKED`:
+
+```bash
+DECODE_MARK=1 KEEP_REMOTE_OUTPUT=1 CODECS="xor-fec" RATES="10" \
+  ./scripts/run_wire_multiflow_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP \
+    a.bin b.bin
+# On VM4: grep -n '\[WG_DECODE_MARK\]' build/wire-multiflow-*-*/out_*
+```
+
 Both endpoints must run the same wire protocol version. Synchronize VM1 and
 VM4 clocks before interpreting the cross-host transfer or end-to-end delay.
 

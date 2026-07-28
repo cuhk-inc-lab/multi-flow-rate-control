@@ -8,6 +8,10 @@
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 \
 #       a.bin b.bin c.bin d.bin
 #
+# Teaching decode-mark (footer proves Codec_decode; status MARKED):
+#   DECODE_MARK=1 KEEP_REMOTE_OUTPUT=1 CODECS="xor-fec" RATES="10" \
+#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 a.bin b.bin
+#
 # Or one seed file (legacy): script synthesizes FLOWS distinct payloads:
 #   FLOWS=4 DURATION_S=10 RATES="10 20" \
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 seed.ts
@@ -41,6 +45,7 @@ idle_sec=${IDLE_SEC:-10}
 port_base=${PORT_BASE:-9100}
 keep_remote=${KEEP_REMOTE_OUTPUT:-1}
 fetch_out=${FETCH_OUTPUT:-0}
+decode_mark=${DECODE_MARK:-0}
 use_no_pace=${USE_NO_PACE:-0}
 monitor_relays=${MONITOR_RELAYS:-1}
 monitor_hz=${MONITOR_HZ:-1}
@@ -98,6 +103,8 @@ Env:
   PORT_BASE=9100
   KEEP_REMOTE_OUTPUT=1   keep remote out_* (set 0 to delete after hash check)
   FETCH_OUTPUT=0         scp outputs into result dir (default: off; large)
+  DECODE_MARK=1          teaching mode: receiver --decode-mark; hash will not
+                         match; look for [WG_DECODE_MARK] footer / status MARKED
   USE_NO_PACE=0
   MONITOR_RELAYS=1       sample Node2/Node3 NIC bitrate during each case
   MONITOR_HZ=1
@@ -224,6 +231,17 @@ remote_match_hash() {
            if [ \"\$h\" = '$want_hash' ]; then echo \"\$f\"; exit 0; fi
          done
          exit 1"
+}
+
+# True if remote file contains the teaching decode footer.
+remote_has_decode_mark() {
+    path=$1
+    case "$path" in
+        /*) ssh $ssh_opts "$receiver_ssh" \
+            "grep -q '\\[WG_DECODE_MARK\\]' -- '$path' 2>/dev/null" ;;
+        *)  ssh $ssh_opts "$receiver_ssh" \
+            "cd '$remote_repo' && grep -q '\\[WG_DECODE_MARK\\]' -- '$path' 2>/dev/null" ;;
+    esac
 }
 
 latency_field() {
@@ -617,6 +635,10 @@ pace_opt=
 if [ "$use_no_pace" = "1" ]; then
     pace_opt="--no-pace"
 fi
+decode_mark_opt=
+if [ "$decode_mark" = "1" ]; then
+    decode_mark_opt="--decode-mark"
+fi
 
 {
     echo "# Wire multi-flow (Node1 → Node4)"
@@ -637,6 +659,11 @@ fi
         echo "- **Mode:** seed synthesize FLOWS=$flows DURATION_S=${dur_s}s seed=\`$seed_path\`"
     fi
     echo "- **PASS:** sha256 match on receiver for every flow"
+    if [ "$decode_mark" = "1" ]; then
+        echo "- **Decode-mark:** **ON** (receiver \`--decode-mark\`; hash will not match; look for \`[WG_DECODE_MARK]\` / status \`MARKED\`)"
+    else
+        echo "- **Decode-mark:** off (set \`DECODE_MARK=1\` to enable)"
+    fi
     # Link Mbps estimate removed (we only report measured relay NIC Mbps).
     if [ "$monitor_relays" = "1" ]; then
         echo "- **Measured:** Node2 \`$node2_ssh\` ($node2_ifaces) / Node3 \`$node3_ssh\` ($node3_ifaces) NIC peak/avg Mbps"
@@ -650,7 +677,7 @@ fi
 
 echo "codec,src_mbps_per_flow,n2_peak_mbps,n2_avg_mbps,n3_peak_mbps,n3_avg_mbps,flows,status,flows_pass,loss_pct,e2e_p95_us,elapsed_s,sender_rc,receiver_rc,notes" \
     > "$csv"
-echo "codec,src_mbps,flow_id,status,loss_pct,payload_bytes,output_bytes,e2e_p95_us,fail_reason" \
+echo "codec,src_mbps,flow_id,status,loss_pct,payload_bytes,output_bytes,e2e_p95_us,decode_mark_found,fail_reason" \
     > "$flows_csv"
 
 case_number=0
@@ -742,7 +769,7 @@ for codec in $codecs; do
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
               --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle' \
-              $out_suffix_args" \
+              $out_suffix_args $decode_mark_opt" \
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1
@@ -760,6 +787,7 @@ for codec in $codecs; do
         receiver_rc=1
         status=FAIL
         flows_pass=0
+        flows_marked=0
 
         if ! kill -0 "$receiver_pid" 2>/dev/null; then
             wait "$receiver_pid" || true
@@ -820,11 +848,16 @@ for codec in $codecs; do
             payload_bytes=$(tr -d ' \n' < "$payload_dir/flow${fid}.bytes")
             flow_status=FAIL
             fail_reason=no_match
+            mark_found=no
             log_fid=$(wire_to_log_fid "$fid" "$receiver_log")
 
             remote_hit=
             remote_hash=NA
             log_out=$(flow_output_path "$log_fid" "$receiver_log")
+            # Summary lines print wire flow_id; mapped id may differ — try both.
+            if [ -z "$log_out" ] || [ "$log_out" = "NA" ]; then
+                log_out=$(flow_output_path "$fid" "$receiver_log")
+            fi
             if [ -n "$log_out" ] && [ "$log_out" != "NA" ]; then
                 remote_hash=$(remote_sha256 "$log_out" || true)
                 if [ -n "$remote_hash" ] && [ "$remote_hash" = "$want_hash" ]; then
@@ -842,23 +875,61 @@ for codec in $codecs; do
                 fi
             fi
 
+            if [ "$decode_mark" = "1" ]; then
+                mark_field=$(flow_csv_field "$log_fid" decode_mark "$receiver_log")
+                if [ "$mark_field" = "NA" ] || [ -z "$mark_field" ]; then
+                    mark_field=$(flow_csv_field "$fid" decode_mark "$receiver_log")
+                fi
+                if [ "$mark_field" = "yes" ]; then
+                    mark_found=yes
+                elif [ -n "$log_out" ] && [ "$log_out" != "NA" ]; then
+                    if grep -F "decode-mark appended to $log_out" "$receiver_log" >/dev/null 2>&1 ||
+                        remote_has_decode_mark "$log_out"; then
+                        mark_found=yes
+                    fi
+                fi
+            fi
+
             recv_blocks=$(flow_incomplete_field "$log_fid" received_blocks "$receiver_log")
             expect_blocks=$(flow_incomplete_field "$log_fid" expected_blocks "$receiver_log")
             missing_groups=$(flow_incomplete_field "$log_fid" missing_groups "$receiver_log")
+            if [ "$recv_blocks" = "NA" ]; then
+                recv_blocks=$(flow_incomplete_field "$fid" received_blocks "$receiver_log")
+                expect_blocks=$(flow_incomplete_field "$fid" expected_blocks "$receiver_log")
+                missing_groups=$(flow_incomplete_field "$fid" missing_groups "$receiver_log")
+            fi
 
             if [ -n "$remote_hit" ]; then
                 flow_status=PASS
                 flows_pass=$((flows_pass + 1))
                 fail_reason=
+            elif [ "$decode_mark" = "1" ] && [ "$mark_found" = "yes" ]; then
+                # Footer changes sha256; mark proves Codec_decode ran.
+                flow_status=MARKED
+                flows_pass=$((flows_pass + 1))
+                flows_marked=$((flows_marked + 1))
+                fail_reason=
             else
                 out_bytes_guess=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
+                if [ "$out_bytes_guess" = "NA" ]; then
+                    out_bytes_guess=$(flow_csv_field "$fid" output_bytes "$receiver_log")
+                fi
                 if [ "$recv_blocks" != "NA" ]; then
                     fail_reason="incomplete_recv=${recv_blocks}/${expect_blocks}_missing_groups=${missing_groups}"
                 elif [ "$out_bytes_guess" != "NA" ] && [ "$out_bytes_guess" != "$payload_bytes" ]; then
-                    fail_reason="size_mismatch_out=${out_bytes_guess}_want=${payload_bytes}"
+                    # With decode-mark, output_bytes includes the footer — not a size mismatch.
+                    if [ "$decode_mark" = "1" ]; then
+                        fail_reason="decode_mark_missing_hash_mismatch"
+                    else
+                        fail_reason="size_mismatch_out=${out_bytes_guess}_want=${payload_bytes}"
+                    fi
                 elif [ "$remote_hash" != "NA" ] && [ -n "$remote_hash" ] &&
                     [ "$remote_hash" != "$want_hash" ]; then
-                    fail_reason="content_hash_mismatch"
+                    if [ "$decode_mark" = "1" ]; then
+                        fail_reason="decode_mark_missing"
+                    else
+                        fail_reason="content_hash_mismatch"
+                    fi
                 else
                     fail_reason="missing_or_incomplete"
                 fi
@@ -875,13 +946,24 @@ for codec in $codecs; do
             dropped=$(flow_csv_field "$log_fid" dropped_groups "$receiver_log")
             out_bytes=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
             e2e_p95=$(flow_latency_field "$log_fid" end_to_end p95_us "$receiver_log")
+            if [ "$datagrams" = "NA" ]; then
+                datagrams=$(flow_csv_field "$fid" datagrams "$receiver_log")
+                seen=$(flow_csv_field "$fid" seen_datagrams "$receiver_log")
+                late=$(flow_csv_field "$fid" late "$receiver_log")
+                recovered=$(flow_csv_field "$fid" recovered_groups "$receiver_log")
+                dropped=$(flow_csv_field "$fid" dropped_groups "$receiver_log")
+                out_bytes=$(flow_csv_field "$fid" output_bytes "$receiver_log")
+            fi
+            if [ "$e2e_p95" = "NA" ]; then
+                e2e_p95=$(flow_latency_field "$fid" end_to_end p95_us "$receiver_log")
+            fi
 
             # shellcheck disable=SC2086
             set -- $(loss_stats "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" \
                 "$dropped" "$recovered" "$recv_blocks" "$expect_blocks")
             est_loss=${1:-NA}
 
-            echo "$codec,$rate,$fid,$flow_status,$est_loss,$payload_bytes,$out_bytes,$e2e_p95,$fail_reason" \
+            echo "$codec,$rate,$fid,$flow_status,$est_loss,$payload_bytes,$out_bytes,$e2e_p95,$mark_found,$fail_reason" \
                 >> "$flows_csv"
 
             case "$est_loss" in
@@ -903,10 +985,10 @@ for codec in $codecs; do
                     ;;
             esac
 
-            if [ "$flow_status" = "PASS" ]; then
-                echo "  flow $fid -> PASS  loss%=$est_loss  e2e_p95=$e2e_p95"
+            if [ "$flow_status" = "PASS" ] || [ "$flow_status" = "MARKED" ]; then
+                echo "  flow $fid -> $flow_status  loss%=$est_loss  e2e_p95=$e2e_p95  mark=$mark_found"
             else
-                echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  reason=$fail_reason"
+                echo "  flow $fid -> FAIL  loss%=$est_loss  e2e_p95=$e2e_p95  mark=$mark_found  reason=$fail_reason"
                 echo "           wire_id=$fid log_id=$log_fid out_bytes=$out_bytes"
                 echo "           recv_blocks=$recv_blocks expect=$expect_blocks missing_groups=$missing_groups"
             fi
@@ -922,7 +1004,11 @@ for codec in $codecs; do
 
         if [ "$sender_rc" -eq 0 ] && [ "$receiver_rc" -eq 0 ] &&
             [ "$flows_pass" -eq "$flows" ]; then
-            status=PASS
+            if [ "$flows_marked" -gt 0 ]; then
+                status=MARKED
+            else
+                status=PASS
+            fi
         fi
 
         if [ "$loss_display" = "NA" ] && [ "$loss_n" -gt 0 ]; then
@@ -941,12 +1027,12 @@ for codec in $codecs; do
         echo "| $codec | $rate | $n2_peak | $n2_avg | $n3_peak | $n3_avg | $status | $loss_display | $e2e_avg | $case_notes |" \
             >> "$markdown"
 
-        if [ "$status" != "PASS" ]; then
+        if [ "$status" != "PASS" ] && [ "$status" != "MARKED" ]; then
             echo "- \`$label\`: $case_notes (snd=$sender_rc rcv=$receiver_rc)" >> "$fail_notes"
         fi
 
         case_total=$((case_total + 1))
-        if [ "$status" = "PASS" ]; then
+        if [ "$status" = "PASS" ] || [ "$status" = "MARKED" ]; then
             case_pass=$((case_pass + 1))
         fi
         echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  N2=${n2_peak}/${n2_avg}  N3=${n3_peak}/${n3_avg}  loss%=$loss_display"
@@ -963,7 +1049,7 @@ done
     echo
     echo "## Summary"
     echo
-    echo "- Cases PASS: **$case_pass / $case_total**"
+    echo "- Cases PASS/MARKED: **$case_pass / $case_total**"
     if [ -s "$fail_notes" ]; then
         echo
         echo "### Failures"
@@ -982,7 +1068,7 @@ done
 rm -f "$fail_notes"
 
 echo
-echo "Done. Cases PASS $case_pass / $case_total"
+echo "Done. Cases PASS/MARKED $case_pass / $case_total"
 echo "  Report: $markdown"
 echo
 cat "$markdown"

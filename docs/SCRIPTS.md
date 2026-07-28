@@ -87,6 +87,7 @@ Helper (kept for multiflow / stress relay NIC sampling):
 - `CODECS`, `RATES`, `FLOWS`, `DURATION_S`
 - `RECEIVER_REPO`, `IDLE_SEC`, `PORT_BASE`
 - `FETCH_OUTPUT`, `KEEP_REMOTE_OUTPUT`
+- `DECODE_MARK` (teaching mode: receiver `--decode-mark`; status `MARKED`)
 - `MONITOR_RELAYS`, `MONITOR_HZ`
 - `NODE2_SSH`, `NODE3_SSH`
 - `NODE2_IFACES`, `NODE3_IFACES`
