@@ -87,6 +87,7 @@ class Stream:
     file: str
     rate_mbps: float
     codec: str
+    flow_no: int = 0  # 1-based index in config order (human-facing)
     src_hash: str = ""
     src_bytes: int = 0
     dest_ip: str = ""
@@ -272,6 +273,7 @@ def validate_and_build(
             file=fpath,
             rate_mbps=rate,
             codec=codec,
+            flow_no=i + 1,
             dest_ip="127.0.0.1" if frm == to else nodes[to].ip,
             file_ext=file_ext_of(fpath),
         )
@@ -919,16 +921,21 @@ class Orchestrator:
                 )
 
     def write_report(self) -> int:
+        # Config order (flow_no), not wire id — ids can repeat across recv groups.
+        ordered = sorted(self.streams, key=lambda s: s.flow_no)
+
         csv_path = self.result_dir / "streams.csv"
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(
                 [
-                    "id",
+                    "flow",
                     "from",
                     "to",
-                    "codec",
+                    "path",
                     "rate_mbps",
+                    "codec",
+                    "wire_id",
                     "file",
                     "bytes",
                     "src_sha256",
@@ -940,14 +947,16 @@ class Orchestrator:
                     "note",
                 ]
             )
-            for st in sorted(self.streams, key=lambda s: s.id):
+            for st in ordered:
                 w.writerow(
                     [
-                        st.id,
+                        st.flow_no,
                         st.from_node,
                         st.to_node,
-                        st.codec,
+                        f"{st.from_node}->{st.to_node}",
                         st.rate_mbps,
+                        st.codec,
+                        st.id,
                         Path(st.file).name,
                         st.src_bytes,
                         st.src_hash,
@@ -1005,28 +1014,33 @@ class Orchestrator:
                 "",
                 "## Streams",
                 "",
-                "| id | from→to | codec | Mbps | bytes | status | note |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
+                "`flow` = config order (1..N). "
+                "`wire_id` = UDP wire flow_id inside that receiver process (0..7; "
+                "may repeat on different nodes/codecs).",
+                "",
+                "| flow | path | rate | codec | wire_id | recv port | status | note |",
+                "| ---: | --- | ---: | --- | ---: | ---: | --- | --- |",
             ]
         )
-        for st in sorted(self.streams, key=lambda s: s.id):
+        for st in ordered:
             lines.append(
-                f"| {st.id} | {st.from_node}→{st.to_node} | {st.codec} | "
-                f"{st.rate_mbps} | {human_bytes(st.src_bytes)} | {st.status} | {st.note} |"
+                f"| {st.flow_no} | {st.from_node}→{st.to_node} | {st.rate_mbps:g} | "
+                f"{st.codec} | {st.id} | {st.dest_port} | {st.status} | {st.note} |"
             )
         lines.extend(["", "## Process groups", "", "### Receivers", ""])
         for rg in self.recv_groups:
-            ids = ",".join(str(s.id) for s in rg.streams)
+            flows = ",".join(str(s.flow_no) for s in sorted(rg.streams, key=lambda x: x.flow_no))
+            wires = ",".join(str(s.id) for s in sorted(rg.streams, key=lambda x: x.id))
             lines.append(
                 f"- `{rg.to_node}` codec=`{rg.codec}` port=`{rg.port}` "
-                f"idle={rg.idle_sec}s flows=[{ids}]"
+                f"idle={rg.idle_sec}s flows=[{flows}] wire_ids=[{wires}]"
             )
         lines.extend(["", "### Senders", ""])
         for sg in self.send_groups:
-            ids = ",".join(str(s.id) for s in sg.streams)
+            flows = ",".join(str(s.flow_no) for s in sorted(sg.streams, key=lambda x: x.flow_no))
             lines.append(
                 f"- `{sg.from_node}` codec=`{sg.codec}` → "
-                f"`{sg.dest_ip}:{sg.dest_port}` flows=[{ids}]"
+                f"`{sg.dest_ip}:{sg.dest_port}` flows=[{flows}]"
             )
         md.write_text("\n".join(lines) + "\n", encoding="utf-8")
         log(f"Wrote {md}")
