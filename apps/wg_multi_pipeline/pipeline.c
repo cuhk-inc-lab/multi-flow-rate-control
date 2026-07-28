@@ -1072,24 +1072,23 @@ static int buffer_has_space(CircularBuffer *buf, size_t need)
 
 static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
 {
-    size_t per_flow_cap;
     size_t deferred_count;
 
     if (st == NULL || mgr == NULL) {
         return 0;
     }
 
-    per_flow_cap = mgr->config.per_flow_queue_capacity;
     deferred_count = flow_manager_deferred_count(mgr, st->flow_id);
 
     if (mixed_queue_count(&mgr->mixed) + 1 >= mgr->config.mixed_queue_capacity) {
         return 0;
     }
 
-    if (flow_buffer_count(&mgr->flows[st->flow_id].queue) + 1 >= per_flow_cap) {
-        return 0;
-    }
-
+    /*
+     * Do not gate on per-flow queue depth here. The dispatcher already keeps
+     * strict per-flow ordering with deferred queues when the flow queue is full.
+     * Skipping this lock-heavy check reduces ingress hot-path mutex traffic.
+     */
     if (deferred_count + 1 >= mgr->config.mixed_queue_capacity) {
         return 0;
     }
