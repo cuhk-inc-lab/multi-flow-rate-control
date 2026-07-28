@@ -27,12 +27,25 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 WIRE_MAX_FLOWS = 8
-SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+SSH_OPTS = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
+]
 
 
 def die(msg: str, code: int = 1) -> None:
-    print(f"error: {msg}", file=sys.stderr)
+    print(f"error: {msg}", file=sys.stderr, flush=True)
     raise SystemExit(code)
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def load_config(path: Path) -> dict:
@@ -491,7 +504,7 @@ class Orchestrator:
                 remote_path = (
                     f"{remote_payload_dir}/s{st.codec}_{st.id}_{local.name}"
                 )
-                print(f"  scp {local.name} -> {node.ssh}:{remote_path}")
+                log(f"  scp {local.name} -> {node.ssh}:{remote_path}")
                 scp_to(str(local), node.ssh, remote_path)
                 st.file = remote_path
             else:
@@ -538,17 +551,18 @@ class Orchestrator:
             except subprocess.CalledProcessError:
                 print(f"  warn: could not scp monitor to {name}", file=sys.stderr)
                 continue
+            # Detach stdin so SSH does not block waiting on the background job.
             cmd = (
                 f"rm -f {shlex.quote(remote_csv)}; "
                 f"nohup python3 /tmp/iperf_like_monitor.py "
                 f"{shlex.quote(node.monitor_ifaces)} {self.monitor_hz} "
-                f"{shlex.quote(remote_csv)} >/dev/null 2>&1 & echo $!"
+                f"{shlex.quote(remote_csv)} </dev/null >/dev/null 2>&1 & echo $!"
             )
             r = subprocess.run(ssh_cmd(node.ssh, cmd), capture_output=True, text=True)
             pid = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
             if pid.isdigit():
                 self.monitor_pids.append((node.ssh, pid, remote_csv, local_csv))
-                print(f"  monitor {name} pid={pid}")
+                log(f"  monitor {name} pid={pid}")
 
     def stop_monitors(self) -> None:
         for host, pid, remote_csv, local_csv in self.monitor_pids:
@@ -569,6 +583,9 @@ class Orchestrator:
             )
 
     def start_receivers(self) -> None:
+        # Remote receivers: keep SSH in the foreground (backgrounded locally),
+        # same pattern as run_wire_multiflow_matrix.sh. Avoids SSH hanging on
+        # nohup/background jobs that still hold the session.
         for rg in self.recv_groups:
             node = self.nodes[rg.to_node]
             prefix_name = "out_"
@@ -576,13 +593,17 @@ class Orchestrator:
             for st in sorted(rg.streams, key=lambda x: x.id):
                 suffix_args.extend(["--out-suffix", f"{st.id}:{st.file_ext}"])
 
+            local_log = (
+                self.result_dir / "logs" / f"recv_{rg.to_node}_{rg.codec}_{rg.port}.log"
+            )
+            rg.log_path = str(local_log)
+            logf = open(local_log, "w", encoding="utf-8")
+
             if node.is_local:
                 out_dir = self.result_dir / "out" / f"{rg.to_node}_{rg.codec}_{rg.port}"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 rg.remote_dir = str(out_dir)
                 rg.prefix = str(out_dir / prefix_name)
-                log = self.result_dir / "logs" / f"recv_{rg.to_node}_{rg.codec}_{rg.port}.log"
-                rg.log_path = str(log)
                 cmd = [
                     str(self.bin_path),
                     "--codec",
@@ -597,15 +618,13 @@ class Orchestrator:
                     str(rg.idle_sec),
                     *suffix_args,
                 ]
-                print(
+                log(
                     f"  recv local: port={rg.port} codec={rg.codec} "
                     f"flows={[s.id for s in rg.streams]} idle={rg.idle_sec}"
                 )
-                logf = open(log, "w", encoding="utf-8")
                 rg.local_proc = subprocess.Popen(
                     cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(self.repo_root)
                 )
-                rg.pid = rg.local_proc.pid
             else:
                 remote_dir = (
                     f"{node.remote_repo}/build/wire-stress-{self.stamp}/"
@@ -613,11 +632,6 @@ class Orchestrator:
                 )
                 rg.remote_dir = remote_dir
                 rg.prefix = f"{remote_dir}/{prefix_name}"
-                remote_log = f"{remote_dir}/recv.log"
-                local_log = (
-                    self.result_dir / "logs" / f"recv_{rg.to_node}_{rg.codec}_{rg.port}.log"
-                )
-                rg.log_path = str(local_log)
                 bin_rel = "./build/wg_multi_pipeline"
                 suffix_sh = " ".join(
                     f"--out-suffix {shlex.quote(f'{st.id}:{st.file_ext}')}"
@@ -625,33 +639,41 @@ class Orchestrator:
                 )
                 remote_cmd = (
                     f"cd {shlex.quote(node.remote_repo)} && "
-                    f"rm -rf {shlex.quote(remote_dir)} && mkdir -p {shlex.quote(remote_dir)} && "
-                    f"nohup {bin_rel} --codec {shlex.quote(rg.codec)} --lock-memory "
+                    f"rm -rf {shlex.quote(remote_dir)} && "
+                    f"mkdir -p {shlex.quote(remote_dir)} && "
+                    f"exec {bin_rel} --codec {shlex.quote(rg.codec)} --lock-memory "
                     f"--udp-recv {rg.port} {shlex.quote(rg.prefix)} "
                     f"--max-flows {len(rg.streams)} --idle-sec {rg.idle_sec} "
-                    f"{suffix_sh} >{shlex.quote(remote_log)} 2>&1 & echo $!"
+                    f"{suffix_sh}"
                 )
-                print(
+                log(
                     f"  recv {node.ssh}: port={rg.port} codec={rg.codec} "
                     f"flows={[s.id for s in rg.streams]} idle={rg.idle_sec}"
                 )
-                r = subprocess.run(
-                    ssh_cmd(node.ssh, remote_cmd), capture_output=True, text=True, check=True
+                rg.local_proc = subprocess.Popen(
+                    ssh_cmd(node.ssh, remote_cmd),
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
                 )
-                pid = (r.stdout or "").strip().splitlines()[-1]
-                if not pid.isdigit():
-                    die(f"failed to start receiver on {node.ssh}: {r.stdout!r} {r.stderr!r}")
-                rg.pid = int(pid)
+            rg.pid = rg.local_proc.pid
 
         time.sleep(1.0)
+        for rg in self.recv_groups:
+            if rg.local_proc is not None and rg.local_proc.poll() is not None:
+                die(
+                    f"receiver exited early ({rg.key}, rc={rg.local_proc.returncode}); "
+                    f"see {rg.log_path}"
+                )
+        log("  receivers are up")
 
     def start_senders(self) -> None:
         for sg in self.send_groups:
             node = self.nodes[sg.from_node]
-            log = self.result_dir / "logs" / (
+            slog = self.result_dir / "logs" / (
                 f"send_{sg.from_node}_{sg.codec}_{sg.dest_ip}_{sg.dest_port}.log"
             )
-            sg.log_path = str(log)
+            sg.log_path = str(slog)
+            logf = open(slog, "w", encoding="utf-8")
 
             flow_args: List[str] = []
             for st in sorted(sg.streams, key=lambda x: x.id):
@@ -668,22 +690,15 @@ class Orchestrator:
                     "--udp-send-multi",
                     *flow_args,
                 ]
-                print(
+                log(
                     f"  send local: codec={sg.codec} -> {sg.dest_ip}:{sg.dest_port} "
                     f"flows={[s.id for s in sg.streams]}"
                 )
-                logf = open(log, "w", encoding="utf-8")
                 sg.local_proc = subprocess.Popen(
                     cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(self.repo_root)
                 )
-                sg.pid = sg.local_proc.pid
             else:
                 bin_rel = "./build/wg_multi_pipeline"
-                remote_log = (
-                    f"{node.remote_repo}/build/wire-stress-{self.stamp}/"
-                    f"send_{sg.codec}_{sg.dest_port}.log"
-                )
-                sg.remote_log = remote_log
                 flow_parts = []
                 for st in sorted(sg.streams, key=lambda x: x.id):
                     path = sg.staged_files.get(st.id, st.file)
@@ -691,21 +706,19 @@ class Orchestrator:
                     flow_parts.extend(["--flow", shlex.quote(spec)])
                 remote_cmd = (
                     f"cd {shlex.quote(node.remote_repo)} && "
-                    f"mkdir -p $(dirname {shlex.quote(remote_log)}) && "
-                    f"nohup {bin_rel} --codec {shlex.quote(sg.codec)} --udp-send-multi "
-                    f"{' '.join(flow_parts)} >{shlex.quote(remote_log)} 2>&1 & echo $!"
+                    f"exec {bin_rel} --codec {shlex.quote(sg.codec)} --udp-send-multi "
+                    f"{' '.join(flow_parts)}"
                 )
-                print(
+                log(
                     f"  send {node.ssh}: codec={sg.codec} -> {sg.dest_ip}:{sg.dest_port} "
                     f"flows={[s.id for s in sg.streams]}"
                 )
-                r = subprocess.run(
-                    ssh_cmd(node.ssh, remote_cmd), capture_output=True, text=True, check=True
+                sg.local_proc = subprocess.Popen(
+                    ssh_cmd(node.ssh, remote_cmd),
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
                 )
-                pid = (r.stdout or "").strip().splitlines()[-1]
-                if not pid.isdigit():
-                    die(f"failed to start sender on {node.ssh}")
-                sg.pid = int(pid)
+            sg.pid = sg.local_proc.pid
 
     def wait_senders(self) -> None:
         max_wait = self.idle_sec + 60
@@ -713,97 +726,55 @@ class Orchestrator:
             max_wait = max(max_wait, eta_seconds(st.src_bytes, st.rate_mbps, self.idle_sec))
         for rg in self.recv_groups:
             max_wait = max(max_wait, rg.idle_sec + 30)
-        print(f"  waiting up to {max_wait}s for senders...")
+        log(f"  waiting up to {max_wait}s for senders...")
         deadline = time.time() + max_wait
         pending = list(self.send_groups)
         while pending and time.time() < deadline:
             still = []
             for sg in pending:
-                node = self.nodes[sg.from_node]
-                if sg.local_proc is not None:
-                    if sg.local_proc.poll() is None:
-                        still.append(sg)
-                else:
-                    r = subprocess.run(
-                        ssh_cmd(node.ssh, f"kill -0 {sg.pid} 2>/dev/null"),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    if r.returncode == 0:
-                        still.append(sg)
+                if sg.local_proc is not None and sg.local_proc.poll() is None:
+                    still.append(sg)
             pending = still
             if pending:
                 time.sleep(2)
         for sg in pending:
-            node = self.nodes[sg.from_node]
-            print(f"  warn: sender still running, killing {sg.key}", file=sys.stderr)
+            log(f"  warn: sender still running, killing {sg.key}")
             if sg.local_proc is not None:
                 sg.local_proc.send_signal(signal.SIGTERM)
                 try:
                     sg.local_proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     sg.local_proc.kill()
-            else:
-                subprocess.run(
-                    ssh_cmd(
-                        node.ssh,
-                        f"kill {sg.pid} 2>/dev/null; sleep 0.5; "
-                        f"kill -9 {sg.pid} 2>/dev/null || true",
-                    ),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
 
         # Wait for receivers to idle-exit
-        print("  waiting for receivers to idle-exit...")
+        log("  waiting for receivers to idle-exit...")
         recv_deadline = time.time() + max(rg.idle_sec for rg in self.recv_groups) + 30
         pending_r = list(self.recv_groups)
         while pending_r and time.time() < recv_deadline:
             still = []
             for rg in pending_r:
-                node = self.nodes[rg.to_node]
-                if rg.local_proc is not None:
-                    if rg.local_proc.poll() is None:
-                        still.append(rg)
-                else:
-                    r = subprocess.run(
-                        ssh_cmd(node.ssh, f"kill -0 {rg.pid} 2>/dev/null"),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    if r.returncode == 0:
-                        still.append(rg)
+                if rg.local_proc is not None and rg.local_proc.poll() is None:
+                    still.append(rg)
             pending_r = still
             if pending_r:
                 time.sleep(2)
 
     def stop_receivers(self) -> None:
         for rg in self.recv_groups:
-            node = self.nodes[rg.to_node]
-            if rg.local_proc is not None:
-                if rg.local_proc.poll() is None:
-                    rg.local_proc.send_signal(signal.SIGTERM)
-                    try:
-                        rg.local_proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        rg.local_proc.kill()
-            elif rg.pid:
-                subprocess.run(
-                    ssh_cmd(
-                        node.ssh,
-                        f"kill {rg.pid} 2>/dev/null; sleep 1; "
-                        f"kill -9 {rg.pid} 2>/dev/null || true",
-                    ),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            if not node.is_local:
-                scp_from(node.ssh, f"{rg.remote_dir}/recv.log", rg.log_path)
+            if rg.local_proc is not None and rg.local_proc.poll() is None:
+                rg.local_proc.send_signal(signal.SIGTERM)
+                try:
+                    rg.local_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    rg.local_proc.kill()
 
         for sg in self.send_groups:
-            node = self.nodes[sg.from_node]
-            if sg.remote_log and not node.is_local:
-                scp_from(node.ssh, sg.remote_log, sg.log_path)
+            if sg.local_proc is not None and sg.local_proc.poll() is None:
+                sg.local_proc.send_signal(signal.SIGTERM)
+                try:
+                    sg.local_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    sg.local_proc.kill()
 
     def validate_streams(self) -> None:
         for rg in self.recv_groups:
@@ -985,35 +956,35 @@ class Orchestrator:
                 f"`{sg.dest_ip}:{sg.dest_port}` flows=[{ids}]"
             )
         md.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print(f"Wrote {md}")
-        print(f"Wrote {csv_path}")
-        print(f"Summary: {n_pass} PASS / {n_fail} FAIL")
+        log(f"Wrote {md}")
+        log(f"Wrote {csv_path}")
+        log(f"Summary: {n_pass} PASS / {n_fail} FAIL")
         return n_fail
 
     def run(self) -> int:
-        print(f"Config: {self.cfg_path}")
-        print(f"Result: {self.result_dir}")
-        print(
+        log(f"Config: {self.cfg_path}")
+        log(f"Result: {self.result_dir}")
+        log(
             f"Streams: {len(self.streams)}  recv_groups: {len(self.recv_groups)}  "
             f"send_groups: {len(self.send_groups)}"
         )
         self.setup_dirs()
-        print("Staging sender files...")
+        log("Staging sender files...")
         self.stage_remote_sender_files()
-        print("Starting relay monitors...")
+        log("Starting relay monitors...")
         self.start_monitors()
         try:
-            print("Starting receivers...")
+            log("Starting receivers...")
             self.start_receivers()
-            print("Starting senders...")
+            log("Starting senders...")
             self.start_senders()
             self.wait_senders()
         finally:
-            print("Stopping receivers / fetching logs...")
+            log("Stopping receivers / fetching logs...")
             self.stop_receivers()
-            print("Stopping monitors...")
+            log("Stopping monitors...")
             self.stop_monitors()
-        print("Validating SHA256...")
+        log("Validating SHA256...")
         self.validate_streams()
         n_fail = self.write_report()
         return 1 if n_fail else 0
