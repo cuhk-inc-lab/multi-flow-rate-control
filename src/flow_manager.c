@@ -219,11 +219,7 @@ void flow_manager_dispatch_wake(FlowManager *mgr)
 
     pthread_mutex_lock(&mgr->dispatch_wake_mtx);
     mgr->dispatch_wake_gen++;
-    /*
-     * Only the single dispatcher thread waits on this condition variable.
-     * signal() avoids unnecessary wake fan-out under high PPS.
-     */
-    pthread_cond_signal(&mgr->dispatch_wake_cv);
+    pthread_cond_broadcast(&mgr->dispatch_wake_cv);
     pthread_mutex_unlock(&mgr->dispatch_wake_mtx);
 }
 

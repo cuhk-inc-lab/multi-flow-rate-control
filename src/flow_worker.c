@@ -118,13 +118,7 @@ void *flow_worker_thread(void *arg)
             ctx->pacing.has_stream_start = 0;
         }
 
-        /*
-         * Waking the dispatcher for every dequeued packet creates heavy
-         * synchronization traffic at high PPS. We only need to wake it when
-         * this flow actually has deferred packets waiting for queue space.
-         */
-        if (ctx->owner != NULL &&
-            flow_manager_deferred_count(ctx->owner, ctx->flow_id) > 0) {
+        if (ctx->owner != NULL) {
             flow_manager_dispatch_wake(ctx->owner);
         }
 
