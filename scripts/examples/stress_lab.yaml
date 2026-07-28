@@ -1,0 +1,75 @@
+# Configurable multi-stream wire stress test (Node1/2/3/4 lab topology).
+# Run from Node1:
+#   ./scripts/run_wire_stress.sh scripts/examples/stress_lab.yaml
+#
+# Rules:
+# - One wg_multi_pipeline process = one codec (runner auto-groups).
+# - Same (to, codec) share one UDP listen port / receiver process.
+# - Max 8 flows per receiver process.
+# - file paths are on the *sender* host (local path for ssh: local).
+
+nodes:
+  node1:
+    ssh: local
+    ip: 10.10.12.1
+  node2:
+    ssh: fyp1@10.10.10.162
+    ip: 10.10.12.2
+    # Optional NIC monitor ifaces (used when defaults.monitor: true)
+    monitor_ifaces: "ap0 station1"
+  node3:
+    ssh: fyp1@10.10.10.163
+    ip: 10.10.23.2
+    monitor_ifaces: "ap1 station2"
+  node4:
+    ssh: fyp1@10.10.10.164
+    ip: 10.10.34.2
+
+defaults:
+  idle_sec: 20
+  port_base: 9200
+  monitor: true
+  keep_remote_output: true
+  # Repo path on remote nodes (where build/wg_multi_pipeline lives)
+  remote_repo: ~/work/multi-flow-rate-control
+
+streams:
+  # Recreate a 6-stream lab recipe: three codecs × two rates into Node4.
+  # id is the wire flow_id within each (to, codec) receiver process (0..7).
+  # Same id may be reused across different codecs (separate processes/ports).
+  - id: 0
+    from: node1
+    to: node4
+    file: te.mp4
+    rate_mbps: 10
+    codec: copy
+  - id: 1
+    from: node1
+    to: node4
+    file: te.mp4
+    rate_mbps: 30
+    codec: copy
+  - id: 0
+    from: node1
+    to: node4
+    file: te.mp4
+    rate_mbps: 10
+    codec: xor-fec
+  - id: 1
+    from: node1
+    to: node4
+    file: te.mp4
+    rate_mbps: 30
+    codec: xor-fec
+  - id: 0
+    from: node1
+    to: node4
+    file: te.mp4
+    rate_mbps: 10
+    codec: rs-fec
+  - id: 1
+    from: node1
+    to: node4
+    file: te.mp4
+    rate_mbps: 30
+    codec: rs-fec

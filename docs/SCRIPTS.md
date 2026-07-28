@@ -19,14 +19,16 @@ it, and the most common command forms.
 | `scripts/run_vm_baseline.sh` | Single sender/receiver `iperf3` TCP+UDP baseline | Verify raw path capacity/loss before app tests |
 | `scripts/run_wire_matrix.sh` | Single-flow codec×rate matrix (Node1 -> Node4) | Find passing bitrate per codec |
 | `scripts/run_wire_multiflow_matrix.sh` | Multi-flow codec×rate matrix with per-flow checks | Validate concurrent flow behavior and relay load |
+| `scripts/run_wire_stress.sh` | Configurable multi-stream stress (YAML/JSON) | Custom from/to/file/rate/codec mixes across nodes |
 | `scripts/encode_multibitrate.sh` | Generate `input_1m.ts` / `input_10m.ts` / `input_20m.ts` | Prepare demo sources |
 | `scripts/run_dual_fifo.sh` | Live 3-stream FIFO demo with ffplay windows | Visual local demo of multi-flow processing |
 
-Helper (kept for multiflow relay NIC sampling):
+Helper (kept for multiflow / stress relay NIC sampling):
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/iperf_like_monitor.py` | Sample NIC/CPU timeseries; used by multiflow matrix |
+| `scripts/iperf_like_monitor.py` | Sample NIC/CPU timeseries; used by multiflow matrix and stress |
+| `scripts/wire_stress_run.py` | Orchestrator behind `run_wire_stress.sh` |
 
 ## Script Details
 
@@ -91,6 +93,33 @@ Helper (kept for multiflow relay NIC sampling):
 
 ---
 
+### `run_wire_stress.sh`
+
+**What it does**
+- Runs a configurable multi-stream wire stress from a YAML or JSON config.
+- Each stream sets `from` / `to` / `file` / `rate_mbps` / `codec`.
+- Auto-groups processes: same `(to, codec)` share one `--udp-recv` (one UDP
+  port); same `(from, codec, dest)` share one `--udp-send-multi`.
+- Stages files to remote senders when needed; SHA-256 checks each stream.
+- Optionally samples relay NIC bitrate (`monitor_ifaces` on nodes).
+
+**Usage**
+- `./scripts/run_wire_stress.sh scripts/examples/stress_lab.yaml`
+- JSON works without PyYAML: `./scripts/run_wire_stress.sh my_stress.json`
+
+**Config notes**
+- `ssh: local` runs on this host; otherwise `user@host` over SSH.
+- Stream `id` is the wire `flow_id` (0..7), unique per `(to, codec)`.
+- Max 8 flows per receiver process.
+- Loopback: `to: loopback` (or same `from`/`to`) uses `127.0.0.1`.
+- YAML needs PyYAML; JSON uses the stdlib only.
+
+**Key env / flags**
+- `RESULT_DIR` or `--result-dir DIR` (default `build/wire-stress-<ts>/`)
+- Artifacts: `results.md`, `streams.csv`, `logs/`, `monitor/`, config copy
+
+---
+
 ### `encode_multibitrate.sh`
 
 **What it does**
@@ -130,5 +159,6 @@ Helper (kept for multiflow relay NIC sampling):
 2. Validate app behavior:
    - `run_wire_matrix.sh` (single flow codec sweep)
    - `run_wire_multiflow_matrix.sh` (multi-flow)
+   - `run_wire_stress.sh` (custom multi-stream / multi-node recipe)
 3. Optional local demo:
    - `encode_multibitrate.sh` then `run_dual_fifo.sh`

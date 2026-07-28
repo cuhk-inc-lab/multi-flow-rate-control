@@ -97,6 +97,8 @@ Script catalog (purpose + usage + key env):
   - `CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" ./scripts/run_wire_matrix.sh NODE4_SSH NODE4_DATA_IP input.ts`
 - Multi-flow matrix (one file per flow):
   - `CODECS="copy xor-fec" RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh NODE4_SSH NODE4_DATA_IP a.bin b.bin`
+- Configurable multi-stream stress (YAML/JSON; see `scripts/examples/stress_lab.yaml`):
+  - `./scripts/run_wire_stress.sh scripts/examples/stress_lab.yaml`
 
 ## Build & test
 
