@@ -29,6 +29,7 @@ Helper (kept for multiflow / stress relay NIC sampling):
 | --- | --- |
 | `scripts/iperf_like_monitor.py` | Sample NIC/CPU timeseries; used by multiflow matrix and stress |
 | `scripts/wire_stress_run.py` | Orchestrator behind `run_wire_stress.sh` |
+| `scripts/wire_stress_charts.py` | SVG CPU/RX/TX charts from stress `monitor/*.csv` |
 
 ## Script Details
 
@@ -102,7 +103,8 @@ Helper (kept for multiflow / stress relay NIC sampling):
 - Auto-groups processes: same `(to, codec)` share one `--udp-recv` (one UDP
   port); same `(from, codec, dest)` share one `--udp-send-multi`.
 - Stages files to remote senders when needed; SHA-256 checks each stream.
-- Optionally samples relay NIC bitrate (`monitor_ifaces` on nodes).
+- Samples **every involved node** (CPU + NIC TX/RX) when `defaults.monitor` is
+  true, and writes SVG line charts under `charts/` (embedded in `results.md`).
 
 **Usage**
 - `./scripts/run_wire_stress.sh scripts/examples/stress_lab.yaml`
@@ -113,11 +115,14 @@ Helper (kept for multiflow / stress relay NIC sampling):
 - Stream `id` is the wire `flow_id` (0..7), unique per `(to, codec)`.
 - Max 8 flows per receiver process.
 - Loopback: `to: loopback` (or same `from`/`to`) uses `127.0.0.1`.
+- Set `monitor_ifaces` per node (lab defaults: node1 `station0`, node2
+  `ap0 station1`, node3 `ap1 station2`, node4 `ap2`). Empty → CPU only.
 - YAML needs PyYAML; JSON uses the stdlib only.
 
 **Key env / flags**
 - `RESULT_DIR` or `--result-dir DIR` (default `build/wire-stress-<ts>/`)
-- Artifacts: `results.md`, `streams.csv`, `logs/`, `monitor/`, config copy
+- Artifacts: `results.md`, `streams.csv`, `logs/`, `monitor/`, `charts/*.svg`,
+  config copy
 
 ---
 

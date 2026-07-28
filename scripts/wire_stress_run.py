@@ -459,7 +459,9 @@ class Orchestrator:
         self.recv_groups, self.send_groups = assign_ports_and_groups(
             self.streams, self.port_base
         )
-        self.monitor_pids: List[Tuple[str, str, str, Path]] = []
+        # Each job: {"kind": "local"|"remote", "name", "ssh", "pid", "remote_csv",
+        #            "local_csv", "proc"}
+        self.monitor_jobs: List[dict] = []
         self.stamp = result_dir.name.replace("wire-stress-", "", 1)
         if self.stamp == result_dir.name:
             self.stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -470,9 +472,16 @@ class Orchestrator:
             rg.idle_sec = max_eta
 
     def setup_dirs(self) -> None:
-        for sub in ("logs", "monitor", "payloads", "out"):
+        for sub in ("logs", "monitor", "payloads", "out", "charts"):
             (self.result_dir / sub).mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.cfg_path, self.result_dir / f"config{self.cfg_path.suffix}")
+
+    def _nodes_to_monitor(self) -> List[str]:
+        names = set()
+        for st in self.streams:
+            names.add(st.from_node)
+            names.add(st.to_node)
+        return sorted(names)
 
     def stage_remote_sender_files(self) -> None:
         for st in self.streams:
@@ -541,31 +550,82 @@ class Orchestrator:
     def start_monitors(self) -> None:
         if not self.monitor or not self.monitor_py.is_file():
             return
-        for name, node in self.nodes.items():
-            if node.is_local or not node.monitor_ifaces:
-                continue
-            remote_csv = f"/tmp/wire-stress-mon-{self.stamp}-{name}.csv"
+        for name in self._nodes_to_monitor():
+            node = self.nodes[name]
+            iface_arg = (node.monitor_ifaces or "").strip() or "-"
             local_csv = self.result_dir / "monitor" / f"{name}.csv"
+
+            if node.is_local:
+                mon_log = self.result_dir / "monitor" / f"{name}.monitor.log"
+                logf = open(mon_log, "w", encoding="utf-8")
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(self.monitor_py),
+                        iface_arg,
+                        str(self.monitor_hz),
+                        str(local_csv),
+                    ],
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                )
+                self.monitor_jobs.append(
+                    {
+                        "kind": "local",
+                        "name": name,
+                        "ssh": "local",
+                        "pid": proc.pid,
+                        "remote_csv": "",
+                        "local_csv": local_csv,
+                        "proc": proc,
+                    }
+                )
+                log(f"  monitor {name} (local) pid={proc.pid} ifaces={iface_arg}")
+                continue
+
+            remote_csv = f"/tmp/wire-stress-mon-{self.stamp}-{name}.csv"
             try:
                 scp_to(str(self.monitor_py), node.ssh, "/tmp/iperf_like_monitor.py")
             except subprocess.CalledProcessError:
                 print(f"  warn: could not scp monitor to {name}", file=sys.stderr)
                 continue
-            # Detach stdin so SSH does not block waiting on the background job.
             cmd = (
                 f"rm -f {shlex.quote(remote_csv)}; "
                 f"nohup python3 /tmp/iperf_like_monitor.py "
-                f"{shlex.quote(node.monitor_ifaces)} {self.monitor_hz} "
+                f"{shlex.quote(iface_arg)} {self.monitor_hz} "
                 f"{shlex.quote(remote_csv)} </dev/null >/dev/null 2>&1 & echo $!"
             )
             r = subprocess.run(ssh_cmd(node.ssh, cmd), capture_output=True, text=True)
             pid = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
             if pid.isdigit():
-                self.monitor_pids.append((node.ssh, pid, remote_csv, local_csv))
-                log(f"  monitor {name} pid={pid}")
+                self.monitor_jobs.append(
+                    {
+                        "kind": "remote",
+                        "name": name,
+                        "ssh": node.ssh,
+                        "pid": pid,
+                        "remote_csv": remote_csv,
+                        "local_csv": local_csv,
+                        "proc": None,
+                    }
+                )
+                log(f"  monitor {name} pid={pid} ifaces={iface_arg}")
 
     def stop_monitors(self) -> None:
-        for host, pid, remote_csv, local_csv in self.monitor_pids:
+        for job in self.monitor_jobs:
+            if job["kind"] == "local":
+                proc = job.get("proc")
+                if proc is not None and proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                continue
+            host = job["ssh"]
+            pid = job["pid"]
+            remote_csv = job["remote_csv"]
+            local_csv = job["local_csv"]
             subprocess.run(
                 ssh_cmd(
                     host,
@@ -905,7 +965,18 @@ class Orchestrator:
             csvf = self.result_dir / "monitor" / f"{name}.csv"
             if csvf.is_file():
                 peak, avg = nic_peak_avg(csvf)
-                mon_lines.append(f"- **{name}**: peak {peak} Mbps, avg {avg} Mbps")
+                mon_lines.append(f"- **{name}**: NIC peak {peak} / avg {avg} Mbps")
+
+        chart_lines: List[str] = []
+        try:
+            charts_dir = Path(__file__).resolve().parent
+            if str(charts_dir) not in sys.path:
+                sys.path.insert(0, str(charts_dir))
+            from wire_stress_charts import build_charts
+
+            chart_lines = build_charts(self.result_dir)
+        except Exception as exc:  # noqa: BLE001 — chart failure must not abort report
+            chart_lines = [f"- (chart build failed: {exc})"]
 
         n_pass = sum(1 for s in self.streams if s.status == "PASS")
         n_fail = len(self.streams) - n_pass
@@ -920,13 +991,15 @@ class Orchestrator:
             f"- Sender groups: {len(self.send_groups)}",
             f"- idle_sec_base={self.idle_sec} port_base={self.port_base}",
             "",
-            "## Relay NIC (optional)",
+            "## Node CPU / NIC",
             "",
         ]
         if mon_lines:
             lines.extend(mon_lines)
         else:
             lines.append("- (no monitor data)")
+        lines.append("")
+        lines.extend(chart_lines)
         lines.extend(
             [
                 "",
@@ -971,8 +1044,10 @@ class Orchestrator:
         self.setup_dirs()
         log("Staging sender files...")
         self.stage_remote_sender_files()
-        log("Starting relay monitors...")
+        log("Starting node monitors (CPU + NIC)...")
         self.start_monitors()
+        # Let monitors establish a baseline sample before traffic.
+        time.sleep(max(1.0, self.monitor_hz))
         try:
             log("Starting receivers...")
             self.start_receivers()
