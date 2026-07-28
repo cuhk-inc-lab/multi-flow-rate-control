@@ -203,6 +203,21 @@ static double monotonic_seconds(void)
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
+static void sleep_until_monotonic(double target)
+{
+    double now = monotonic_seconds();
+    double delay;
+    struct timespec sleep_for;
+
+    if (target <= 0.0 || now <= 0.0 || target <= now) {
+        return;
+    }
+    delay = target - now;
+    sleep_for.tv_sec = (time_t)delay;
+    sleep_for.tv_nsec = (long)((delay - (double)sleep_for.tv_sec) * 1000000000.0);
+    (void)nanosleep(&sleep_for, NULL);
+}
+
 static void pace_to_source_rate(double started, uint64_t source_bytes,
                                 double source_rate_mbps)
 {
@@ -368,23 +383,49 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
         return -1;
     }
     shard_count = (uint16_t)(output_size / PKG_SIZE);
-    for (shard = 0; shard < shard_count; shard++) {
-        WireHeader header = {
-            .type = WIRE_TYPE_DATA,
-            .flow_id = tx->flow_id,
-            .block_id = tx->block_id,
-            .shard_index = shard,
-            .shard_count = shard_count,
-            .valid_len = (uint16_t)valid_len,
-            .payload_len = PKG_SIZE,
-            .encode_begin_ns = encode_begin_ns,
-            .encode_end_ns = encode_end_ns,
-        };
+    /*
+     * Smooth intra-block burst: at small packet sizes, sending all shards
+     * back-to-back can create microbursts that overflow multi-hop Wi-Fi queues.
+     * Spread shards across this block's source-rate time budget.
+     */
+    {
+        double block_budget_sec = 0.0;
+        double shard_spacing_sec = 0.0;
+        double shard_target = 0.0;
 
-        if (send_wire_datagram(tx->sock, (const struct sockaddr *)&tx->address,
-                               tx->address_len, &header,
-                               encoded_block + (size_t)shard * PKG_SIZE) != 0) {
-            return -1;
+        if (tx->source_rate_mbps > 0.0 && shard_count > 1 && valid_len > 0) {
+            block_budget_sec =
+                ((double)valid_len * 8.0) / (tx->source_rate_mbps * 1000000.0);
+            shard_spacing_sec = block_budget_sec / (double)shard_count;
+            if (shard_spacing_sec < 0.0) {
+                shard_spacing_sec = 0.0;
+            }
+            shard_target = monotonic_seconds();
+        }
+
+        for (shard = 0; shard < shard_count; shard++) {
+            WireHeader header = {
+                .type = WIRE_TYPE_DATA,
+                .flow_id = tx->flow_id,
+                .block_id = tx->block_id,
+                .shard_index = shard,
+                .shard_count = shard_count,
+                .valid_len = (uint16_t)valid_len,
+                .payload_len = PKG_SIZE,
+                .encode_begin_ns = encode_begin_ns,
+                .encode_end_ns = encode_end_ns,
+            };
+
+            if (send_wire_datagram(tx->sock, (const struct sockaddr *)&tx->address,
+                                   tx->address_len, &header,
+                                   encoded_block + (size_t)shard * PKG_SIZE) != 0) {
+                return -1;
+            }
+
+            if (shard_spacing_sec > 0.0 && shard + 1 < shard_count) {
+                shard_target += shard_spacing_sec;
+                sleep_until_monotonic(shard_target);
+            }
         }
     }
     tx->source_bytes += valid_len;
