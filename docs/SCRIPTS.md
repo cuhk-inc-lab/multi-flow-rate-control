@@ -77,6 +77,7 @@ Helper (kept for multiflow / stress relay NIC sampling):
   - synthesized payloads from one seed file
 - Validates per-flow hashes on receiver side.
 - Reports measured Node2/Node3 relay NIC Mbps.
+- `CODECS="none"` now exercises wire raw passthrough (single-shard, no coding).
 
 **Usage**
 - User files mode (recommended):

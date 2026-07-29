@@ -485,7 +485,7 @@ int wire_udp_send(const WireUdpSendConfig *config)
     int result = -1;
 
     if (config == NULL || config->host == NULL || config->input_path == NULL ||
-        config->port == 0 || config->codec_kind == CODEC_KIND_NONE) {
+        config->port == 0) {
         return -1;
     }
 
@@ -1350,7 +1350,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     size_t        fi;
 
     if (config == NULL || config->output_path == NULL || config->port == 0 ||
-        config->codec_kind == CODEC_KIND_NONE || config->idle_sec == 0) {
+        config->idle_sec == 0) {
         return -1;
     }
 

@@ -1955,8 +1955,7 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     WgPipelineStatus  status = WG_PIPE_OK;
     unsigned char     work[CODEC_MAX_ENCODE_BLOCK];
 
-    if (config == NULL || config->flows == NULL || config->flow_count == 0 ||
-        config->codec_kind == CODEC_KIND_NONE) {
+    if (config == NULL || config->flows == NULL || config->flow_count == 0) {
         return WG_PIPE_ERR;
     }
 

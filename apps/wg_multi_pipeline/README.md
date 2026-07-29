@@ -30,7 +30,7 @@ cmp c.ts  out_c.ts
 | `--codec block` | Default: existing reversible `+/-` BlockCodec demo transform |
 | `--codec xor-fec` | Systematic XOR FEC: 4 data TS packets + 1 parity packet |
 | `--codec rs-fec` | Systematic Reed-Solomon FEC: 4 data TS packets + 2 parity packets |
-| `--codec none` / `--no-codec` | Optional relay: skip coding; pointer-only post-worker queue |
+| `--codec none` / `--no-codec` | Local relay: skip coding; pointer-only post-worker queue. In wire UDP modes, `none` sends raw single-shard blocks |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
@@ -239,5 +239,9 @@ ingress (flow_id or 5-tuple)
 `--udp-send-multi` mirrors local `--multi`: demux before encode, then the same
 per-flow encode step. Only the demux buffer (packet queue vs pipe) and
 post-encode egress (UDP vs local transfer/decode) differ.
+
+For wire UDP only, `--codec none` is supported as raw passthrough: each block is
+sent as a single `PKG_SIZE` shard with no parity and written back verbatim on the
+receiver.
 
 BlockCodec is a demo encode/decode transform only — not cryptographic encryption.

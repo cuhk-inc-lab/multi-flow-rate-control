@@ -285,9 +285,9 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] <input.ts> <output.ts>\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:src_ip:src_port:dst_ip:dst_port:host:port:input[:rate-mbps]> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|none] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|none] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:src_ip:src_port:dst_ip:dst_port:host:port:input[:rate-mbps]> ...\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|none] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
@@ -395,7 +395,7 @@ int main(int argc, char **argv)
         char *end = NULL;
         long port;
 
-        if (codec_kind == CODEC_KIND_NONE || argc - argi != 4) {
+        if (argc - argi != 4) {
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
@@ -427,11 +427,6 @@ int main(int argc, char **argv)
         uint32_t        i;
         FlowPeerMap    *peer_map = NULL;
         WgPipelineStatus status;
-
-        if (codec_kind == CODEC_KIND_NONE) {
-            print_usage(argv[0]);
-            return EXIT_FAILURE;
-        }
 
         argi++;
         while (argi < argc && strcmp(argv[argi], "--flow") == 0) {
@@ -616,7 +611,7 @@ int main(int argc, char **argv)
         long port;
         const char *output_path;
 
-        if (codec_kind == CODEC_KIND_NONE || argc - argi < 3) {
+        if (argc - argi < 3) {
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
