@@ -97,6 +97,7 @@ Examples:
 Env:
   CODECS="copy ..."
   RATES="10 20"           per-flow source Mbps (same for all flows in a case)
+                          use 0 = no wire source_rate pacing (omit :rate on --flow)
   FLOWS=N                 seed mode only; with multiple FILEs, count is automatic
   DURATION_S=10           seed mode only (payload ≈ rate × duration)
   IDLE_SEC=10
@@ -686,6 +687,9 @@ case_total=0
 
 for codec in $codecs; do
     for rate in $rates; do
+        if [ "$rate" = "0" ] && [ "$user_files" -ne 1 ]; then
+            die "RATES=0 (no wire pace) requires user input files; seed mode needs rate>0"
+        fi
         port=$((port_base + case_number))
         label="${codec}-${rate}m-${flows}f"
         case_dir="$result_dir/out/$label"
@@ -699,7 +703,11 @@ for codec in $codecs; do
             mkdir -p "$case_dir"
         fi
 
-        echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps src ==="
+        if [ "$rate" = "0" ]; then
+            echo "=== $label: UDP $port, $flows flows @ uncapped (no wire pace) ==="
+        else
+            echo "=== $label: UDP $port, $flows flows @ ${rate}Mbps src ==="
+        fi
 
         flow_args=
         out_suffix_args=
@@ -739,7 +747,12 @@ for codec in $codecs; do
             fi
             out_suffix_args="$out_suffix_args --out-suffix ${fid}:${flow_ext}"
             echo "  payload flow $fid: $fbytes bytes ($srcname)"
-            flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${send_path}:${rate}"
+            if [ "$rate" = "0" ]; then
+                # No :rate → wire TX source_rate_mbps=0 → no shard pacing.
+                flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${send_path}"
+            else
+                flow_args="$flow_args --flow ${fid}:${receiver_ip}:${port}:${send_path}:${rate}"
+            fi
             fid=$((fid + 1))
         done
         nbytes=$nbytes_ref
@@ -750,8 +763,13 @@ for codec in $codecs; do
         if [ "$need_idle" -gt "$case_idle" ]; then
             case_idle=$need_idle
         fi
-        echo "  idle-sec=$case_idle (auto from largest payload @ ${rate}Mbps src)"
-        echo "  sending (may take ~${need_idle}s)..."
+        if [ "$rate" = "0" ]; then
+            echo "  idle-sec=$case_idle (wire pacing OFF; auto idle from payload size)"
+            echo "  sending uncapped (expect high wire Mbps; loss likely)..."
+        else
+            echo "  idle-sec=$case_idle (auto from largest payload @ ${rate}Mbps src)"
+            echo "  sending (may take ~${need_idle}s)..."
+        fi
 
         case_start=$(date +%s)
         n2_mon_pid=

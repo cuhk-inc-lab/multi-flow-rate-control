@@ -27,6 +27,12 @@
 #define WIRE_MAX_SHARDS     (CODEC_MAX_ENCODE_BLOCK / PKG_SIZE)
 /* Larger UDP buffers reduce drops under multi-flow microbursts of 232 B datagrams. */
 #define WIRE_UDP_SOCKBUF    (8 * 1024 * 1024)
+/*
+ * Min inter-shard sleep for intra-block smoothing. Below this, nanosleep
+ * overshoots and caps achievable source rate; fall back to block pacing.
+ * (~12 Mbps xor-fec / ~10 Mbps rs-fec crossover with 752 B blocks.)
+ */
+#define WIRE_SHARD_PACE_MIN_SEC 0.0001
 
 static const char *wire_codec_kind_name(CodecKind kind)
 {
@@ -384,9 +390,12 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
     }
     shard_count = (uint16_t)(output_size / PKG_SIZE);
     /*
-     * Smooth intra-block burst: at small packet sizes, sending all shards
-     * back-to-back can create microbursts that overflow multi-hop Wi-Fi queues.
-     * Spread shards across this block's source-rate time budget.
+     * Hybrid pacing:
+     * - Low rate (shard spacing >= WIRE_SHARD_PACE_MIN_SEC): spread shards
+     *   across the block budget to avoid Wi-Fi microburst loss.
+     * - High rate (spacing too short for nanosleep): burst shards and rely on
+     *   wire_udp_tx_ready() block-level pacing so the configured source rate
+     *   is still achievable (short nanosleeps systematically overshoot).
      */
     {
         double block_budget_sec = 0.0;
@@ -397,10 +406,12 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
             block_budget_sec =
                 ((double)valid_len * 8.0) / (tx->source_rate_mbps * 1000000.0);
             shard_spacing_sec = block_budget_sec / (double)shard_count;
-            if (shard_spacing_sec < 0.0) {
+            if (shard_spacing_sec < WIRE_SHARD_PACE_MIN_SEC) {
                 shard_spacing_sec = 0.0;
             }
-            shard_target = monotonic_seconds();
+            if (shard_spacing_sec > 0.0) {
+                shard_target = monotonic_seconds();
+            }
         }
 
         for (shard = 0; shard < shard_count; shard++) {
