@@ -30,7 +30,7 @@
 /*
  * Min inter-shard sleep for intra-block smoothing. Below this, nanosleep
  * overshoots and caps achievable source rate; fall back to block pacing.
- * (~12 Mbps xor-fec / ~10 Mbps rs-fec crossover with 752 B blocks.)
+ * (~90 Mbps xor-fec / ~75 Mbps rs-fec crossover with 5600 B blocks.)
  */
 #define WIRE_SHARD_PACE_MIN_SEC 0.0001
 
@@ -1334,7 +1334,7 @@ static bool wire_flows_all_complete(const WireFlowCtx flows[], size_t max_flows)
 int wire_udp_recv(const WireUdpRecvConfig *config)
 {
     const Codec *codec;
-    WireFlowCtx  flows[WIRE_MAX_FLOWS] = {0};
+    WireFlowCtx *flows = NULL;
     FlowPeerMap *flow_map = NULL;
     unsigned char datagram[WIRE_HEADER_SIZE + PKG_SIZE];
     size_t        input_size;
@@ -1365,23 +1365,29 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
     multi_mode = max_flows > 1;
 
-    codec = Codec_get(config->codec_kind);
-    if (codec == NULL) {
+    /* Heap: each flow holds a reassembly window of large encode blocks. */
+    flows = calloc(WIRE_MAX_FLOWS, sizeof(*flows));
+    if (flows == NULL) {
         return -1;
     }
+
+    codec = Codec_get(config->codec_kind);
+    if (codec == NULL) {
+        goto cleanup;
+    }
     if (config->best_effort && !Codec_is_systematic(codec)) {
-        return -1;
+        goto cleanup;
     }
     input_size = Codec_input_block_size(codec);
     output_size = Codec_output_block_size(codec);
     if (input_size == 0 || output_size == 0 || output_size > CODEC_MAX_ENCODE_BLOCK ||
         output_size % PKG_SIZE != 0) {
-        return -1;
+        goto cleanup;
     }
     expected_shards = (uint16_t)(output_size / PKG_SIZE);
     if (expected_shards == 0 || expected_shards > WIRE_MAX_SHARDS ||
         expected_shards != Codec_data_shards(codec) + Codec_parity_shards(codec)) {
-        return -1;
+        goto cleanup;
     }
 
     sock = open_receiver_socket(config->port);
@@ -1638,8 +1644,11 @@ cleanup:
     if (flow_map != NULL) {
         flow_peer_map_destroy(flow_map);
     }
-    for (fi = 0; fi < max_flows; fi++) {
-        wire_flow_close(&flows[fi]);
+    if (flows != NULL) {
+        for (fi = 0; fi < WIRE_MAX_FLOWS; fi++) {
+            wire_flow_close(&flows[fi]);
+        }
+        free(flows);
     }
     if (sock >= 0) {
         close(sock);

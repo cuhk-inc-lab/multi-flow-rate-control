@@ -19,8 +19,8 @@ trap cleanup EXIT INT TERM
 python3 - "$input" <<'PY'
 from pathlib import Path
 import sys
-Path(sys.argv[1]).write_bytes(b"A" * 188 + b"B" * 188 +
-                              b"C" * 188 + b"D" * 188)
+Path(sys.argv[1]).write_bytes(b"A" * 1400 + b"B" * 1400 +
+                              b"C" * 1400 + b"D" * 1400)
 PY
 
 start_receiver() {
@@ -129,7 +129,7 @@ run_best_effort() {
     python3 - "$expected" <<'PY'
 from pathlib import Path
 import sys
-Path(sys.argv[1]).write_bytes(b"A" * 188 + b"C" * 188)
+Path(sys.argv[1]).write_bytes(b"A" * 1400 + b"C" * 1400)
 PY
     start_receiver "$partial_port" "$output" --best-effort
     start_drop_proxy 21919 "$partial_port" "1,3,4"

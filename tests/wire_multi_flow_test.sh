@@ -17,8 +17,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Small correctness case
-dd if=/dev/urandom of="$input0" bs=188 count=20 status=none
-dd if=/dev/urandom of="$input1" bs=752 count=5 status=none
+dd if=/dev/urandom of="$input0" bs=1400 count=20 status=none
+dd if=/dev/urandom of="$input1" bs=5600 count=5 status=none
 
 "$bin" --codec copy --udp-recv "$port" "$prefix" --max-flows 2 --idle-sec 2 \
     >"$base/wire_multi_receiver.log" 2>&1 &

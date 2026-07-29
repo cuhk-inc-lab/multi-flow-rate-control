@@ -3,7 +3,12 @@
 
 #include "circular_buffer.h"
 
-#define PKG_SIZE       188u
+/*
+ * Shard/payload size on the wire (plus 44 B WireHeader per UDP datagram).
+ * 1400 keeps IP+UDP+header+payload under a typical 1500 B MTU while cutting
+ * PPS vs the old MPEG-TS-sized 188 B shards.
+ */
+#define PKG_SIZE       1400u
 #define PACKAGES_PER_DECODE_BLOCK  4u
 #define PACKAGES_PER_ENCODE_BLOCK  8u
 #define XOR_FEC_PARITY_SHARDS      1u
@@ -18,7 +23,7 @@
 #define CODEC_MAX_ENCODE_BLOCK ENCODE_BLOCK
 
 #define BUFFER_BLOCK_COUNT  2048u
-#define BUFFER_BLOCK_SIZE   1024u
+#define BUFFER_BLOCK_SIZE   8192u
 #define BUFFER_OVERFLOW_POLICY  CB_OVERFLOW_REJECT
 
 #define MF_MAX_FLOWS        8u

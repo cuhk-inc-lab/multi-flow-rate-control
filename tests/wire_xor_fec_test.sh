@@ -8,6 +8,8 @@ recover_port=21903
 partial_port=21904
 recover_output="$base/wire_xor_recovered.ts"
 partial_output="$base/wire_xor_partial.ts"
+PKG=1400
+VALID=$((PKG * 4))
 
 cleanup() {
     [ -n "${receiver_pid:-}" ] && kill "$receiver_pid" 2>/dev/null || true
@@ -28,31 +30,33 @@ send_group() {
     port=$1
     mode=$2
 
-    python3 - "$port" "$mode" <<'PY'
+    python3 - "$port" "$mode" "$PKG" "$VALID" <<'PY'
 import socket
 import struct
 import sys
 
 port = int(sys.argv[1])
 mode = sys.argv[2]
+pkg = int(sys.argv[3])
+valid = int(sys.argv[4])
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 target = ("127.0.0.1", port)
 
-def header(kind, block, index, valid, payload):
+def header(kind, block, index, valid_len, payload):
     return struct.pack("!IBBHIQHHHHQQ",
                        0x57475031, 2, kind, 0, 0, block,
-                       index, 5, valid, payload, 0, 0)
+                       index, 5, valid_len, payload, 0, 0)
 
 if mode == "recover":
-    shards = ((0, b"A" * 188), (1, b"B" * 188),
-              (3, b"D" * 188), (4, b"\x04" * 188))
+    shards = ((0, b"A" * pkg), (1, b"B" * pkg),
+              (3, b"D" * pkg), (4, b"\x04" * pkg))
 elif mode == "partial":
-    shards = ((0, b"A" * 188), (2, b"C" * 188))
+    shards = ((0, b"A" * pkg), (2, b"C" * pkg))
 else:
     raise SystemExit("unknown mode")
 
 for index, payload in shards:
-    sock.sendto(header(1, 0, index, 752, 188) + payload, target)
+    sock.sendto(header(1, 0, index, valid, pkg) + payload, target)
 sock.sendto(header(2, 1, 0, 0, 0), target)
 sock.close()
 PY
@@ -76,11 +80,12 @@ start_receiver "$recover_port" "$recover_output"
 send_group "$recover_port" recover
 wait "$receiver_pid"
 receiver_pid=
-python3 - "$base/wire_xor_expected_full.ts" <<'PY'
+python3 - "$base/wire_xor_expected_full.ts" "$PKG" <<'PY'
 from pathlib import Path
 import sys
-Path(sys.argv[1]).write_bytes(b"A" * 188 + b"B" * 188 +
-                              b"C" * 188 + b"D" * 188)
+pkg = int(sys.argv[2])
+Path(sys.argv[1]).write_bytes(b"A" * pkg + b"B" * pkg +
+                              b"C" * pkg + b"D" * pkg)
 PY
 assert_output "$recover_output" "$base/wire_xor_expected_full.ts"
 
@@ -88,10 +93,11 @@ start_receiver "$partial_port" "$partial_output"
 send_group "$partial_port" partial
 wait "$receiver_pid"
 receiver_pid=
-python3 - "$base/wire_xor_expected_partial.ts" <<'PY'
+python3 - "$base/wire_xor_expected_partial.ts" "$PKG" <<'PY'
 from pathlib import Path
 import sys
-Path(sys.argv[1]).write_bytes(b"A" * 188 + b"C" * 188)
+pkg = int(sys.argv[2])
+Path(sys.argv[1]).write_bytes(b"A" * pkg + b"C" * pkg)
 PY
 assert_output "$partial_output" "$base/wire_xor_expected_partial.ts"
 

@@ -82,9 +82,9 @@ test check: $(TEST_BIN)
 
 integration-test wg-demo-test: $(WG_BIN) $(WG_CODEC_TEST_BIN)
 	./$(WG_CODEC_TEST_BIN)
-	dd if=/dev/urandom of=$(WG_TEST_IN0) bs=188 count=20 status=none
-	dd if=/dev/urandom of=$(WG_TEST_IN1) bs=752 count=5 status=none
-	dd if=/dev/urandom of=$(WG_TEST_IN2) bs=188 count=40 status=none
+	dd if=/dev/urandom of=$(WG_TEST_IN0) bs=1400 count=20 status=none
+	dd if=/dev/urandom of=$(WG_TEST_IN1) bs=5600 count=5 status=none
+	dd if=/dev/urandom of=$(WG_TEST_IN2) bs=1400 count=40 status=none
 	dd if=/dev/urandom bs=1 count=96 status=none >> $(WG_TEST_IN2)
 	./$(WG_BIN) --no-pace --multi \
 		$(WG_TEST_IN0) $(WG_TEST_OUT0) \

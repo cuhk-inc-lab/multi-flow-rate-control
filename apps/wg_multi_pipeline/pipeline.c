@@ -216,7 +216,7 @@ static WgPipelineStatus init_wire_flow_stage(FlowStage *stage, uint32_t flow_id,
     /*
      * Same architecture as local --multi (demux → per-flow buffer → encode),
      * but use a packet queue into post_multi_in instead of a byte pipe.
-     * Under pacing, a raw pipe can reassemble across partial 188 B reads and
+     * Under pacing, a raw pipe can reassemble across partial PKG_SIZE reads and
      * corrupt codec blocks; packet boundaries keep wire send aligned.
      */
     if (flow_buffer_init(&stage->post_multi_pkts, MF_QUEUE_CAPACITY) != FB_OK) {

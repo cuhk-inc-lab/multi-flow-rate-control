@@ -320,9 +320,15 @@ dropped = as_int(sys.argv[6])
 recovered = as_int(sys.argv[7])
 recv_blocks = as_int(sys.argv[8])
 expect_blocks = as_int(sys.argv[9])
-blocks = math.ceil(payload / 752) if payload > 0 else 0
-if blocks <= 0 and expect_blocks is not None and expect_blocks > 0:
+# Prefer receiver expected_blocks. Fallback matches stream_config.h
+# DECODE_BLOCK = PKG_SIZE * 4 (PKG_SIZE currently 1400).
+input_block = 4 * 1400
+if expect_blocks is not None and expect_blocks > 0:
     blocks = expect_blocks
+elif payload > 0:
+    blocks = math.ceil(payload / input_block)
+else:
+    blocks = 0
 exp = blocks * shards if blocks > 0 else 0
 
 def pct(num, den):

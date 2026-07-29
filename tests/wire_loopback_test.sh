@@ -15,7 +15,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-dd if=/dev/urandom of="$input" bs=188 count=40 status=none
+dd if=/dev/urandom of="$input" bs=1400 count=40 status=none
 dd if=/dev/urandom bs=1 count=96 status=none >> "$input"
 
 run_case() {
