@@ -49,6 +49,8 @@ typedef struct WgWireMultiSendConfig {
     uint32_t              flow_count;
     int                   pacing_enabled;
     CodecKind             codec_kind;
+    uint8_t               final_dst;
+    uint8_t               ttl;
     /* Shared map for tuple-mode flows; NULL when no flow uses a fake 5-tuple. */
     FlowPeerMap          *peer_map;
 } WgWireMultiSendConfig;

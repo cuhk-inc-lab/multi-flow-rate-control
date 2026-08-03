@@ -130,3 +130,7 @@ Block sizes (`stream_config.h`): `PKG_SIZE` 188, `DECODE_BLOCK` 752, `ENCODE_BLO
 | `pipe_io.h` | `pipe_io_drain_to_buffer` |
 | `circular_buffer.h` | `Buffer_Read`, `Buffer_Write` |
 | `buffer_transfer.h` | `BufferTransfer_pump` (demo) |
+| `wire_header.h` | `WireHeader`, `wire_header_encode/decode`, `wire_header_is_local` (v3) |
+
+Application-layer hop relay (opaque forward, destination check on `final_dst`):
+`apps/wire_relay/` — see that app's README.

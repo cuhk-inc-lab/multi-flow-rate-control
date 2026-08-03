@@ -4,7 +4,9 @@
 #include "circular_buffer.h"
 
 /*
- * Shard/payload size on the wire (plus 44 B WireHeader per UDP datagram).
+ * Shard/payload size on the wire (plus 44 B WireHeader v3 per UDP datagram).
+ * Wire v3 reuses the former reserved bytes at offsets 6-7 for final_dst + ttl;
+ * offsets 8-43 and the payload layout are unchanged from v2.
  * 1400 keeps IP+UDP+header+payload under a typical 1500 B MTU while cutting
  * PPS vs the old MPEG-TS-sized 188 B shards.
  */

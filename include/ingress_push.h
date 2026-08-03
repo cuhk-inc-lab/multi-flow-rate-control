@@ -28,6 +28,12 @@ IngressPushStatus ingress_push(FlowManager *mgr,
                                size_t len);
 
 /*
+ * Push a pre-filled packet (e.g. from packet_pool_alloc + direct read).
+ * On failure the packet is freed/returned to pool.
+ */
+IngressPushStatus ingress_push_prepared(FlowManager *mgr, DataPacket *pkt);
+
+/*
  * Resolve internal flow slot from the full UDP 5-tuple, then push.
  * The tuple is the routing key; flow_id is only the assigned slot index.
  */

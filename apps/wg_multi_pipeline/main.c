@@ -1,6 +1,7 @@
 #include "pipeline.h"
 #include "wire_udp.h"
 #include "stream_config.h"
+#include "wire_header.h"
 
 #include "flow_peer_map.h"
 
@@ -285,10 +286,13 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] <input.ts> <output.ts>\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|none] [--rate-mbps N] [--flow-id N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|none] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:src_ip:src_port:dst_ip:dst_port:host:port:input[:rate-mbps]> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|none] --udp-recv <port> <output.ts|prefix> [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|none] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
+            "\n"
+            "Wire v3: header carries final_dst + ttl (defaults final-dst=4, ttl=8).\n"
+            "UDP next-hop is the send target; final_dst is the ultimate delivery node.\n"
             "\n"
             "Pipeline per flow (multi BEFORE encode):\n"
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
@@ -312,6 +316,9 @@ int main(int argc, char **argv)
     CodecKind codec_kind = CODEC_KIND_BLOCK;
     double source_rate_mbps = 0.0;
     uint32_t flow_id = 0;
+    uint8_t final_dst = WIRE_DEFAULT_FINAL_DST;
+    uint8_t ttl = WIRE_DEFAULT_TTL;
+    uint8_t local_node_id = WIRE_DEFAULT_FINAL_DST;
     int lock_memory = 0;
     int argi = 1;
 
@@ -378,6 +385,54 @@ int main(int argc, char **argv)
             }
             flow_id = (uint32_t)parsed;
             argi += 2;
+        } else if (strcmp(argv[argi], "--final-dst") == 0) {
+            char          *end = NULL;
+            unsigned long  parsed;
+
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            parsed = strtoul(argv[argi + 1], &end, 10);
+            if (end == argv[argi + 1] || *end != '\0' || parsed == 0 ||
+                parsed > 255ul) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            final_dst = (uint8_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--ttl") == 0) {
+            char          *end = NULL;
+            unsigned long  parsed;
+
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            parsed = strtoul(argv[argi + 1], &end, 10);
+            if (end == argv[argi + 1] || *end != '\0' || parsed == 0 ||
+                parsed > 255ul) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            ttl = (uint8_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--local-node-id") == 0) {
+            char          *end = NULL;
+            unsigned long  parsed;
+
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            parsed = strtoul(argv[argi + 1], &end, 10);
+            if (end == argv[argi + 1] || *end != '\0' || parsed == 0 ||
+                parsed > 255ul) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            local_node_id = (uint8_t)parsed;
+            argi += 2;
         } else if (strcmp(argv[argi], "--lock-memory") == 0) {
             lock_memory = 1;
             argi++;
@@ -411,6 +466,8 @@ int main(int argc, char **argv)
             .codec_kind = codec_kind,
             .source_rate_mbps = source_rate_mbps,
             .flow_id = flow_id,
+            .final_dst = final_dst,
+            .ttl = ttl,
         };
         return wire_udp_send(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -574,6 +631,8 @@ int main(int argc, char **argv)
                 .flow_count = flow_count,
                 .pacing_enabled = pacing,
                 .codec_kind = codec_kind,
+                .final_dst = final_dst,
+                .ttl = ttl,
                 .peer_map = peer_map,
             });
         flow_peer_map_destroy(peer_map);
@@ -630,9 +689,26 @@ int main(int argc, char **argv)
             .best_effort = best_effort,
             .max_flows = max_flows,
             .decode_mark = decode_mark,
+            .local_node_id = local_node_id,
         };
         while (argi < argc) {
-            if (strcmp(argv[argi], "--idle-sec") == 0) {
+            if (strcmp(argv[argi], "--local-node-id") == 0) {
+                char          *node_end = NULL;
+                unsigned long  parsed;
+
+                if (argi + 1 >= argc) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                parsed = strtoul(argv[argi + 1], &node_end, 10);
+                if (node_end == argv[argi + 1] || *node_end != '\0' ||
+                    parsed == 0 || parsed > 255ul) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                cfg.local_node_id = (uint8_t)parsed;
+                argi += 2;
+            } else if (strcmp(argv[argi], "--idle-sec") == 0) {
                 if (argi + 1 >= argc) {
                     print_usage(argv[0]);
                     return EXIT_FAILURE;

@@ -46,7 +46,7 @@ streams:
     from: node1
     to: node4
     file: te.mp4
-    rate_mbps: 10
+    rate_mbps: 30
     codec: block
 
   # 2→4 @ 10 Mbps
@@ -54,7 +54,7 @@ streams:
     from: node2
     to: node4
     file: te.mp4
-    rate_mbps: 10
+    rate_mbps: 30
     codec: block
 
   # 1→2 @ 20 Mbps
@@ -62,7 +62,7 @@ streams:
     from: node1
     to: node2
     file: te.mp4
-    rate_mbps: 20
+    rate_mbps: 30
     codec: block
 
   # 2→2 @ 20 Mbps (loopback on node2)
@@ -70,7 +70,7 @@ streams:
     from: node2
     to: node2
     file: te.mp4
-    rate_mbps: 20
+    rate_mbps: 30
     codec: block
 
   # 1→3 @ 10 Mbps
@@ -78,7 +78,7 @@ streams:
     from: node1
     to: node3
     file: te.mp4
-    rate_mbps: 10
+    rate_mbps: 30
     codec: block
 
   # 1→4 @ 20 Mbps
@@ -86,5 +86,5 @@ streams:
     from: node1
     to: node4
     file: te.mp4
-    rate_mbps: 20
+    rate_mbps: 30
     codec: block

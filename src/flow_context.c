@@ -140,6 +140,10 @@ FlowContextStatus flow_context_init(FlowContext *ctx,
         return FC_ERR_ALLOC;
     }
 
+    atomic_store(&ctx->queue_occupancy, 0);
+    atomic_store(&ctx->drop_deferred_overflow, 0);
+    flow_buffer_set_occupancy_counter(&ctx->queue, &ctx->queue_occupancy);
+
     return FC_OK;
 }
 

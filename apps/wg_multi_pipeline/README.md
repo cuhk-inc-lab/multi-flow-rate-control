@@ -120,6 +120,17 @@ next segment. New data for that flow after the timeout starts a new segment.
 Each completed segment is written to its own file, such as
 `/tmp/out_flow0_segment1.bin`.
 
+## Wire header v3 (`final_dst` / `ttl`)
+
+Wire datagrams use a shared 44-byte header (`include/wire_header.h`, version 3).
+Offsets 6–7 carry `final_dst` (ultimate delivery node id) and `ttl`. All other
+fields keep the previous layout. Defaults: `--final-dst 4`, `--ttl 8`,
+receiver `--local-node-id 4`.
+
+For application-layer hops VM1→VM2→VM3→VM4, send to the **next hop** UDP
+address while setting `final_dst` to the final node. Relays:
+[`../wire_relay/README.md`](../wire_relay/README.md).
+
 ## Cross-VM wire multi-flow (single sender/receiver process)
 
 Use wire multi-flow to transfer multiple concurrent streams with one app
@@ -142,14 +153,14 @@ Example: 2 flows (Node1 -> Node4) with `copy` codec.
 Node4 (receiver):
 
 ```bash
-./build/wg_multi_pipeline --codec copy --lock-memory \
+./build/wg_multi_pipeline --codec copy --lock-memory --local-node-id 4 \
   --udp-recv 9000 /tmp/out_multi_ --idle-sec 5 --max-flows 2
 ```
 
 Node1 (sender, explicit flow ids):
 
 ```bash
-./build/wg_multi_pipeline --codec copy --udp-send-multi \
+./build/wg_multi_pipeline --codec copy --final-dst 4 --ttl 8 --udp-send-multi \
   --flow "0:10.10.34.2:9000:input0.ts:32" \
   --flow "1:10.10.34.2:9000:input1.ts:32"
 ```

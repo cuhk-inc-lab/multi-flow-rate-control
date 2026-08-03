@@ -10,6 +10,7 @@
  */
 
 #include <stddef.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 #include "packet.h"
@@ -35,6 +36,7 @@ typedef struct FlowCircularBuffer {
     pthread_cond_t  not_empty;
 
     int             shutdown;
+    _Atomic size_t *occupancy;
 } FlowCircularBuffer;
 
 FlowBufferStatus flow_buffer_init(FlowCircularBuffer *fb, size_t capacity);
@@ -69,8 +71,22 @@ FlowBufferStatus flow_buffer_try_enqueue(FlowCircularBuffer *fb, DataPacket **pk
  */
 FlowBufferStatus flow_buffer_try_dequeue(FlowCircularBuffer *fb, DataPacket **pkt);
 
+/*
+ * Batch variants: one lock, up to max_n packets. Returns number transferred.
+ */
+size_t flow_buffer_try_enqueue_batch(FlowCircularBuffer *fb,
+                                     DataPacket **in,
+                                     size_t n);
+size_t flow_buffer_try_dequeue_batch(FlowCircularBuffer *fb,
+                                     DataPacket **out,
+                                     size_t max_n);
+
 size_t flow_buffer_count(const FlowCircularBuffer *fb);
 int    flow_buffer_is_empty(const FlowCircularBuffer *fb);
 int    flow_buffer_is_full(const FlowCircularBuffer *fb);
+
+/* Optional atomic occupancy mirror (may be NULL). */
+void flow_buffer_set_occupancy_counter(FlowCircularBuffer *fb,
+                                       _Atomic size_t *counter);
 
 #endif /* FLOW_BUFFER_H */

@@ -3,6 +3,7 @@
 #include "codec.h"
 #include "flow_peer_map.h"
 #include "stream_config.h"
+#include "wire_header.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -18,11 +19,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define WIRE_MAGIC          0x57475031u /* WGP1 */
-#define WIRE_VERSION        2u
-#define WIRE_TYPE_DATA      1u
-#define WIRE_TYPE_END       2u
-#define WIRE_HEADER_SIZE    44u
 #define WIRE_GROUP_WINDOW   128u
 #define WIRE_MAX_SHARDS     (CODEC_MAX_ENCODE_BLOCK / PKG_SIZE)
 /* Larger UDP buffers reduce drops under multi-flow microbursts of 232 B datagrams. */
@@ -62,19 +58,6 @@ static void wire_set_udp_buffers(int sock)
     (void)setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 }
 
-typedef struct WireHeader {
-    uint8_t  type;
-    uint32_t flow_id;
-    uint64_t block_id;
-    uint16_t shard_index;
-    uint16_t shard_count;
-    uint16_t valid_len;
-    uint16_t payload_len;
-    /* Sender CLOCK_REALTIME timestamps; synchronize peers before comparing. */
-    uint64_t encode_begin_ns;
-    uint64_t encode_end_ns;
-} WireHeader;
-
 typedef struct WireGroup {
     bool          in_use;
     uint64_t      block_id;
@@ -104,90 +87,6 @@ typedef struct LatencyStats {
     uint64_t       previous_delay_ns;
     bool           disabled;
 } LatencyStats;
-
-static uint64_t host_to_be64(uint64_t value)
-{
-    uint32_t high = htonl((uint32_t)(value >> 32));
-    uint32_t low = htonl((uint32_t)value);
-
-    return ((uint64_t)low << 32) | high;
-}
-
-static uint64_t be64_to_host(uint64_t value)
-{
-    uint32_t high = ntohl((uint32_t)value);
-    uint32_t low = ntohl((uint32_t)(value >> 32));
-
-    return ((uint64_t)high << 32) | low;
-}
-
-static void wire_header_encode(unsigned char out[WIRE_HEADER_SIZE],
-                               const WireHeader *header)
-{
-    uint32_t value32;
-    uint64_t value64;
-    uint16_t value16;
-
-    value32 = htonl(WIRE_MAGIC);
-    memcpy(out, &value32, sizeof(value32));
-    out[4] = WIRE_VERSION;
-    out[5] = header->type;
-    out[6] = 0;
-    out[7] = 0;
-
-    value32 = htonl(header->flow_id);
-    memcpy(out + 8, &value32, sizeof(value32));
-    value64 = host_to_be64(header->block_id);
-    memcpy(out + 12, &value64, sizeof(value64));
-    value16 = htons(header->shard_index);
-    memcpy(out + 20, &value16, sizeof(value16));
-    value16 = htons(header->shard_count);
-    memcpy(out + 22, &value16, sizeof(value16));
-    value16 = htons(header->valid_len);
-    memcpy(out + 24, &value16, sizeof(value16));
-    value16 = htons(header->payload_len);
-    memcpy(out + 26, &value16, sizeof(value16));
-    value64 = host_to_be64(header->encode_begin_ns);
-    memcpy(out + 28, &value64, sizeof(value64));
-    value64 = host_to_be64(header->encode_end_ns);
-    memcpy(out + 36, &value64, sizeof(value64));
-}
-
-static int wire_header_decode(WireHeader *header,
-                              const unsigned char *data, size_t len)
-{
-    uint32_t value32;
-    uint64_t value64;
-    uint16_t value16;
-
-    if (header == NULL || data == NULL || len < WIRE_HEADER_SIZE) {
-        return -1;
-    }
-
-    memcpy(&value32, data, sizeof(value32));
-    if (ntohl(value32) != WIRE_MAGIC || data[4] != WIRE_VERSION) {
-        return -1;
-    }
-
-    header->type = data[5];
-    memcpy(&value32, data + 8, sizeof(value32));
-    header->flow_id = ntohl(value32);
-    memcpy(&value64, data + 12, sizeof(value64));
-    header->block_id = be64_to_host(value64);
-    memcpy(&value16, data + 20, sizeof(value16));
-    header->shard_index = ntohs(value16);
-    memcpy(&value16, data + 22, sizeof(value16));
-    header->shard_count = ntohs(value16);
-    memcpy(&value16, data + 24, sizeof(value16));
-    header->valid_len = ntohs(value16);
-    memcpy(&value16, data + 26, sizeof(value16));
-    header->payload_len = ntohs(value16);
-    memcpy(&value64, data + 28, sizeof(value64));
-    header->encode_begin_ns = be64_to_host(value64);
-    memcpy(&value64, data + 36, sizeof(value64));
-    header->encode_end_ns = be64_to_host(value64);
-    return 0;
-}
 
 static uint64_t realtime_nanoseconds(void)
 {
@@ -327,10 +226,85 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
     }
 }
 
-int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,
-                     uint32_t flow_id, double source_rate_mbps)
+/*
+ * Send multiple shards with one sendmmsg when pacing spacing is zero.
+ * Falls back to per-shard sendto on partial/unsupported failure.
+ */
+static int send_wire_datagrams_batch(int sock, const struct sockaddr *address,
+                                     socklen_t address_len,
+                                     const WireHeader *headers,
+                                     const unsigned char *const *payloads,
+                                     size_t count)
 {
-    if (tx == NULL || host == NULL || port == 0 || source_rate_mbps < 0.0) {
+    unsigned char datagrams[WIRE_MAX_SHARDS][WIRE_HEADER_SIZE + PKG_SIZE];
+    struct iovec iov[WIRE_MAX_SHARDS];
+    struct mmsghdr msgs[WIRE_MAX_SHARDS];
+    size_t i;
+    int sent;
+    int retries = 0;
+    size_t offset = 0;
+
+    if (count == 0 || count > WIRE_MAX_SHARDS) {
+        return -1;
+    }
+
+    memset(msgs, 0, sizeof(msgs[0]) * count);
+    for (i = 0; i < count; i++) {
+        size_t length = WIRE_HEADER_SIZE + headers[i].payload_len;
+
+        if (headers[i].payload_len > PKG_SIZE) {
+            return -1;
+        }
+        wire_header_encode(datagrams[i], &headers[i]);
+        if (headers[i].payload_len > 0 && payloads[i] != NULL) {
+            memcpy(datagrams[i] + WIRE_HEADER_SIZE, payloads[i],
+                   headers[i].payload_len);
+        }
+        iov[i].iov_base = datagrams[i];
+        iov[i].iov_len = length;
+        msgs[i].msg_hdr.msg_name = (void *)address;
+        msgs[i].msg_hdr.msg_namelen = address_len;
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    while (offset < count) {
+        sent = sendmmsg(sock, msgs + offset, (unsigned int)(count - offset), 0);
+        if (sent > 0) {
+            offset += (size_t)sent;
+            retries = 0;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                         errno == ENOBUFS) &&
+            retries < 10000) {
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000L};
+
+            retries++;
+            nanosleep(&delay, NULL);
+            continue;
+        }
+        /* Fallback: finish remaining shards with sendto. */
+        for (i = offset; i < count; i++) {
+            if (send_wire_datagram(sock, address, address_len, &headers[i],
+                                   payloads[i]) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,
+                     uint32_t flow_id, double source_rate_mbps,
+                     uint8_t final_dst, uint8_t ttl)
+{
+    if (tx == NULL || host == NULL || port == 0 || source_rate_mbps < 0.0 ||
+        final_dst == 0 || ttl == 0) {
         return -1;
     }
 
@@ -342,6 +316,8 @@ int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,
     }
     tx->flow_id = flow_id;
     tx->source_rate_mbps = source_rate_mbps;
+    tx->final_dst = final_dst;
+    tx->ttl = ttl;
     tx->started = monotonic_seconds();
     return 0;
 }
@@ -401,6 +377,8 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
         double block_budget_sec = 0.0;
         double shard_spacing_sec = 0.0;
         double shard_target = 0.0;
+        WireHeader headers[WIRE_MAX_SHARDS];
+        const unsigned char *payloads[WIRE_MAX_SHARDS];
 
         if (tx->source_rate_mbps > 0.0 && shard_count > 1 && valid_len > 0) {
             block_budget_sec =
@@ -415,8 +393,10 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
         }
 
         for (shard = 0; shard < shard_count; shard++) {
-            WireHeader header = {
+            headers[shard] = (WireHeader){
                 .type = WIRE_TYPE_DATA,
+                .final_dst = tx->final_dst,
+                .ttl = tx->ttl,
                 .flow_id = tx->flow_id,
                 .block_id = tx->block_id,
                 .shard_index = shard,
@@ -426,16 +406,28 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
                 .encode_begin_ns = encode_begin_ns,
                 .encode_end_ns = encode_end_ns,
             };
+            payloads[shard] = encoded_block + (size_t)shard * PKG_SIZE;
+        }
 
-            if (send_wire_datagram(tx->sock, (const struct sockaddr *)&tx->address,
-                                   tx->address_len, &header,
-                                   encoded_block + (size_t)shard * PKG_SIZE) != 0) {
+        if (shard_spacing_sec <= 0.0) {
+            if (send_wire_datagrams_batch(tx->sock,
+                                          (const struct sockaddr *)&tx->address,
+                                          tx->address_len, headers, payloads,
+                                          shard_count) != 0) {
                 return -1;
             }
-
-            if (shard_spacing_sec > 0.0 && shard + 1 < shard_count) {
-                shard_target += shard_spacing_sec;
-                sleep_until_monotonic(shard_target);
+        } else {
+            for (shard = 0; shard < shard_count; shard++) {
+                if (send_wire_datagram(tx->sock,
+                                       (const struct sockaddr *)&tx->address,
+                                       tx->address_len, &headers[shard],
+                                       payloads[shard]) != 0) {
+                    return -1;
+                }
+                if (shard + 1 < shard_count) {
+                    shard_target += shard_spacing_sec;
+                    sleep_until_monotonic(shard_target);
+                }
             }
         }
     }
@@ -458,6 +450,8 @@ int wire_udp_tx_send_end(WireUdpTx *tx, const Codec *codec)
     }
     end = (WireHeader){
         .type = WIRE_TYPE_END,
+        .final_dst = tx->final_dst,
+        .ttl = tx->ttl,
         .flow_id = tx->flow_id,
         .block_id = tx->block_id,
         .shard_count = (uint16_t)(output_size / PKG_SIZE),
@@ -485,7 +479,7 @@ int wire_udp_send(const WireUdpSendConfig *config)
     int result = -1;
 
     if (config == NULL || config->host == NULL || config->input_path == NULL ||
-        config->port == 0) {
+        config->port == 0 || config->final_dst == 0 || config->ttl == 0) {
         return -1;
     }
 
@@ -536,6 +530,8 @@ int wire_udp_send(const WireUdpSendConfig *config)
         for (shard = 0; shard < shard_count; shard++) {
             header = (WireHeader){
                 .type = WIRE_TYPE_DATA,
+                .final_dst = config->final_dst,
+                .ttl = config->ttl,
                 .flow_id = config->flow_id,
                 .block_id = block_id,
                 .shard_index = shard,
@@ -559,6 +555,8 @@ int wire_udp_send(const WireUdpSendConfig *config)
     {
         WireHeader end = {
             .type = WIRE_TYPE_END,
+            .final_dst = config->final_dst,
+            .ttl = config->ttl,
             .flow_id = config->flow_id,
             .block_id = block_id,
             .shard_count = shard_count,
@@ -1348,6 +1346,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     int           sock = -1;
     int           result = -1;
     size_t        fi;
+    uint64_t      drop_wrong_dst = 0;
 
     if (config == NULL || config->output_path == NULL || config->port == 0 ||
         config->idle_sec == 0) {
@@ -1414,8 +1413,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
 
     fprintf(stderr,
-            "udp-recv: listening on UDP port %u (max_flows=%zu%s%s)\n",
+            "udp-recv: listening on UDP port %u (max_flows=%zu local_node_id=%u%s%s)\n",
             (unsigned)config->port, max_flows,
+            (unsigned)config->local_node_id,
             multi_mode ? ", prefix mode" : "",
             config->decode_mark ? ", decode-mark" : "");
 
@@ -1505,6 +1505,11 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
              * output files so junk UDP cannot exhaust max_flows.
              */
             if (wire_header_decode(&header, datagram, (size_t)received) != 0) {
+                continue;
+            }
+            if (config->local_node_id != 0 &&
+                !wire_header_is_local(&header, config->local_node_id)) {
+                drop_wrong_dst++;
                 continue;
             }
             if (header.type == WIRE_TYPE_DATA) {
@@ -1638,6 +1643,11 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
 
     if (!multi_mode && !flows[0].active) {
         result = -1;
+    }
+    if (drop_wrong_dst > 0) {
+        fprintf(stderr,
+                "udp-recv: drop_wrong_dst=%llu (final_dst != local_node_id)\n",
+                (unsigned long long)drop_wrong_dst);
     }
 
 cleanup:

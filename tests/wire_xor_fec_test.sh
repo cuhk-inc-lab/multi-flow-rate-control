@@ -43,8 +43,9 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 target = ("127.0.0.1", port)
 
 def header(kind, block, index, valid_len, payload):
-    return struct.pack("!IBBHIQHHHHQQ",
-                       0x57475031, 2, kind, 0, 0, block,
+    # Wire header v3: magic, version, type, final_dst, ttl, flow_id, ...
+    return struct.pack("!IBBBBIQHHHHQQ",
+                       0x57475031, 3, kind, 4, 8, 0, block,
                        index, 5, valid_len, payload, 0, 0)
 
 if mode == "recover":

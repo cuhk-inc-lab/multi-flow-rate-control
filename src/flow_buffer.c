@@ -8,6 +8,13 @@ static int valid_buffer(const FlowCircularBuffer *fb)
     return fb != NULL && fb->slots != NULL && fb->capacity > 0;
 }
 
+static void occupancy_set(FlowCircularBuffer *fb, size_t count)
+{
+    if (fb->occupancy != NULL) {
+        atomic_store_explicit(fb->occupancy, count, memory_order_relaxed);
+    }
+}
+
 FlowBufferStatus flow_buffer_init(FlowCircularBuffer *fb, size_t capacity)
 {
     if (fb == NULL || capacity == 0) {
@@ -24,6 +31,7 @@ FlowBufferStatus flow_buffer_init(FlowCircularBuffer *fb, size_t capacity)
     fb->head = 0;
     fb->tail = 0;
     fb->shutdown = 0;
+    fb->occupancy = NULL;
 
     if (pthread_mutex_init(&fb->mutex, NULL) != 0) {
         free(fb->slots);
@@ -49,6 +57,20 @@ FlowBufferStatus flow_buffer_init(FlowCircularBuffer *fb, size_t capacity)
     return FB_OK;
 }
 
+void flow_buffer_set_occupancy_counter(FlowCircularBuffer *fb,
+                                       _Atomic size_t *counter)
+{
+    if (fb == NULL) {
+        return;
+    }
+    fb->occupancy = counter;
+    if (counter != NULL) {
+        pthread_mutex_lock(&fb->mutex);
+        occupancy_set(fb, fb->count);
+        pthread_mutex_unlock(&fb->mutex);
+    }
+}
+
 void flow_buffer_destroy(FlowCircularBuffer *fb)
 {
     if (fb == NULL) {
@@ -64,6 +86,7 @@ void flow_buffer_destroy(FlowCircularBuffer *fb)
             fb->count--;
             packet_free(pkt);
         }
+        occupancy_set(fb, 0);
         pthread_mutex_unlock(&fb->mutex);
     }
 
@@ -78,6 +101,7 @@ void flow_buffer_destroy(FlowCircularBuffer *fb)
     fb->head = 0;
     fb->tail = 0;
     fb->shutdown = 0;
+    fb->occupancy = NULL;
 }
 
 void flow_buffer_shutdown(FlowCircularBuffer *fb)
@@ -106,7 +130,7 @@ static FlowBufferStatus enqueue_locked(FlowCircularBuffer *fb,
     while (fb->count == fb->capacity && !fb->shutdown) {
         if (!block) {
             pthread_mutex_unlock(&fb->mutex);
-            return FB_ERR_INVALID;
+            return FB_ERR_FULL;
         }
         pthread_cond_wait(&fb->not_full, &fb->mutex);
     }
@@ -119,6 +143,7 @@ static FlowBufferStatus enqueue_locked(FlowCircularBuffer *fb,
     fb->slots[fb->tail] = *pkt;
     fb->tail = (fb->tail + 1) % fb->capacity;
     fb->count++;
+    occupancy_set(fb, fb->count);
     *pkt = NULL;
 
     pthread_cond_signal(&fb->not_empty);
@@ -143,7 +168,7 @@ static FlowBufferStatus dequeue_locked(FlowCircularBuffer *fb,
     while (fb->count == 0 && !fb->shutdown) {
         if (!block) {
             pthread_mutex_unlock(&fb->mutex);
-            return FB_ERR_INVALID;
+            return FB_ERR_EMPTY;
         }
         waited_on_empty = 1;
         pthread_cond_wait(&fb->not_empty, &fb->mutex);
@@ -158,6 +183,7 @@ static FlowBufferStatus dequeue_locked(FlowCircularBuffer *fb,
     fb->slots[fb->head] = NULL;
     fb->head = (fb->head + 1) % fb->capacity;
     fb->count--;
+    occupancy_set(fb, fb->count);
 
     pthread_cond_signal(&fb->not_full);
     pthread_mutex_unlock(&fb->mutex);
@@ -202,6 +228,7 @@ FlowBufferStatus flow_buffer_try_enqueue(FlowCircularBuffer *fb, DataPacket **pk
     fb->slots[fb->tail] = *pkt;
     fb->tail = (fb->tail + 1) % fb->capacity;
     fb->count++;
+    occupancy_set(fb, fb->count);
     *pkt = NULL;
 
     pthread_cond_signal(&fb->not_empty);
@@ -228,11 +255,77 @@ FlowBufferStatus flow_buffer_try_dequeue(FlowCircularBuffer *fb, DataPacket **pk
     fb->slots[fb->head] = NULL;
     fb->head = (fb->head + 1) % fb->capacity;
     fb->count--;
+    occupancy_set(fb, fb->count);
 
     pthread_cond_signal(&fb->not_full);
     pthread_mutex_unlock(&fb->mutex);
 
     return FB_OK;
+}
+
+size_t flow_buffer_try_enqueue_batch(FlowCircularBuffer *fb,
+                                     DataPacket **in,
+                                     size_t n)
+{
+    size_t accepted = 0;
+    int was_empty;
+
+    if (!valid_buffer(fb) || in == NULL || n == 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&fb->mutex);
+    if (fb->shutdown) {
+        pthread_mutex_unlock(&fb->mutex);
+        return 0;
+    }
+
+    was_empty = (fb->count == 0);
+    while (accepted < n && fb->count < fb->capacity) {
+        fb->slots[fb->tail] = in[accepted];
+        in[accepted] = NULL;
+        fb->tail = (fb->tail + 1) % fb->capacity;
+        fb->count++;
+        accepted++;
+    }
+    occupancy_set(fb, fb->count);
+    if (accepted > 0 && was_empty) {
+        pthread_cond_signal(&fb->not_empty);
+    }
+    pthread_mutex_unlock(&fb->mutex);
+    return accepted;
+}
+
+size_t flow_buffer_try_dequeue_batch(FlowCircularBuffer *fb,
+                                     DataPacket **out,
+                                     size_t max_n)
+{
+    size_t n = 0;
+    int was_full;
+
+    if (!valid_buffer(fb) || out == NULL || max_n == 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&fb->mutex);
+    if (fb->count == 0) {
+        pthread_mutex_unlock(&fb->mutex);
+        return 0;
+    }
+
+    was_full = (fb->count == fb->capacity);
+    while (n < max_n && fb->count > 0) {
+        out[n++] = fb->slots[fb->head];
+        fb->slots[fb->head] = NULL;
+        fb->head = (fb->head + 1) % fb->capacity;
+        fb->count--;
+    }
+    occupancy_set(fb, fb->count);
+    if (n > 0 && was_full) {
+        pthread_cond_signal(&fb->not_full);
+    }
+    pthread_mutex_unlock(&fb->mutex);
+    return n;
 }
 
 size_t flow_buffer_count(const FlowCircularBuffer *fb)
@@ -241,6 +334,10 @@ size_t flow_buffer_count(const FlowCircularBuffer *fb)
 
     if (!valid_buffer(fb)) {
         return 0;
+    }
+
+    if (fb->occupancy != NULL) {
+        return atomic_load_explicit(fb->occupancy, memory_order_relaxed);
     }
 
     pthread_mutex_lock((pthread_mutex_t *)&fb->mutex);
@@ -262,6 +359,11 @@ int flow_buffer_is_full(const FlowCircularBuffer *fb)
 
     if (!valid_buffer(fb)) {
         return 0;
+    }
+
+    if (fb->occupancy != NULL) {
+        return atomic_load_explicit(fb->occupancy, memory_order_relaxed) ==
+               fb->capacity;
     }
 
     pthread_mutex_lock((pthread_mutex_t *)&fb->mutex);

@@ -34,15 +34,16 @@ directories:
 ```bash
 cd ~/work/multi-flow-rate-control
 make wg-demo
+make wire-relay    # needed on VM2/VM3 for application-layer hops
 ```
 
 Allow the chosen UDP port in both VM firewalls/security groups.
 
 ## 3. Run the application transfer
 
-The cross-VM wire modes use a UDP header containing flow ID, block ID, shard
-index/count, payload length, and original valid length. They support the
-following codecs:
+The cross-VM wire modes use wire header **v3** (44 bytes): flow ID, block ID,
+shard index/count, payload/valid length, timestamps, plus `final_dst` and `ttl`
+in the former reserved bytes. They support the following codecs:
 
 - `copy`: preserves the existing 4-input-packet to 8-output-packet block
   geometry without `+1/-1` arithmetic.
@@ -54,10 +55,11 @@ following codecs:
   restores up to two missing shards when at least four shards arrive; its
   systematic `--best-effort` behavior is the same as `xor-fec`.
 
-On VM2:
+On VM2 (direct two-node test; `local_node_id` defaults to 4, so set it to match
+`--final-dst` or use the defaults with `final_dst=4` even on a two-node run):
 
 ```bash
-./build/wg_multi_pipeline --codec copy \
+./build/wg_multi_pipeline --codec copy --local-node-id 4 \
   --udp-recv 9000 received-copy.ts --idle-sec 5
 ```
 
@@ -65,8 +67,37 @@ On VM1:
 
 ```bash
 ./build/wg_multi_pipeline --codec copy --rate-mbps 100 \
+  --final-dst 4 --ttl 8 \
   --udp-send VM2_IP 9000 input.ts
 ```
+
+### Application-layer four-hop relay (VM1 → VM2 → VM3 → VM4)
+
+UDP next-hop and header `final_dst` are different:
+
+- VM1 `sendto(VM2)`; header `final_dst=4`
+- VM2/VM3 run `wire_relay` (opaque forward; no decode)
+- VM4 `--udp-recv` with `--local-node-id 4`
+
+Do **not** rely on kernel `ip_forward` to skip the relay processes.
+
+```bash
+# VM4
+./build/wg_multi_pipeline --codec copy --local-node-id 4 \
+  --udp-recv 9000 /tmp/out.ts --idle-sec 5
+
+# VM3
+./build/wire_relay --local-node-id 3 --listen 9000 --next-hop VM4_IP:9000
+
+# VM2
+./build/wire_relay --local-node-id 2 --listen 9000 --next-hop VM3_IP:9000
+
+# VM1
+./build/wg_multi_pipeline --codec copy --final-dst 4 --ttl 8 \
+  --udp-send VM2_IP 9000 input.ts
+```
+
+Details: [`apps/wire_relay/README.md`](../apps/wire_relay/README.md).
 
 After the receiver exits, compare SHA-256 hashes or copy the output back to
 VM1 and use `cmp`:

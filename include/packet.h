@@ -19,12 +19,16 @@ typedef enum {
     PKT_ERR_SYSTEM = -3
 } PacketStatus;
 
+typedef struct PacketPool PacketPool;
+
 typedef struct DataPacket {
     uint32_t        flow_id;
     struct timespec enqueue_ts;
     size_t          payload_len;
     unsigned char  *payload;
     void           *user_data;
+    /* Non-NULL => packet+payload owned by PacketPool; packet_free returns it. */
+    PacketPool     *pool;
 } DataPacket;
 
 typedef void (*PacketPayloadFreeFn)(void *payload, void *ctx);

@@ -1,4 +1,5 @@
 #include "packet.h"
+#include "packet_pool.h"
 #include "time_utils.h"
 
 #include <stdlib.h>
@@ -24,6 +25,7 @@ DataPacket *packet_create(uint32_t flow_id, const void *data, size_t len)
 
     pkt->flow_id = flow_id;
     pkt->payload_len = len;
+    pkt->pool = NULL;
 
     if (len > 0) {
         pkt->payload = malloc(len);
@@ -74,6 +76,7 @@ DataPacket *packet_adopt(uint32_t flow_id,
     pkt->payload_len = len;
     pkt->payload = payload;
     pkt->user_data = adopt;
+    pkt->pool = NULL;
 
     if (time_utils_now_mono(&pkt->enqueue_ts) != TU_OK) {
         free(adopt);
@@ -89,6 +92,11 @@ void packet_free(DataPacket *pkt)
     PacketAdoptCtx *adopt;
 
     if (pkt == NULL) {
+        return;
+    }
+
+    if (pkt->pool != NULL) {
+        packet_pool_release(pkt->pool, pkt);
         return;
     }
 

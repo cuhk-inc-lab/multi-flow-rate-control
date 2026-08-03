@@ -4,6 +4,10 @@
 #include "flow_manager.h"
 #include "time_utils.h"
 
+#ifndef FM_DISPATCH_BATCH
+#define FM_DISPATCH_BATCH 32u
+#endif
+
 static FlowWorkerStatus emit_packet(FlowContext *ctx, DataPacket *pkt, ssize_t *written)
 {
     FlowBufferStatus fb_st;
@@ -92,9 +96,50 @@ static void pace_packet(FlowContext *ctx, const DataPacket *pkt)
     }
 }
 
+static int handle_one(FlowContext *ctx, DataPacket *pkt, int woke_from_idle)
+{
+    ssize_t written = 0;
+
+    if (woke_from_idle) {
+        ctx->pacing.has_stream_start = 0;
+    }
+
+    /* Only wake dispatcher when this flow may have deferred packets waiting. */
+    if (ctx->owner != NULL) {
+        flow_manager_dispatch_wake_if_deferred(ctx->owner, ctx->flow_id);
+    }
+
+    pace_packet(ctx, pkt);
+
+    {
+        FlowWorkerStatus emit_st;
+        size_t             payload_len = pkt->payload_len;
+
+        emit_st = emit_packet(ctx, pkt, &written);
+        if (emit_st == FW_ERR_SHUTDOWN) {
+            return -1;
+        }
+        if (emit_st != FW_OK) {
+            if (pkt != NULL) {
+                packet_free(pkt);
+            }
+            return 0;
+        }
+
+        flow_metrics_record_dequeue(&ctx->metrics, payload_len);
+        if (ctx->relay_queue != NULL) {
+            return 0;
+        }
+
+        packet_free(pkt);
+    }
+    return 0;
+}
+
 void *flow_worker_thread(void *arg)
 {
     FlowContext *ctx = arg;
+    DataPacket *batch[FM_DISPATCH_BATCH];
 
     if (ctx == NULL) {
         return NULL;
@@ -103,8 +148,20 @@ void *flow_worker_thread(void *arg)
     while (1) {
         DataPacket *pkt = NULL;
         FlowBufferStatus st;
-        ssize_t written = 0;
         int woke_from_idle = 0;
+        size_t n;
+        size_t i;
+
+        /* Prefer batch non-blocking drain when queue has depth. */
+        n = flow_buffer_try_dequeue_batch(&ctx->queue, batch, FM_DISPATCH_BATCH);
+        if (n > 0) {
+            for (i = 0; i < n; i++) {
+                if (handle_one(ctx, batch[i], 0) < 0) {
+                    return NULL;
+                }
+            }
+            continue;
+        }
 
         st = flow_buffer_dequeue(&ctx->queue, &pkt, &woke_from_idle);
         if (st == FB_ERR_SHUTDOWN) {
@@ -113,42 +170,8 @@ void *flow_worker_thread(void *arg)
         if (st != FB_OK || pkt == NULL) {
             continue;
         }
-
-        if (woke_from_idle) {
-            ctx->pacing.has_stream_start = 0;
-        }
-
-        if (ctx->owner != NULL) {
-            flow_manager_dispatch_wake(ctx->owner);
-        }
-
-        pace_packet(ctx, pkt);
-
-        {
-            FlowWorkerStatus emit_st;
-            size_t             payload_len = pkt->payload_len;
-
-            emit_st = emit_packet(ctx, pkt, &written);
-            if (emit_st == FW_ERR_SHUTDOWN) {
-                break;
-            }
-            if (emit_st != FW_OK) {
-                if (pkt != NULL) {
-                    packet_free(pkt);
-                }
-                continue;
-            }
-
-            flow_metrics_record_dequeue(&ctx->metrics, payload_len);
-            if (written > 0) {
-                (void)written;
-            }
-
-            if (ctx->relay_queue != NULL) {
-                continue;
-            }
-
-            packet_free(pkt);
+        if (handle_one(ctx, pkt, woke_from_idle) < 0) {
+            break;
         }
     }
 

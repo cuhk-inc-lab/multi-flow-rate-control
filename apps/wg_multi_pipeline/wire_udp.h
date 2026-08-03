@@ -2,6 +2,7 @@
 #define WIRE_UDP_H
 
 #include "codec.h"
+#include "wire_header.h"
 
 #include <stdbool.h>
 #include <sys/socket.h>
@@ -14,6 +15,8 @@ typedef struct WireUdpSendConfig {
     CodecKind   codec_kind;
     double      source_rate_mbps;
     uint32_t    flow_id;
+    uint8_t     final_dst;
+    uint8_t     ttl;
 } WireUdpSendConfig;
 
 typedef struct WireUdpRecvConfig {
@@ -25,6 +28,8 @@ typedef struct WireUdpRecvConfig {
     uint32_t    max_flows;
     /* Demo/teaching: after Codec_decode path, append a text mark into the output. */
     int         decode_mark;
+    /* Drop datagrams whose header.final_dst does not match (0 disables check). */
+    uint8_t     local_node_id;
     /*
      * Optional per sender wire-flow_id output suffix (includes leading '.').
      * When out_suffix_set[id] is set, use out_suffix_by_flow[id] (may be empty).
@@ -43,12 +48,15 @@ typedef struct WireUdpTx {
     uint64_t                source_bytes;
     double                  source_rate_mbps;
     double                  started;
+    uint8_t                 final_dst;
+    uint8_t                 ttl;
 } WireUdpTx;
 
 int wire_udp_send(const WireUdpSendConfig *config);
 int wire_udp_recv(const WireUdpRecvConfig *config);
 int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,
-                     uint32_t flow_id, double source_rate_mbps);
+                     uint32_t flow_id, double source_rate_mbps,
+                     uint8_t final_dst, uint8_t ttl);
 void wire_udp_tx_destroy(WireUdpTx *tx);
 bool wire_udp_tx_ready(const WireUdpTx *tx);
 int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,

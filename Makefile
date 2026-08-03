@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -O2
+CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -Iinclude -O2
 LDFLAGS = -pthread
 RS_LDFLAGS = -lerasurecode_rs_vand
 
@@ -16,6 +16,7 @@ CFLAGS += -I$(CB_INC)
 
 LIB_SRCS = \
 	$(SRC_DIR)/packet.c \
+	$(SRC_DIR)/packet_pool.c \
 	$(SRC_DIR)/time_utils.c \
 	$(SRC_DIR)/flow_buffer.c \
 	$(SRC_DIR)/mixed_queue.c \
@@ -26,7 +27,8 @@ LIB_SRCS = \
 	$(SRC_DIR)/flow_manager.c \
 	$(SRC_DIR)/pipe_io.c \
 	$(SRC_DIR)/flow_peer_map.c \
-	$(SRC_DIR)/ingress_push.c
+	$(SRC_DIR)/ingress_push.c \
+	$(SRC_DIR)/wire_header.c
 
 LIB_OBJS = $(LIB_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o) \
            $(OBJ_DIR)/circular_buffer.o
@@ -34,6 +36,8 @@ LIB_OBJS = $(LIB_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o) \
 LIB      = $(OBJ_DIR)/libmulti_flow.a
 TEST_BIN = $(OBJ_DIR)/run_tests
 WG_BIN    = $(OBJ_DIR)/wg_multi_pipeline
+RELAY_DIR = apps/wire_relay
+RELAY_BIN = $(OBJ_DIR)/wire_relay
 WG_CODEC_TEST_BIN = $(OBJ_DIR)/wg_codec_tests
 FEC_TRACE_BIN = $(OBJ_DIR)/fec_trace
 
@@ -68,11 +72,20 @@ WG_TEST_OUT0 = $(OBJ_DIR)/wg_test_out0.ts
 WG_TEST_OUT1 = $(OBJ_DIR)/wg_test_out1.ts
 WG_TEST_OUT2 = $(OBJ_DIR)/wg_test_out2.ts
 
-.PHONY: all test check wg-demo integration-test fec-trace sanitize tsan clean
+RELAY_OBJS = \
+	$(OBJ_DIR)/relay_main.o \
+	$(OBJ_DIR)/relay_relay.o \
+	$(OBJ_DIR)/relay_recode.o
+
+RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
+
+.PHONY: all test check wg-demo wire-relay integration-test fec-trace sanitize tsan clean
 
 all: $(LIB)
 
 wg-demo: $(WG_BIN)
+
+wire-relay: $(RELAY_BIN)
 
 fec-trace: $(FEC_TRACE_BIN)
 	./$(FEC_TRACE_BIN)
@@ -80,7 +93,7 @@ fec-trace: $(FEC_TRACE_BIN)
 test check: $(TEST_BIN)
 	./$(TEST_BIN)
 
-integration-test wg-demo-test: $(WG_BIN) $(WG_CODEC_TEST_BIN)
+integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN)
 	./$(WG_CODEC_TEST_BIN)
 	dd if=/dev/urandom of=$(WG_TEST_IN0) bs=1400 count=20 status=none
 	dd if=/dev/urandom of=$(WG_TEST_IN1) bs=5600 count=5 status=none
@@ -97,6 +110,7 @@ integration-test wg-demo-test: $(WG_BIN) $(WG_CODEC_TEST_BIN)
 	sh $(TEST_DIR)/wire_multi_flow_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_xor_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_rs_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
+	sh $(TEST_DIR)/wire_relay_loopback.sh ./$(WG_BIN) ./$(RELAY_BIN) $(OBJ_DIR)
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
@@ -129,6 +143,12 @@ $(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 
 $(WG_BIN): $(WG_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) $(WG_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
+$(OBJ_DIR)/relay_%.o: $(RELAY_DIR)/%.c $(INCLUDE_HDRS) $(RELAY_HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -c $< -o $@
+
+$(RELAY_BIN): $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o -o $@ $(LDFLAGS)
 
 $(WG_CODEC_TEST_BIN): $(TEST_DIR)/wg_codec_tests.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \

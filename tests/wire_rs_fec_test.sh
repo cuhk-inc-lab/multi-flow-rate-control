@@ -61,9 +61,10 @@ while time.monotonic() < deadline:
     packet, _ = sock.recvfrom(2048)
     if len(packet) < 44:
         continue
-    _, version, packet_type, _, _, _, shard_index, _, _, _ = \
-        struct.unpack("!IBBHIQHHHH", packet[:28])
-    if version != 2:
+    # Wire header v3: magic, ver, type, final_dst, ttl, flow_id, block_id, shard_index, ...
+    _, version, packet_type, _, _, _, _, shard_index, _, _, _ = \
+        struct.unpack("!IBBBBIQHHHH", packet[:28])
+    if version != 3:
         continue
     if packet_type == 1 and shard_index in dropped:
         continue

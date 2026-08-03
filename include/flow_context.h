@@ -47,6 +47,8 @@ typedef enum {
 typedef struct FlowContext {
     uint32_t            flow_id;
     FlowCircularBuffer  queue;
+    _Atomic size_t      queue_occupancy;
+    _Atomic uint64_t    drop_deferred_overflow;
     FlowMetrics         metrics;
     FlowPacingState     pacing;
     int                 output_fd;

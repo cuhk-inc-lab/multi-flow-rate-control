@@ -12,6 +12,7 @@
 #include "flow_buffer.h"
 #include "flow_manager.h"
 #include "ingress_push.h"
+#include "packet_pool.h"
 #include "pipe_io.h"
 #include "time_utils.h"
 
@@ -946,6 +947,122 @@ static WgPipelineStatus push_ingress_packet(FlowStage *st, FlowManager *mgr,
     return WG_PIPE_OK;
 }
 
+/*
+ * Prefer pool alloc + direct read into payload (no stack buf memcpy).
+ * Falls back to push_ingress_packet when pool is empty / unavailable.
+ */
+static WgPipelineStatus push_ingress_from_fd(FlowStage *st, FlowManager *mgr,
+                                             const unsigned char *data, size_t len)
+{
+    PacketPool *pool;
+    DataPacket *pkt;
+    uint32_t flow_id;
+
+    if (data == NULL || len == 0) {
+        return push_ingress_packet(st, mgr, data, len);
+    }
+
+    pool = flow_manager_packet_pool(mgr);
+    if (pool == NULL || len > packet_pool_payload_cap(pool) ||
+        st->ingress_tuple != NULL) {
+        return push_ingress_packet(st, mgr, data, len);
+    }
+
+    flow_id = st->flow_id;
+    pkt = packet_pool_alloc(pool, flow_id);
+    if (pkt == NULL) {
+        return push_ingress_packet(st, mgr, data, len);
+    }
+
+    memcpy(pkt->payload, data, len);
+    pkt->payload_len = len;
+
+    if (st->wire_send_mode) {
+        st->wire_ingress_bytes += (uint64_t)len;
+        st->wire_ingress_fnv = wire_fnv_update(st->wire_ingress_fnv, data, len);
+    }
+
+    if (ingress_push_prepared(mgr, pkt) != INGRESS_PUSH_OK) {
+        return WG_PIPE_ERR;
+    }
+    atomic_fetch_add(&st->packets_pushed, 1);
+    return WG_PIPE_OK;
+}
+
+/*
+ * Read one full PKG_SIZE packet directly into a pooled payload.
+ * Returns:
+ *   1 — handled (packet pushed, EOF marked, or would-block / partial stored)
+ *   0 — caller should use stack buffer path (no pool / alloc failed)
+ *  -1 — hard I/O or push error
+ */
+static int try_pooled_full_read(FlowStage *st, FlowManager *mgr, int *pumped)
+{
+    PacketPool *pool;
+    DataPacket *pkt;
+    ssize_t n;
+
+    pool = flow_manager_packet_pool(mgr);
+    if (pool == NULL || packet_pool_payload_cap(pool) < PKG_SIZE ||
+        st->ingress_tuple != NULL) {
+        return 0;
+    }
+
+    pkt = packet_pool_alloc(pool, st->flow_id);
+    if (pkt == NULL) {
+        return 0;
+    }
+
+    n = read_input_nb(st, pkt->payload, PKG_SIZE);
+    if (n < 0) {
+        packet_free(pkt);
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 1;
+        }
+        return -1;
+    }
+    if (n == 0) {
+        packet_free(pkt);
+        if (input_is_fifo(st)) {
+            return 1;
+        }
+        mark_segment_ending(st);
+        return 1;
+    }
+    if ((size_t)n < PKG_SIZE) {
+        memcpy(st->ingress_partial, pkt->payload, (size_t)n);
+        st->ingress_partial_len = (size_t)n;
+        packet_free(pkt);
+        if (!input_is_fifo(st)) {
+            if (push_ingress_from_fd(st, mgr, st->ingress_partial,
+                                     st->ingress_partial_len) != WG_PIPE_OK) {
+                return -1;
+            }
+            st->ingress_partial_len = 0;
+            mark_segment_ending(st);
+            if (pumped != NULL) {
+                (*pumped)++;
+            }
+        }
+        return 1;
+    }
+
+    pkt->payload_len = PKG_SIZE;
+    if (st->wire_send_mode) {
+        st->wire_ingress_bytes += (uint64_t)PKG_SIZE;
+        st->wire_ingress_fnv =
+            wire_fnv_update(st->wire_ingress_fnv, pkt->payload, PKG_SIZE);
+    }
+    if (ingress_push_prepared(mgr, pkt) != INGRESS_PUSH_OK) {
+        return -1;
+    }
+    atomic_fetch_add(&st->packets_pushed, 1);
+    if (pumped != NULL) {
+        (*pumped)++;
+    }
+    return 1;
+}
+
 static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
 {
     unsigned char buf[PKG_SIZE];
@@ -967,6 +1084,8 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
     }
 
     while (pumped < max_pkts && !st->ingest_done) {
+        int pooled;
+
         if (!flow_can_accept_ingress(st, mgr)) {
             break;
         }
@@ -989,7 +1108,7 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
                 if (st->ingress_partial_len > 0) {
                     WgPipelineStatus push_st;
 
-                    push_st = push_ingress_packet(st, mgr, st->ingress_partial,
+                    push_st = push_ingress_from_fd(st, mgr, st->ingress_partial,
                                                   st->ingress_partial_len);
                     st->ingress_partial_len = 0;
                     if (push_st != WG_PIPE_OK) {
@@ -1008,7 +1127,7 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
             {
                 WgPipelineStatus push_st;
 
-                push_st = push_ingress_packet(st, mgr, st->ingress_partial,
+                push_st = push_ingress_from_fd(st, mgr, st->ingress_partial,
                                               PKG_SIZE);
                 st->ingress_partial_len = 0;
                 if (push_st != WG_PIPE_OK) {
@@ -1017,6 +1136,17 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
                 pumped++;
                 continue;
             }
+        }
+
+        pooled = try_pooled_full_read(st, mgr, &pumped);
+        if (pooled < 0) {
+            return WG_PIPE_ERR;
+        }
+        if (pooled > 0) {
+            if (st->ingest_done) {
+                return WG_PIPE_OK;
+            }
+            continue;
         }
 
         n = read_input_nb(st, buf, PKG_SIZE);
@@ -1037,11 +1167,10 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
         if ((size_t)n < PKG_SIZE) {
             memcpy(st->ingress_partial, buf, (size_t)n);
             st->ingress_partial_len = (size_t)n;
-            /* Regular-file short read is EOF; flush the tail packet now. */
             if (!input_is_fifo(st)) {
                 WgPipelineStatus push_st;
 
-                push_st = push_ingress_packet(st, mgr, st->ingress_partial,
+                push_st = push_ingress_from_fd(st, mgr, st->ingress_partial,
                                               st->ingress_partial_len);
                 st->ingress_partial_len = 0;
                 if (push_st != WG_PIPE_OK) {
@@ -1052,7 +1181,7 @@ static WgPipelineStatus pump_file_ingress(FlowStage *st, FlowManager *mgr)
             return WG_PIPE_OK;
         }
 
-        if (push_ingress_packet(st, mgr, buf, PKG_SIZE) != WG_PIPE_OK) {
+        if (push_ingress_from_fd(st, mgr, buf, PKG_SIZE) != WG_PIPE_OK) {
             return WG_PIPE_ERR;
         }
         pumped++;
@@ -1074,6 +1203,8 @@ static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
 {
     size_t per_flow_cap;
     size_t deferred_count;
+    size_t mixed_count;
+    size_t flow_count;
 
     if (st == NULL || mgr == NULL) {
         return 0;
@@ -1081,12 +1212,14 @@ static int flow_can_accept_ingress(const FlowStage *st, const FlowManager *mgr)
 
     per_flow_cap = mgr->config.per_flow_queue_capacity;
     deferred_count = flow_manager_deferred_count(mgr, st->flow_id);
+    mixed_count = mixed_queue_count(&mgr->mixed);
+    flow_count = flow_buffer_count(&mgr->flows[st->flow_id].queue);
 
-    if (mixed_queue_count(&mgr->mixed) + 1 >= mgr->config.mixed_queue_capacity) {
+    if (mixed_count + 1 >= mgr->config.mixed_queue_capacity) {
         return 0;
     }
 
-    if (flow_buffer_count(&mgr->flows[st->flow_id].queue) + 1 >= per_flow_cap) {
+    if (flow_count + 1 >= per_flow_cap) {
         return 0;
     }
 
@@ -1381,7 +1514,9 @@ WgPipelineStatus wg_pipeline_run(const WgPipelineConfig *config)
         .mixed_queue_capacity = MF_MIXED_CAPACITY,
         .default_output_fd = -1,
         .output_fds = NULL,
-        .encode_scratch_cap = 0
+        .encode_scratch_cap = 0,
+        .packet_pool_capacity = 0,
+        .packet_pool_payload_cap = PKG_SIZE
     };
 
     if (flow_manager_init(&mgr, &mgr_cfg) != FM_OK) {
@@ -1782,7 +1917,9 @@ WgPipelineStatus wg_pipeline_run_udp(const WgUdpConfig *config)
         .mixed_queue_capacity = MF_MIXED_CAPACITY,
         .default_output_fd = -1,
         .output_fds = NULL,
-        .encode_scratch_cap = 0
+        .encode_scratch_cap = 0,
+        .packet_pool_capacity = 0,
+        .packet_pool_payload_cap = PKG_SIZE
     };
 
     if (flow_manager_init(&mgr, &mgr_cfg) != FM_OK) {
@@ -1955,7 +2092,8 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     WgPipelineStatus  status = WG_PIPE_OK;
     unsigned char     work[CODEC_MAX_ENCODE_BLOCK];
 
-    if (config == NULL || config->flows == NULL || config->flow_count == 0) {
+    if (config == NULL || config->flows == NULL || config->flow_count == 0 ||
+        config->final_dst == 0 || config->ttl == 0) {
         return WG_PIPE_ERR;
     }
 
@@ -1996,7 +2134,8 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
             goto cleanup;
         }
         if (wire_udp_tx_init(&txs[i], path->host, path->port, path->flow_id,
-                             path->source_rate_mbps) != 0) {
+                             path->source_rate_mbps, config->final_dst,
+                             config->ttl) != 0) {
             status = WG_PIPE_ERR;
             goto cleanup;
         }
@@ -2008,7 +2147,9 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
         .mixed_queue_capacity = MF_MIXED_CAPACITY,
         .default_output_fd = -1,
         .output_fds = NULL,
-        .encode_scratch_cap = 0
+        .encode_scratch_cap = 0,
+        .packet_pool_capacity = 0,
+        .packet_pool_payload_cap = PKG_SIZE
     };
 
     if (flow_manager_init(&mgr, &mgr_cfg) != FM_OK) {

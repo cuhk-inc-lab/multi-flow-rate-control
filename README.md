@@ -105,12 +105,22 @@ Script catalog (purpose + usage + key env):
 ```bash
 make                  # libmulti_flow.a
 make test             # unit tests (run_tests.c)
-make integration-test # multi-file wg_multi_pipeline (3 flows, cmp)
+make integration-test # multi-file + wire + wire_relay loopback
 make wg-demo          # build wg_multi_pipeline
+make wire-relay       # build apps/wire_relay (opaque UDP hop relay)
 make sanitize         # ASan + test + integration-test
 make tsan             # TSan + test + integration-test
 make clean
 ```
+
+Wire UDP uses header **v3** (`include/wire_header.h`): 44-byte header with
+`final_dst` + `ttl` in the former reserved bytes. Application-layer multi-hop:
+
+```text
+VM1 encode → VM2 wire_relay → VM3 wire_relay → VM4 decode
+```
+
+See [`apps/wire_relay/README.md`](apps/wire_relay/README.md).
 
 ## Library modules
 
@@ -125,6 +135,7 @@ make clean
 | `fd_sink` | write() with partial retry |
 | `flow_peer_map` | UDP 5-tuple → internal flow slot |
 | `ingress_push` | Upstream bytes → `flow_manager_push` |
+| `wire_header` | Shared WGP1 wire header encode/decode (v3) |
 
 ## Pacing
 

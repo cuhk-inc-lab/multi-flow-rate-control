@@ -2,6 +2,33 @@
 
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
+
+#ifndef FM_DISPATCH_BATCH
+#define FM_DISPATCH_BATCH 32u
+#endif
+
+#ifndef FM_DEFERRED_QUOTA
+#define FM_DEFERRED_QUOTA 8u
+#endif
+
+static void deferred_mark_active(FlowManager *mgr, uint32_t flow_id)
+{
+    if (flow_id < 64u) {
+        atomic_fetch_or_explicit(&mgr->deferred_active_bits,
+                                 (uint64_t)1u << flow_id,
+                                 memory_order_relaxed);
+    }
+}
+
+static void deferred_clear_active(FlowManager *mgr, uint32_t flow_id)
+{
+    if (flow_id < 64u) {
+        atomic_fetch_and_explicit(&mgr->deferred_active_bits,
+                                  ~((uint64_t)1u << flow_id),
+                                  memory_order_relaxed);
+    }
+}
 
 static int deferred_init(DeferredQueue *dq, size_t capacity)
 {
@@ -43,48 +70,62 @@ static void deferred_destroy(DeferredQueue *dq)
     atomic_store(&dq->count, 0);
 }
 
-static int deferred_push(DeferredQueue *dq, DataPacket *pkt)
+static int deferred_push(FlowManager *mgr, uint32_t flow_id, DataPacket *pkt)
 {
-    if (dq == NULL || pkt == NULL ||
-        atomic_load(&dq->count) >= dq->capacity) {
+    DeferredQueue *dq;
+
+    if (mgr == NULL || pkt == NULL || flow_id >= mgr->config.max_flows) {
+        return 0;
+    }
+
+    dq = &mgr->deferred[flow_id];
+    if (atomic_load(&dq->count) >= dq->capacity) {
         return 0;
     }
 
     dq->slots[dq->tail] = pkt;
     dq->tail = (dq->tail + 1) % dq->capacity;
-    atomic_fetch_add(&dq->count, 1);
+    if (atomic_fetch_add(&dq->count, 1) == 0) {
+        deferred_mark_active(mgr, flow_id);
+    }
+    atomic_fetch_add_explicit(&mgr->deferred_total_count, 1, memory_order_relaxed);
     return 1;
 }
 
-static DataPacket *deferred_pop(DeferredQueue *dq)
+static DataPacket *deferred_pop(FlowManager *mgr, uint32_t flow_id)
 {
+    DeferredQueue *dq;
     DataPacket *pkt;
+    size_t prev;
 
-    if (dq == NULL || atomic_load(&dq->count) == 0) {
+    if (mgr == NULL || flow_id >= mgr->config.max_flows) {
+        return NULL;
+    }
+
+    dq = &mgr->deferred[flow_id];
+    if (atomic_load(&dq->count) == 0) {
         return NULL;
     }
 
     pkt = dq->slots[dq->head];
     dq->slots[dq->head] = NULL;
     dq->head = (dq->head + 1) % dq->capacity;
-    atomic_fetch_sub(&dq->count, 1);
+    prev = atomic_fetch_sub(&dq->count, 1);
+    atomic_fetch_sub_explicit(&mgr->deferred_total_count, 1, memory_order_relaxed);
+    if (prev == 1) {
+        deferred_clear_active(mgr, flow_id);
+    }
     return pkt;
 }
 
-static int deferred_total(const FlowManager *mgr)
+static void record_deferred_overflow(FlowManager *mgr, uint32_t flow_id)
 {
-    size_t total = 0;
-    uint32_t i;
-
-    if (mgr == NULL || mgr->deferred == NULL) {
-        return 0;
+    mgr->route_errors++;
+    atomic_fetch_add_explicit(&mgr->drop_deferred_overflow, 1, memory_order_relaxed);
+    if (flow_id < mgr->config.max_flows) {
+        atomic_fetch_add_explicit(&mgr->flows[flow_id].drop_deferred_overflow,
+                                  1, memory_order_relaxed);
     }
-
-    for (i = 0; i < mgr->config.max_flows; i++) {
-        total += atomic_load(&mgr->deferred[i].count);
-    }
-
-    return (int)total;
 }
 
 static int route_packet(FlowManager *mgr, DataPacket *pkt)
@@ -108,8 +149,8 @@ static int route_packet(FlowManager *mgr, DataPacket *pkt)
      * packet ahead of an earlier deferred one (reorder → corrupt payload).
      */
     if (atomic_load(&mgr->deferred[flow_id].count) > 0) {
-        if (!deferred_push(&mgr->deferred[flow_id], pkt)) {
-            mgr->route_errors++;
+        if (!deferred_push(mgr, flow_id, pkt)) {
+            record_deferred_overflow(mgr, flow_id);
             packet_free(pkt);
         }
         return 1;
@@ -126,8 +167,8 @@ static int route_packet(FlowManager *mgr, DataPacket *pkt)
         return 0;
     }
 
-    if (!deferred_push(&mgr->deferred[flow_id], pkt)) {
-        mgr->route_errors++;
+    if (!deferred_push(mgr, flow_id, pkt)) {
+        record_deferred_overflow(mgr, flow_id);
         packet_free(pkt);
     }
 
@@ -137,54 +178,82 @@ static int route_packet(FlowManager *mgr, DataPacket *pkt)
 static int drain_deferred(FlowManager *mgr)
 {
     uint32_t i;
+    uint32_t examined = 0;
     int progress = 0;
+    uint32_t start;
+    uint64_t active;
 
-    for (i = 0; i < mgr->config.max_flows; i++) {
-        DeferredQueue *dq = &mgr->deferred[i];
-        FlowContext *flow = &mgr->flows[i];
+    if (mgr == NULL || mgr->deferred == NULL || mgr->config.max_flows == 0) {
+        return 0;
+    }
 
-        while (atomic_load(&dq->count) > 0) {
-            DataPacket *pkt = dq->slots[dq->head];
+    active = atomic_load_explicit(&mgr->deferred_active_bits, memory_order_relaxed);
+    if (active == 0 && flow_manager_deferred_total(mgr) == 0) {
+        return 0;
+    }
+
+    start = mgr->deferred_rr_cursor % mgr->config.max_flows;
+
+    for (examined = 0; examined < mgr->config.max_flows; examined++) {
+        unsigned quota = FM_DEFERRED_QUOTA;
+
+        i = (start + examined) % mgr->config.max_flows;
+        if (i < 64u && (active & ((uint64_t)1u << i)) == 0 &&
+            atomic_load(&mgr->deferred[i].count) == 0) {
+            continue;
+        }
+
+        while (quota-- > 0 && atomic_load(&mgr->deferred[i].count) > 0) {
+            DataPacket *pkt = mgr->deferred[i].slots[mgr->deferred[i].head];
             FlowBufferStatus fb_st;
             size_t bytes = pkt->payload_len;
 
-            fb_st = flow_buffer_try_enqueue(&flow->queue, &pkt);
+            fb_st = flow_buffer_try_enqueue(&mgr->flows[i].queue, &pkt);
             if (fb_st != FB_OK) {
                 break;
             }
 
-            deferred_pop(dq);
-            flow_metrics_record_enqueue(&flow->metrics, bytes);
+            deferred_pop(mgr, i);
+            flow_metrics_record_enqueue(&mgr->flows[i].metrics, bytes);
             progress = 1;
         }
     }
 
+    mgr->deferred_rr_cursor = (start + 1u) % mgr->config.max_flows;
     return progress;
 }
 
 void *dispatcher_thread(void *arg)
 {
     FlowManager *mgr = arg;
+    DataPacket *batch[FM_DISPATCH_BATCH];
 
     if (mgr == NULL) {
         return NULL;
     }
 
     while (flow_manager_is_running(mgr)) {
-        DataPacket *pkt = NULL;
         MixedQueueStatus mq_st;
         int progress = 0;
         uint64_t wake_seen;
+        size_t n;
+        size_t bi;
+        int saw_shutdown = 0;
 
         progress |= drain_deferred(mgr);
 
-        mq_st = mixed_queue_try_pop(&mgr->mixed, &pkt);
-        if (mq_st == MQ_ERR_SHUTDOWN) {
+        n = mixed_queue_try_pop_batch(&mgr->mixed, batch, FM_DISPATCH_BATCH,
+                                      &saw_shutdown);
+        if (saw_shutdown && n == 0) {
             break;
         }
 
-        if (mq_st == MQ_OK && pkt != NULL) {
-            route_packet(mgr, pkt);
+        if (n > 0) {
+            for (bi = 0; bi < n; bi++) {
+                if (batch[bi] != NULL) {
+                    route_packet(mgr, batch[bi]);
+                }
+            }
             progress = 1;
             continue;
         }
@@ -202,7 +271,7 @@ void *dispatcher_thread(void *arg)
          * generation, retry drain (in case a worker already freed a slot and
          * signaled), then wait only if no newer wake arrived.
          */
-        if (deferred_total(mgr) > 0) {
+        if (flow_manager_deferred_total(mgr) > 0) {
             pthread_mutex_lock(&mgr->dispatch_wake_mtx);
             wake_seen = mgr->dispatch_wake_gen;
             pthread_mutex_unlock(&mgr->dispatch_wake_mtx);
@@ -212,7 +281,8 @@ void *dispatcher_thread(void *arg)
             }
 
             pthread_mutex_lock(&mgr->dispatch_wake_mtx);
-            while (flow_manager_is_running(mgr) && deferred_total(mgr) > 0 &&
+            while (flow_manager_is_running(mgr) &&
+                   flow_manager_deferred_total(mgr) > 0 &&
                    mgr->dispatch_wake_gen == wake_seen) {
                 pthread_cond_wait(&mgr->dispatch_wake_cv,
                                   &mgr->dispatch_wake_mtx);
@@ -221,13 +291,16 @@ void *dispatcher_thread(void *arg)
             continue;
         }
 
-        pkt = NULL;
-        mq_st = mixed_queue_pop(&mgr->mixed, &pkt);
-        if (mq_st == MQ_ERR_SHUTDOWN) {
-            break;
-        }
-        if (mq_st == MQ_OK && pkt != NULL) {
-            route_packet(mgr, pkt);
+        {
+            DataPacket *pkt = NULL;
+
+            mq_st = mixed_queue_pop(&mgr->mixed, &pkt);
+            if (mq_st == MQ_ERR_SHUTDOWN) {
+                break;
+            }
+            if (mq_st == MQ_OK && pkt != NULL) {
+                route_packet(mgr, pkt);
+            }
         }
     }
 
@@ -288,6 +361,9 @@ int dispatcher_init_deferred(FlowManager *mgr)
         }
     }
 
+    atomic_store(&mgr->deferred_active_bits, 0);
+    atomic_store(&mgr->deferred_total_count, 0);
+    mgr->deferred_rr_cursor = 0;
     return 1;
 }
 
@@ -305,4 +381,6 @@ void dispatcher_destroy_deferred(FlowManager *mgr)
 
     free(mgr->deferred);
     mgr->deferred = NULL;
+    atomic_store(&mgr->deferred_active_bits, 0);
+    atomic_store(&mgr->deferred_total_count, 0);
 }

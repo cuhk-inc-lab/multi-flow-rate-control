@@ -7,6 +7,7 @@
  */
 
 #include <stddef.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 #include "packet.h"
@@ -32,6 +33,7 @@ typedef struct MixedQueue {
     pthread_cond_t  not_empty;
 
     int             shutdown;
+    _Atomic size_t *occupancy; /* optional mirror */
 } MixedQueue;
 
 MixedQueueStatus mixed_queue_init(MixedQueue *mq, size_t capacity);
@@ -43,8 +45,23 @@ MixedQueueStatus mixed_queue_pop(MixedQueue *mq, DataPacket **pkt);
 MixedQueueStatus mixed_queue_try_push(MixedQueue *mq, DataPacket **pkt);
 MixedQueueStatus mixed_queue_try_pop(MixedQueue *mq, DataPacket **pkt);
 
+/*
+ * Pop up to max_n packets under one lock. Returns number popped (0..max_n).
+ * On shutdown with empty queue returns 0 and *saw_shutdown=1 if provided.
+ */
+size_t mixed_queue_try_pop_batch(MixedQueue *mq,
+                                 DataPacket **out,
+                                 size_t max_n,
+                                 int *saw_shutdown);
+
 size_t mixed_queue_count(const MixedQueue *mq);
+/* Lock-free snapshot when occupancy is maintained externally (optional). */
+size_t mixed_queue_count_unlocked_hint(const MixedQueue *mq);
+
 int    mixed_queue_is_empty(const MixedQueue *mq);
 int    mixed_queue_is_full(const MixedQueue *mq);
+
+/* Optional atomic occupancy mirror updated on push/pop (may be NULL). */
+void mixed_queue_set_occupancy_counter(MixedQueue *mq, _Atomic size_t *counter);
 
 #endif /* MIXED_QUEUE_H */

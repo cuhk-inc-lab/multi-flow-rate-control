@@ -2,7 +2,9 @@
 #include "flow_peer_map.h"
 #include "ingress_push.h"
 #include "packet.h"
+#include "packet_pool.h"
 #include "time_utils.h"
+#include "wire_header.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -171,6 +173,105 @@ static int test_packet_create_free(void)
         return 1;
     }
     packet_free(pkt);
+    return 0;
+}
+
+static int test_packet_pool_alloc_release(void)
+{
+    PacketPool *pool = NULL;
+    DataPacket *a;
+    DataPacket *b;
+    DataPacket *c;
+
+    if (packet_pool_init(&pool, 2, 64) != PP_OK || pool == NULL) {
+        return 1;
+    }
+    if (packet_pool_available(pool) != 2) {
+        packet_pool_destroy(pool);
+        return 1;
+    }
+
+    a = packet_pool_alloc(pool, 1);
+    b = packet_pool_alloc(pool, 2);
+    c = packet_pool_alloc(pool, 3);
+    if (a == NULL || b == NULL || c != NULL) {
+        packet_free(a);
+        packet_free(b);
+        packet_pool_destroy(pool);
+        return 1;
+    }
+    if (!packet_is_pooled(a) || a->payload == NULL) {
+        packet_free(a);
+        packet_free(b);
+        packet_pool_destroy(pool);
+        return 1;
+    }
+
+    memcpy(a->payload, "hi", 2);
+    a->payload_len = 2;
+    packet_free(a);
+    if (packet_pool_available(pool) != 1) {
+        packet_free(b);
+        packet_pool_destroy(pool);
+        return 1;
+    }
+
+    c = packet_pool_alloc(pool, 7);
+    if (c == NULL || c->flow_id != 7) {
+        packet_free(b);
+        packet_free(c);
+        packet_pool_destroy(pool);
+        return 1;
+    }
+
+    packet_free(b);
+    packet_free(c);
+    if (packet_pool_available(pool) != 2) {
+        packet_pool_destroy(pool);
+        return 1;
+    }
+    packet_pool_destroy(pool);
+    return 0;
+}
+
+static int test_mixed_queue_batch_pop(void)
+{
+    MixedQueue mq;
+    DataPacket *pkts[4];
+    DataPacket *out[4];
+    size_t n;
+    int i;
+    int saw = 0;
+
+    if (mixed_queue_init(&mq, 8) != MQ_OK) {
+        return 1;
+    }
+    for (i = 0; i < 4; i++) {
+        char buf[8];
+
+        snprintf(buf, sizeof(buf), "p%d", i);
+        pkts[i] = packet_create((uint32_t)i, buf, strlen(buf) + 1);
+        if (pkts[i] == NULL || mixed_queue_try_push(&mq, &pkts[i]) != MQ_OK) {
+            mixed_queue_destroy(&mq);
+            return 1;
+        }
+    }
+
+    n = mixed_queue_try_pop_batch(&mq, out, 3, &saw);
+    if (n != 3 || saw != 0) {
+        mixed_queue_destroy(&mq);
+        return 1;
+    }
+    for (i = 0; i < 3; i++) {
+        packet_free(out[i]);
+    }
+    n = mixed_queue_try_pop_batch(&mq, out, 4, &saw);
+    if (n != 1) {
+        mixed_queue_destroy(&mq);
+        return 1;
+    }
+    packet_free(out[0]);
+    mixed_queue_destroy(&mq);
     return 0;
 }
 
@@ -1188,10 +1289,65 @@ static int test_flow_peer_map(void)
     return 0;
 }
 
+static int test_wire_header_roundtrip(void)
+{
+    WireHeader in = {
+        .type = WIRE_TYPE_DATA,
+        .final_dst = 4,
+        .ttl = 8,
+        .flow_id = 3,
+        .block_id = 0x1122334455667788ull,
+        .shard_index = 2,
+        .shard_count = 5,
+        .valid_len = 1400,
+        .payload_len = 1400,
+        .encode_begin_ns = 1001,
+        .encode_end_ns = 2002,
+    };
+    unsigned char raw[WIRE_HEADER_SIZE];
+    WireHeader out;
+    unsigned char bad[WIRE_HEADER_SIZE];
+
+    memset(raw, 0, sizeof(raw));
+    wire_header_encode(raw, &in);
+    if (raw[4] != WIRE_VERSION || raw[6] != 4 || raw[7] != 8) {
+        return 1;
+    }
+    if (wire_header_decode(&out, raw, sizeof(raw)) != 0) {
+        return 1;
+    }
+    if (out.type != in.type || out.final_dst != in.final_dst || out.ttl != in.ttl ||
+        out.flow_id != in.flow_id || out.block_id != in.block_id ||
+        out.shard_index != in.shard_index || out.shard_count != in.shard_count ||
+        out.valid_len != in.valid_len || out.payload_len != in.payload_len ||
+        out.encode_begin_ns != in.encode_begin_ns ||
+        out.encode_end_ns != in.encode_end_ns) {
+        return 1;
+    }
+    if (!wire_header_is_local(&out, 4) || wire_header_is_local(&out, 2)) {
+        return 1;
+    }
+
+    memcpy(bad, raw, sizeof(bad));
+    bad[4] = 2; /* old version */
+    if (wire_header_decode(&out, bad, sizeof(bad)) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (test_packet_create_free() != 0) {
         fprintf(stderr, "test_packet_create_free failed\n");
+        return 1;
+    }
+    if (test_packet_pool_alloc_release() != 0) {
+        fprintf(stderr, "test_packet_pool_alloc_release failed\n");
+        return 1;
+    }
+    if (test_mixed_queue_batch_pop() != 0) {
+        fprintf(stderr, "test_mixed_queue_batch_pop failed\n");
         return 1;
     }
     if (test_time_utils_sub_add() != 0) {
@@ -1240,6 +1396,10 @@ int main(void)
     }
     if (test_flow_peer_map() != 0) {
         fprintf(stderr, "test_flow_peer_map failed\n");
+        return 1;
+    }
+    if (test_wire_header_roundtrip() != 0) {
+        fprintf(stderr, "test_wire_header_roundtrip failed\n");
         return 1;
     }
 

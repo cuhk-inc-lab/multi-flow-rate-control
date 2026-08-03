@@ -1,6 +1,9 @@
 #include "ingress_push.h"
 
 #include "packet.h"
+#include "packet_pool.h"
+
+#include <string.h>
 
 IngressPushStatus ingress_push(FlowManager *mgr,
                                uint32_t flow_id,
@@ -9,14 +12,47 @@ IngressPushStatus ingress_push(FlowManager *mgr,
 {
     DataPacket *pkt;
     FlowManagerStatus st;
+    PacketPool *pool;
 
     if (mgr == NULL || (len > 0 && data == NULL)) {
         return INGRESS_PUSH_ERR_INVALID;
     }
 
-    pkt = packet_create(flow_id, data, len);
+    pool = flow_manager_packet_pool(mgr);
+    if (pool != NULL && len <= packet_pool_payload_cap(pool)) {
+        pkt = packet_pool_alloc(pool, flow_id);
+        if (pkt != NULL) {
+            if (len > 0) {
+                memcpy(pkt->payload, data, len);
+            }
+            pkt->payload_len = len;
+        }
+    } else {
+        pkt = NULL;
+    }
+
     if (pkt == NULL) {
-        return INGRESS_PUSH_ERR_ALLOC;
+        pkt = packet_create(flow_id, data, len);
+        if (pkt == NULL) {
+            return INGRESS_PUSH_ERR_ALLOC;
+        }
+    }
+
+    st = flow_manager_push(mgr, &pkt);
+    if (st != FM_OK) {
+        packet_free(pkt);
+        return INGRESS_PUSH_ERR_MGR;
+    }
+
+    return INGRESS_PUSH_OK;
+}
+
+IngressPushStatus ingress_push_prepared(FlowManager *mgr, DataPacket *pkt)
+{
+    FlowManagerStatus st;
+
+    if (mgr == NULL || pkt == NULL) {
+        return INGRESS_PUSH_ERR_INVALID;
     }
 
     st = flow_manager_push(mgr, &pkt);

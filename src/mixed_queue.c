@@ -7,6 +7,13 @@ static int valid_queue(const MixedQueue *mq)
     return mq != NULL && mq->slots != NULL && mq->capacity > 0;
 }
 
+static void occupancy_set(MixedQueue *mq, size_t count)
+{
+    if (mq->occupancy != NULL) {
+        atomic_store_explicit(mq->occupancy, count, memory_order_relaxed);
+    }
+}
+
 MixedQueueStatus mixed_queue_init(MixedQueue *mq, size_t capacity)
 {
     if (mq == NULL || capacity == 0) {
@@ -23,6 +30,7 @@ MixedQueueStatus mixed_queue_init(MixedQueue *mq, size_t capacity)
     mq->head = 0;
     mq->tail = 0;
     mq->shutdown = 0;
+    mq->occupancy = NULL;
 
     if (pthread_mutex_init(&mq->mutex, NULL) != 0) {
         free(mq->slots);
@@ -48,6 +56,19 @@ MixedQueueStatus mixed_queue_init(MixedQueue *mq, size_t capacity)
     return MQ_OK;
 }
 
+void mixed_queue_set_occupancy_counter(MixedQueue *mq, _Atomic size_t *counter)
+{
+    if (mq == NULL) {
+        return;
+    }
+    mq->occupancy = counter;
+    if (counter != NULL) {
+        pthread_mutex_lock(&mq->mutex);
+        occupancy_set(mq, mq->count);
+        pthread_mutex_unlock(&mq->mutex);
+    }
+}
+
 void mixed_queue_destroy(MixedQueue *mq)
 {
     if (mq == NULL) {
@@ -63,6 +84,7 @@ void mixed_queue_destroy(MixedQueue *mq)
             mq->count--;
             packet_free(pkt);
         }
+        occupancy_set(mq, 0);
         pthread_mutex_unlock(&mq->mutex);
     }
 
@@ -77,6 +99,7 @@ void mixed_queue_destroy(MixedQueue *mq)
     mq->head = 0;
     mq->tail = 0;
     mq->shutdown = 0;
+    mq->occupancy = NULL;
 }
 
 void mixed_queue_shutdown(MixedQueue *mq)
@@ -112,6 +135,7 @@ MixedQueueStatus mixed_queue_push(MixedQueue *mq, DataPacket **pkt)
     mq->slots[mq->tail] = *pkt;
     mq->tail = (mq->tail + 1) % mq->capacity;
     mq->count++;
+    occupancy_set(mq, mq->count);
     *pkt = NULL;
 
     pthread_cond_signal(&mq->not_empty);
@@ -141,6 +165,7 @@ MixedQueueStatus mixed_queue_pop(MixedQueue *mq, DataPacket **pkt)
     mq->slots[mq->head] = NULL;
     mq->head = (mq->head + 1) % mq->capacity;
     mq->count--;
+    occupancy_set(mq, mq->count);
 
     pthread_cond_signal(&mq->not_full);
     pthread_mutex_unlock(&mq->mutex);
@@ -169,6 +194,7 @@ MixedQueueStatus mixed_queue_try_push(MixedQueue *mq, DataPacket **pkt)
     mq->slots[mq->tail] = *pkt;
     mq->tail = (mq->tail + 1) % mq->capacity;
     mq->count++;
+    occupancy_set(mq, mq->count);
     *pkt = NULL;
 
     pthread_cond_signal(&mq->not_empty);
@@ -195,11 +221,51 @@ MixedQueueStatus mixed_queue_try_pop(MixedQueue *mq, DataPacket **pkt)
     mq->slots[mq->head] = NULL;
     mq->head = (mq->head + 1) % mq->capacity;
     mq->count--;
+    occupancy_set(mq, mq->count);
 
     pthread_cond_signal(&mq->not_full);
     pthread_mutex_unlock(&mq->mutex);
 
     return MQ_OK;
+}
+
+size_t mixed_queue_try_pop_batch(MixedQueue *mq,
+                                 DataPacket **out,
+                                 size_t max_n,
+                                 int *saw_shutdown)
+{
+    size_t n = 0;
+    int was_full;
+
+    if (saw_shutdown != NULL) {
+        *saw_shutdown = 0;
+    }
+    if (!valid_queue(mq) || out == NULL || max_n == 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&mq->mutex);
+    if (mq->count == 0) {
+        if (mq->shutdown && saw_shutdown != NULL) {
+            *saw_shutdown = 1;
+        }
+        pthread_mutex_unlock(&mq->mutex);
+        return 0;
+    }
+
+    was_full = (mq->count == mq->capacity);
+    while (n < max_n && mq->count > 0) {
+        out[n++] = mq->slots[mq->head];
+        mq->slots[mq->head] = NULL;
+        mq->head = (mq->head + 1) % mq->capacity;
+        mq->count--;
+    }
+    occupancy_set(mq, mq->count);
+    if (n > 0 && was_full) {
+        pthread_cond_signal(&mq->not_full);
+    }
+    pthread_mutex_unlock(&mq->mutex);
+    return n;
 }
 
 size_t mixed_queue_count(const MixedQueue *mq)
@@ -210,11 +276,26 @@ size_t mixed_queue_count(const MixedQueue *mq)
         return 0;
     }
 
+    if (mq->occupancy != NULL) {
+        return atomic_load_explicit(mq->occupancy, memory_order_relaxed);
+    }
+
     pthread_mutex_lock((pthread_mutex_t *)&mq->mutex);
     count = mq->count;
     pthread_mutex_unlock((pthread_mutex_t *)&mq->mutex);
 
     return count;
+}
+
+size_t mixed_queue_count_unlocked_hint(const MixedQueue *mq)
+{
+    if (!valid_queue(mq)) {
+        return 0;
+    }
+    if (mq->occupancy != NULL) {
+        return atomic_load_explicit(mq->occupancy, memory_order_relaxed);
+    }
+    return mq->count;
 }
 
 int mixed_queue_is_empty(const MixedQueue *mq)
@@ -229,6 +310,11 @@ int mixed_queue_is_full(const MixedQueue *mq)
 
     if (!valid_queue(mq)) {
         return 0;
+    }
+
+    if (mq->occupancy != NULL) {
+        return atomic_load_explicit(mq->occupancy, memory_order_relaxed) ==
+               mq->capacity;
     }
 
     pthread_mutex_lock((pthread_mutex_t *)&mq->mutex);
