@@ -283,12 +283,12 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] <input.ts> <output.ts>\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|none] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|none] <input.ts> <output.ts>\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Wire v3: header carries final_dst + ttl (defaults final-dst=4, ttl=8).\n"
@@ -299,8 +299,8 @@ static void print_usage(const char *prog)
             "         -> selected codec encode -> buffer transfer -> decode -> file\n"
             "\n"
             "Codecs: block (default, existing demo), copy (4-to-8 benchmark without arithmetic),\n"
-            "        xor-fec (4 data + 1 XOR parity), rs-fec (RS 4 data + 2 parity),\n"
-            "        none (file/FIFO relay mode; --no-codec alias)\n"
+            "        xor-fec (4 data + 1 XOR parity), rs-fec (liberasurecode RS 4+2),\n"
+            "        rs (hqm/rscode column-wise RS 4+2), none (file/FIFO relay; --no-codec)\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
@@ -350,6 +350,8 @@ int main(int argc, char **argv)
                 codec_kind = CODEC_KIND_XOR_FEC;
             } else if (strcmp(argv[argi + 1], "rs-fec") == 0) {
                 codec_kind = CODEC_KIND_RS_FEC;
+            } else if (strcmp(argv[argi + 1], "rs") == 0) {
+                codec_kind = CODEC_KIND_RS;
             } else if (strcmp(argv[argi + 1], "none") == 0) {
                 codec_kind = CODEC_KIND_NONE;
             } else {

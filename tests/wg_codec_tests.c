@@ -77,6 +77,39 @@ static int test_rs_fec_recovers_two_shards(void)
     return 0;
 }
 
+static int test_rs_recovers_two_shards(void)
+{
+    unsigned char encoded[RS_FEC_ENCODE_BLOCK];
+    unsigned char original[DECODE_BLOCK];
+    size_t byte;
+
+    for (byte = 0; byte < DECODE_BLOCK; byte++) {
+        encoded[byte] = (unsigned char)(byte * 19u + 5u);
+    }
+    memcpy(original, encoded, sizeof(original));
+    Codec_encode(RsCodec_get(), encoded, sizeof(encoded));
+
+    memset(encoded + PKG_SIZE, 0, PKG_SIZE);
+    memset(encoded + 4u * PKG_SIZE, 0, PKG_SIZE);
+    if (Codec_recover(RsCodec_get(), encoded, 0x2du) != CODEC_RECOVER_OK ||
+        memcmp(encoded, original, sizeof(original)) != 0) {
+        return -1;
+    }
+
+    memset(encoded + 2u * PKG_SIZE, 0, PKG_SIZE);
+    if (Codec_recover(RsCodec_get(), encoded, 0x3bu) != CODEC_RECOVER_OK ||
+        memcmp(encoded, original, sizeof(original)) != 0) {
+        return -1;
+    }
+
+    if (Codec_recover(RsCodec_get(), encoded, 0x29u) !=
+        CODEC_RECOVER_UNAVAILABLE) {
+        return -1;
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     if (test_copy_codec_preserves_systematic_payload() != 0) {
@@ -94,6 +127,11 @@ int main(void)
         return 1;
     }
 
-    puts("XOR and RS FEC codec tests passed");
+    if (test_rs_recovers_two_shards() != 0) {
+        fprintf(stderr, "rscode RS codec test failed\n");
+        return 1;
+    }
+
+    puts("XOR, RS FEC, and rscode RS codec tests passed");
     return 0;
 }

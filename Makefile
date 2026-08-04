@@ -11,6 +11,7 @@ SRC_DIR  = src
 TEST_DIR = tests
 WG_DIR    = apps/wg_multi_pipeline
 OBJ_DIR  = build
+RSCODE_DIR = third_party/rscode
 
 CFLAGS += -I$(CB_INC)
 
@@ -50,8 +51,21 @@ WG_APP_SRCS = \
 	$(WG_DIR)/copy_codec.c \
 	$(WG_DIR)/xor_fec_codec.c \
 	$(WG_DIR)/rs_fec_codec.c \
+	$(WG_DIR)/rs_codec.c \
 	$(WG_DIR)/wire_udp.c \
 	$(WG_DIR)/file_drain.c
+
+RSCODE_SRCS = \
+	$(RSCODE_DIR)/rs.c \
+	$(RSCODE_DIR)/galois.c \
+	$(RSCODE_DIR)/berlekamp.c \
+	$(RSCODE_DIR)/crcgen.c
+
+RSCODE_OBJS = \
+	$(OBJ_DIR)/rscode_rs.o \
+	$(OBJ_DIR)/rscode_galois.o \
+	$(OBJ_DIR)/rscode_berlekamp.o \
+	$(OBJ_DIR)/rscode_crcgen.o
 
 WG_OBJS = \
 	$(OBJ_DIR)/wg_main.o \
@@ -62,6 +76,7 @@ WG_OBJS = \
 	$(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o \
 	$(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o \
 	$(OBJ_DIR)/wg_wire_udp.o \
 	$(OBJ_DIR)/wg_file_drain.o
 
@@ -110,6 +125,7 @@ integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN)
 	sh $(TEST_DIR)/wire_multi_flow_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_xor_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_rs_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
+	sh $(TEST_DIR)/wire_rs_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_relay_loopback.sh ./$(WG_BIN) ./$(RELAY_BIN) $(OBJ_DIR)
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -141,8 +157,15 @@ $(TEST_BIN): $(TEST_DIR)/run_tests.c $(LIB_OBJS) | $(OBJ_DIR)
 $(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -c $< -o $@
 
-$(WG_BIN): $(WG_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(WG_DIR) $(WG_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+$(OBJ_DIR)/wg_rs_codec.o: $(WG_DIR)/rs_codec.c $(INCLUDE_HDRS) $(WG_HDRS) \
+	$(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(RSCODE_DIR) -c $< -o $@
+
+$(OBJ_DIR)/rscode_%.o: $(RSCODE_DIR)/%.c $(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Wno-unused-parameter -I$(RSCODE_DIR) -c $< -o $@
+
+$(WG_BIN): $(WG_OBJS) $(RSCODE_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $(WG_OBJS) $(RSCODE_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(OBJ_DIR)/relay_%.o: $(RELAY_DIR)/%.c $(INCLUDE_HDRS) $(RELAY_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(RELAY_DIR) -c $< -o $@
@@ -152,7 +175,8 @@ $(RELAY_BIN): $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
 
 $(WG_CODEC_TEST_BIN): $(TEST_DIR)/wg_codec_tests.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
-	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o | $(OBJ_DIR)
+	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(FEC_TRACE_BIN): $(TEST_DIR)/fec_trace.c \

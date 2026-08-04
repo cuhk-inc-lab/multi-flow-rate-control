@@ -312,7 +312,7 @@ def as_int(v):
     except ValueError:
         return None
 
-shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6}.get(codec, 8)
+shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6, "rs": 6}.get(codec, 8)
 datagrams = as_int(sys.argv[3])
 seen = as_int(sys.argv[4])
 late = as_int(sys.argv[5])

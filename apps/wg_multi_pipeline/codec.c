@@ -155,6 +155,8 @@ const Codec *Codec_get(CodecKind kind)
         return XorFecCodec_get();
     case CODEC_KIND_RS_FEC:
         return RsFecCodec_get();
+    case CODEC_KIND_RS:
+        return RsCodec_get();
     default:
         return NULL;
     }

@@ -109,7 +109,7 @@ late = as_int(sys.argv[5]) or 0
 dropped = as_int(sys.argv[6])
 recovered = as_int(sys.argv[7])
 
-shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6, "none": 4}.get(codec, 8)
+shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6, "rs": 6, "none": 4}.get(codec, 8)
 decode_block = 188 * 4
 blocks = 0 if payload <= 0 else (payload + decode_block - 1) // decode_block
 exp = blocks * shards

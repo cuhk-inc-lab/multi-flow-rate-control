@@ -29,14 +29,17 @@ cmp c.ts  out_c.ts
 | `--no-pace` | Disable pacing; byte-exact for `cmp`; live scripts use this with `ffmpeg -re` |
 | `--codec block` | Default: existing reversible `+/-` BlockCodec demo transform |
 | `--codec xor-fec` | Systematic XOR FEC: 4 data TS packets + 1 parity packet |
-| `--codec rs-fec` | Systematic Reed-Solomon FEC: 4 data TS packets + 2 parity packets |
+| `--codec rs-fec` | Systematic Reed-Solomon FEC via liberasurecode: 4 data + 2 parity shards |
+| `--codec rs` | Systematic Reed-Solomon FEC via vendored hqm/rscode (column-wise RS 4+2); GPL |
 | `--codec none` / `--no-codec` | Local relay: skip coding; pointer-only post-worker queue. In wire UDP modes, `none` sends raw single-shard blocks |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
 The local demo transfer does not drop packets. The wire UDP receiver recovers
 one missing XOR FEC shard automatically when it receives 4 of 5 shards. With
-`rs-fec`, it recovers up to two missing shards when any 4 of 6 shards arrive.
+`rs-fec` or `rs`, it recovers up to two missing shards when any 4 of 6 shards
+arrive. `rs` and `rs-fec` share geometry but are not wire-compatible (different
+parity); send and receive must use the same `--codec`.
 
 ```bash
 ./build/wg_multi_pipeline --no-pace --codec xor-fec input.ts output.ts
@@ -65,6 +68,11 @@ data shards in order and skip missing data shards; parity is not output.
 ```bash
 sudo apt-get install liberasurecode-dev
 ```
+
+`rs` vendors [hqm/rscode](https://github.com/hqm/rscode) under
+`third_party/rscode` (GPL). It applies classical RS with `NPAR=2` to each
+byte-aligned column across the six shards (same 4+2 erasure capability as
+`rs-fec`, independent implementation).
 
 ## Per-block latency and jitter
 

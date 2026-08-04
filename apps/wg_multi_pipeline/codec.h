@@ -11,7 +11,8 @@ typedef enum CodecKind {
     CODEC_KIND_BLOCK,
     CODEC_KIND_COPY,
     CODEC_KIND_XOR_FEC,
-    CODEC_KIND_RS_FEC
+    CODEC_KIND_RS_FEC,
+    CODEC_KIND_RS
 } CodecKind;
 
 typedef enum CodecRecoverStatus {
@@ -53,6 +54,7 @@ const Codec *BlockCodec_get(void);
 const Codec *CopyCodec_get(void);
 const Codec *XorFecCodec_get(void);
 const Codec *RsFecCodec_get(void);
+const Codec *RsCodec_get(void);
 const Codec *Codec_get(CodecKind kind);
 
 #endif /* CODEC_H */

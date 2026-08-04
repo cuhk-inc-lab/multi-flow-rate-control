@@ -41,6 +41,8 @@ static const char *wire_codec_kind_name(CodecKind kind)
         return "xor-fec";
     case CODEC_KIND_RS_FEC:
         return "rs-fec";
+    case CODEC_KIND_RS:
+        return "rs";
     case CODEC_KIND_NONE:
     default:
         return "none";
