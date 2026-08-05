@@ -24,11 +24,17 @@
 /* Larger UDP buffers reduce drops under multi-flow microbursts of 232 B datagrams. */
 #define WIRE_UDP_SOCKBUF    (8 * 1024 * 1024)
 /*
- * Min inter-shard sleep for intra-block smoothing. Below this, nanosleep
- * overshoots and caps achievable source rate; fall back to block pacing.
- * (~90 Mbps xor-fec / ~75 Mbps rs-fec crossover with 5600 B blocks.)
+ * Hybrid shard pacing:
+ * - spacing >= SLEEP: nanosleep (+ spin finish)
+ * - MIN .. SLEEP: busy-wait only (nanosleep too coarse)
+ * - below MIN: sendmmsg burst + block-level pacing
+ *
+ * Older SLEEP=100us forced bursts above ~75-90 Mbps source for rs/xor; with
+ * fast matrix recovery we keep spreading shards at higher rates to cut
+ * correlated per-group loss.
  */
-#define WIRE_SHARD_PACE_MIN_SEC 0.0001
+#define WIRE_SHARD_PACE_SLEEP_SEC 0.0001
+#define WIRE_SHARD_PACE_MIN_SEC   0.000005
 
 static const char *wire_codec_kind_name(CodecKind kind)
 {
@@ -112,17 +118,24 @@ static double monotonic_seconds(void)
 
 static void sleep_until_monotonic(double target)
 {
-    double now = monotonic_seconds();
-    double delay;
-    struct timespec sleep_for;
+    for (;;) {
+        double now = monotonic_seconds();
+        double delay;
+        struct timespec sleep_for;
 
-    if (target <= 0.0 || now <= 0.0 || target <= now) {
-        return;
+        if (target <= 0.0 || now <= 0.0 || target <= now) {
+            return;
+        }
+        delay = target - now;
+        if (delay >= WIRE_SHARD_PACE_SLEEP_SEC) {
+            sleep_for.tv_sec = (time_t)delay;
+            sleep_for.tv_nsec =
+                (long)((delay - (double)sleep_for.tv_sec) * 1000000000.0);
+            (void)nanosleep(&sleep_for, NULL);
+            continue;
+        }
+        /* Short gaps: spin so we still separate shards inside one block. */
     }
-    delay = target - now;
-    sleep_for.tv_sec = (time_t)delay;
-    sleep_for.tv_nsec = (long)((delay - (double)sleep_for.tv_sec) * 1000000000.0);
-    (void)nanosleep(&sleep_for, NULL);
 }
 
 static void pace_to_source_rate(double started, uint64_t source_bytes,
@@ -369,11 +382,10 @@ int wire_udp_tx_send_block(WireUdpTx *tx, const Codec *codec,
     shard_count = (uint16_t)(output_size / PKG_SIZE);
     /*
      * Hybrid pacing:
-     * - Low rate (shard spacing >= WIRE_SHARD_PACE_MIN_SEC): spread shards
-     *   across the block budget to avoid Wi-Fi microburst loss.
-     * - High rate (spacing too short for nanosleep): burst shards and rely on
-     *   wire_udp_tx_ready() block-level pacing so the configured source rate
-     *   is still achievable (short nanosleeps systematically overshoot).
+     * - spacing >= SLEEP: nanosleep between shards
+     * - MIN .. SLEEP: busy-wait between shards (avoids Wi-Fi/queue microbursts
+     *   without giving up high source rates)
+     * - spacing < MIN: burst shards via sendmmsg; block-level pacing remains
      */
     {
         double block_budget_sec = 0.0;
