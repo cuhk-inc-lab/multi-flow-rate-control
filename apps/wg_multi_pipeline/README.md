@@ -74,6 +74,22 @@ sudo apt-get install liberasurecode-dev
 byte-aligned column across the six shards (same 4+2 erasure capability as
 `rs-fec`, independent implementation).
 
+### `rs` recovery development modes
+
+`--codec rs` defaults to the legacy rscode per-column recovery implementation.
+For development and validation, a receiver can select the calibrated
+erasure-only matrix path:
+
+```bash
+./build/wg_multi_pipeline --codec rs --rs-recover=matrix \
+  --udp-recv 9000 received.ts
+```
+
+The matrix path derives its generator matrix from the existing rscode encoder,
+so it does not change sender encoding or parity bytes. It only handles known
+UDP shard erasures; the wire protocol has no per-shard CRC/checksum, so silent
+payload corruption cannot be detected and must not be treated as an erasure.
+
 ## Per-block latency and jitter
 
 Wire sender/receiver transfers record per-block timestamps automatically. The

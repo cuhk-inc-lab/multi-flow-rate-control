@@ -41,6 +41,7 @@ RELAY_DIR = apps/wire_relay
 RELAY_BIN = $(OBJ_DIR)/wire_relay
 WG_CODEC_TEST_BIN = $(OBJ_DIR)/wg_codec_tests
 FEC_TRACE_BIN = $(OBJ_DIR)/fec_trace
+RS_RECOVERY_BENCH_BIN = $(OBJ_DIR)/rs_recovery_bench
 
 WG_APP_SRCS = \
 	$(WG_DIR)/main.c \
@@ -94,7 +95,7 @@ RELAY_OBJS = \
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
-.PHONY: all test check wg-demo wire-relay integration-test fec-trace sanitize tsan clean
+.PHONY: all test check wg-demo wire-relay integration-test fec-trace rs-recovery-bench sanitize tsan clean
 
 all: $(LIB)
 
@@ -104,6 +105,9 @@ wire-relay: $(RELAY_BIN)
 
 fec-trace: $(FEC_TRACE_BIN)
 	./$(FEC_TRACE_BIN)
+
+rs-recovery-bench: $(RS_RECOVERY_BENCH_BIN)
+	./$(RS_RECOVERY_BENCH_BIN)
 
 test check: $(TEST_BIN)
 	./$(TEST_BIN)
@@ -174,6 +178,12 @@ $(RELAY_BIN): $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(RELAY_DIR) $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o -o $@ $(LDFLAGS)
 
 $(WG_CODEC_TEST_BIN): $(TEST_DIR)/wg_codec_tests.c \
+	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
+	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
+$(RS_RECOVERY_BENCH_BIN): $(TEST_DIR)/rs_recovery_bench.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
 	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)

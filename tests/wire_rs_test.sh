@@ -4,6 +4,7 @@ set -eu
 
 bin=${1:?usage: wire_rs_test.sh path-to-wg_multi_pipeline}
 base=${2:-build}
+rs_recover_option=${RS_RECOVER_OPTION:-}
 full_port=22005
 one_loss_port=22006
 two_loss_port=22007
@@ -27,7 +28,7 @@ start_receiver() {
     port=$1
     output=$2
     shift 2
-    "$bin" --codec rs --udp-recv "$port" "$output" \
+    "$bin" --codec rs $rs_recover_option --udp-recv "$port" "$output" \
         --idle-sec 1 "$@" >"$output.log" 2>&1 &
     receiver_pid=$!
     sleep 1
