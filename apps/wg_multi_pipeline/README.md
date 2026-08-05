@@ -90,6 +90,11 @@ so it does not change sender encoding or parity bytes. It only handles known
 UDP shard erasures; the wire protocol has no per-shard CRC/checksum, so silent
 payload corruption cannot be detected and must not be treated as an erasure.
 
+Wire matrix scripts (`run_wire_matrix.sh`, `run_wire_multiflow_matrix.sh`,
+`run_wire_stress.sh`) automatically pass `--rs-recover=matrix` when
+`CODECS` includes `rs`. Override with
+`RS_RECOVER_OPTION=--rs-recover=legacy` if needed.
+
 ## Per-block latency and jitter
 
 Wire sender/receiver transfers record per-block timestamps automatically. The

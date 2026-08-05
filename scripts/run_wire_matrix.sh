@@ -33,6 +33,8 @@ usage() {
     echo "Set CODECS, RATES, RECEIVER_REPO, IDLE_SEC, PORT_BASE, RESULT_DIR," >&2
     echo "KEEP_REMOTE_OUTPUT=0 to delete receiver output after hash check," >&2
     echo "DECODE_MARK=1 to append a decode proof footer into the received file." >&2
+    echo "For codec=rs, receiver defaults to --rs-recover=matrix;" >&2
+    echo "override with RS_RECOVER_OPTION=--rs-recover=legacy." >&2
     echo "Receiver output uses the same file suffix as INPUT_FILE." >&2
 }
 
@@ -195,6 +197,12 @@ pass_count=0
 total_count=0
 for codec in $codecs; do
     for rate in $rates; do
+        # rs defaults to calibrated matrix recovery on the receiver; override with
+        # RS_RECOVER_OPTION=--rs-recover=legacy (or empty) if needed.
+        rs_recover_opt=
+        if [ "$codec" = "rs" ]; then
+            rs_recover_opt=${RS_RECOVER_OPTION:---rs-recover=matrix}
+        fi
         port=$((port_base + case_number))
         label="${codec}-${rate}m"
         remote_output="$remote_repo/build/wire-matrix-$timestamp-$label$input_ext"
@@ -209,7 +217,7 @@ for codec in $codecs; do
         echo "=== $label: UDP port $port ==="
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
-            "cd '$remote_repo' && exec ./build/wg_multi_pipeline --codec '$codec' --udp-recv '$port' '$remote_output' --idle-sec '$idle_sec' $decode_mark_opt" \
+            "cd '$remote_repo' && exec ./build/wg_multi_pipeline --codec '$codec' $rs_recover_opt --udp-recv '$port' '$remote_output' --idle-sec '$idle_sec' $decode_mark_opt" \
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1

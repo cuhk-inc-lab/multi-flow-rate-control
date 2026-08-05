@@ -113,6 +113,8 @@ Env:
   NODE3_SSH=fyp1@10.10.10.163   NODE3_IFACES="ap1 station2"
   RECEIVER_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/wire-multiflow-<timestamp>
+  RS_RECOVER_OPTION      for codec=rs, receiver defaults to --rs-recover=matrix;
+                         set RS_RECOVER_OPTION=--rs-recover=legacy to force legacy
 EOF
 }
 
@@ -696,6 +698,12 @@ for codec in $codecs; do
         if [ "$rate" = "0" ] && [ "$user_files" -ne 1 ]; then
             die "RATES=0 (no wire pace) requires user input files; seed mode needs rate>0"
         fi
+        # rs defaults to calibrated matrix recovery on the receiver; override with
+        # RS_RECOVER_OPTION=--rs-recover=legacy (or empty) if needed.
+        rs_recover_opt=
+        if [ "$codec" = "rs" ]; then
+            rs_recover_opt=${RS_RECOVER_OPTION:---rs-recover=matrix}
+        fi
         port=$((port_base + case_number))
         label="${codec}-${rate}m-${flows}f"
         case_dir="$result_dir/out/$label"
@@ -791,7 +799,7 @@ for codec in $codecs; do
 
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
-            "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
+            "cd '$remote_repo' && exec $bin_rel --codec '$codec' $rs_recover_opt --lock-memory \
               --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle' \
               $out_suffix_args $decode_mark_opt" \
             > "$receiver_log" 2>&1 &
