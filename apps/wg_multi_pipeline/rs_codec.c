@@ -35,7 +35,7 @@ static unsigned char   rs_generator[RS_FEC_TOTAL_SHARDS][RS_FEC_DATA_SHARDS];
 static RsRepairPlan    rs_plans[1u << RS_FEC_TOTAL_SHARDS];
 static int             rs_matrix_ready;
 static uint64_t        rs_matrix_init_ns;
-static RsRecoverMode   rs_recover_mode = RS_RECOVER_LEGACY;
+static RsRecoverMode   rs_recover_mode = RS_RECOVER_MATRIX;
 
 static uint64_t monotonic_nanoseconds(void)
 {

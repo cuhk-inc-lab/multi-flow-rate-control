@@ -668,10 +668,9 @@ class Orchestrator:
                 rg.prefix = str(out_dir / prefix_name)
                 rs_recover_args: List[str] = []
                 if rg.codec == "rs":
-                    rs_recover_args = [
-                        os.environ.get("RS_RECOVER_OPTION", "--rs-recover=matrix")
-                    ]
-                    rs_recover_args = [a for a in rs_recover_args if a]
+                    override = os.environ.get("RS_RECOVER_OPTION", "").strip()
+                    if override:
+                        rs_recover_args = [override]
                 cmd = [
                     str(self.bin_path),
                     "--codec",
@@ -708,11 +707,9 @@ class Orchestrator:
                 )
                 rs_recover_opt = ""
                 if rg.codec == "rs":
-                    rs_recover_opt = os.environ.get(
-                        "RS_RECOVER_OPTION", "--rs-recover=matrix"
-                    )
-                    if rs_recover_opt:
-                        rs_recover_opt = f" {shlex.quote(rs_recover_opt)}"
+                    override = os.environ.get("RS_RECOVER_OPTION", "").strip()
+                    if override:
+                        rs_recover_opt = f" {shlex.quote(override)}"
                 remote_cmd = (
                     f"cd {shlex.quote(node.remote_repo)} && "
                     f"rm -rf {shlex.quote(remote_dir)} && "

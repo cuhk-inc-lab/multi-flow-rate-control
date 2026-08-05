@@ -13,8 +13,8 @@ typedef enum RsRecoverMode {
 const Codec *RsCodec_get(void);
 
 /*
- * The default is legacy recovery. Matrix recovery is an erasure-only
- * development path; it is selected explicitly by the command line/tests.
+ * Default is calibrated matrix recovery (erasure-only). Use
+ * --rs-recover=legacy for the original per-column Berlekamp path.
  */
 int RsCodec_set_recover_mode(RsRecoverMode mode);
 RsRecoverMode RsCodec_get_recover_mode(void);

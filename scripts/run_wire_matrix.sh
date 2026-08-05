@@ -33,7 +33,7 @@ usage() {
     echo "Set CODECS, RATES, RECEIVER_REPO, IDLE_SEC, PORT_BASE, RESULT_DIR," >&2
     echo "KEEP_REMOTE_OUTPUT=0 to delete receiver output after hash check," >&2
     echo "DECODE_MARK=1 to append a decode proof footer into the received file." >&2
-    echo "For codec=rs, receiver defaults to --rs-recover=matrix;" >&2
+    echo "For codec=rs, binary defaults to matrix recovery;" >&2
     echo "override with RS_RECOVER_OPTION=--rs-recover=legacy." >&2
     echo "Receiver output uses the same file suffix as INPUT_FILE." >&2
 }
@@ -197,11 +197,10 @@ pass_count=0
 total_count=0
 for codec in $codecs; do
     for rate in $rates; do
-        # rs defaults to calibrated matrix recovery on the receiver; override with
-        # RS_RECOVER_OPTION=--rs-recover=legacy (or empty) if needed.
+        # Binary defaults to matrix for --codec rs; only pass an override.
         rs_recover_opt=
-        if [ "$codec" = "rs" ]; then
-            rs_recover_opt=${RS_RECOVER_OPTION:---rs-recover=matrix}
+        if [ "$codec" = "rs" ] && [ -n "${RS_RECOVER_OPTION:-}" ]; then
+            rs_recover_opt=$RS_RECOVER_OPTION
         fi
         port=$((port_base + case_number))
         label="${codec}-${rate}m"

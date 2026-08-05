@@ -74,26 +74,23 @@ sudo apt-get install liberasurecode-dev
 byte-aligned column across the six shards (same 4+2 erasure capability as
 `rs-fec`, independent implementation).
 
-### `rs` recovery development modes
+### `rs` recovery modes
 
-`--codec rs` defaults to the legacy rscode per-column recovery implementation.
-For development and validation, a receiver can select the calibrated
-erasure-only matrix path:
+`--codec rs` defaults to calibrated matrix recovery (erasure-only). The
+legacy per-column Berlekamp path remains available for comparison:
 
 ```bash
-./build/wg_multi_pipeline --codec rs --rs-recover=matrix \
+./build/wg_multi_pipeline --codec rs --rs-recover=legacy \
   --udp-recv 9000 received.ts
 ```
 
-The matrix path derives its generator matrix from the existing rscode encoder,
-so it does not change sender encoding or parity bytes. It only handles known
-UDP shard erasures; the wire protocol has no per-shard CRC/checksum, so silent
+Matrix recovery derives its generator from the existing rscode encoder, so
+sender encoding and parity bytes are unchanged. It only handles known UDP
+shard erasures; the wire protocol has no per-shard CRC/checksum, so silent
 payload corruption cannot be detected and must not be treated as an erasure.
 
-Wire matrix scripts (`run_wire_matrix.sh`, `run_wire_multiflow_matrix.sh`,
-`run_wire_stress.sh`) automatically pass `--rs-recover=matrix` when
-`CODECS` includes `rs`. Override with
-`RS_RECOVER_OPTION=--rs-recover=legacy` if needed.
+Wire scripts still accept `RS_RECOVER_OPTION=--rs-recover=legacy` to force
+the old path when needed.
 
 ## Per-block latency and jitter
 

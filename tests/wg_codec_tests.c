@@ -202,7 +202,7 @@ static int test_rs_matrix_exhaustive_compatibility(void)
         }
     }
 
-    return RsCodec_set_recover_mode(RS_RECOVER_LEGACY);
+    return RsCodec_set_recover_mode(RS_RECOVER_MATRIX);
 }
 
 int main(void)

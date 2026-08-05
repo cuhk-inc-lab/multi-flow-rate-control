@@ -97,6 +97,6 @@ int main(void)
         return 1;
     }
 
-    (void)RsCodec_set_recover_mode(RS_RECOVER_LEGACY);
+    (void)RsCodec_set_recover_mode(RS_RECOVER_MATRIX);
     return 0;
 }

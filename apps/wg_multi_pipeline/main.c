@@ -302,7 +302,7 @@ static void print_usage(const char *prog)
             "Codecs: block (default, existing demo), copy (4-to-8 benchmark without arithmetic),\n"
             "        xor-fec (4 data + 1 XOR parity), rs-fec (liberasurecode RS 4+2),\n"
             "        rs (hqm/rscode column-wise RS 4+2), none (file/FIFO relay; --no-codec)\n"
-            "RS recovery: legacy is the default; matrix is the erasure-only development path.\n"
+            "RS recovery: matrix is the default; --rs-recover=legacy selects the old path.\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
