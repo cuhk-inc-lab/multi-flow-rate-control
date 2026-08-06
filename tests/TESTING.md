@@ -7,7 +7,7 @@
 | `make test` | Unit tests in `tests/run_tests.c` (queues, pacing, **5-tuple peer map**, …) |
 | `make integration-test` | Automated multi-file `wg_multi_pipeline` roundtrip (3 flows, `cmp`) + wire loopback/FEC/rs tests |
 | `make wg-demo` | Build `build/wg_multi_pipeline` only |
-| `make rs-recovery-bench` | Compare legacy vs matrix RS recover latency (`tests/rs_recovery_bench.c`) |
+| `make rs-recovery-bench` | Matrix RS recover latency (`tests/rs_recovery_bench.c`) |
 | `make sanitize` | ASan + `test` + `integration-test` |
 | `make tsan` | TSan + `test` + `integration-test` |
 
@@ -69,14 +69,12 @@ Same app as above, but Makefile generates random inputs and asserts `cmp` for yo
 - **Flows:** 3 input/output pairs under `build/wg_test_in*.ts` / `build/wg_test_out*.ts`
 - **Data:** flow 0: 20×188 B; flow 1: 5×752 B; flow 2: 40×188 B + 96 B tail
 - **Path:** `ingress_push` → `FlowManager` → encode → transfer → decode → file
-- **Also runs:** `wg_codec_tests` (XOR/RS FEC/`rs` matrix compatibility),
+- **Also runs:** `wg_codec_tests` (XOR/RS FEC/`rs` matrix recovery),
   `wire_rs_test.sh` / `wire_rs_fec_test.sh` (UDP shard erasure recovery),
   wire loopback, multi-flow, and relay loopback scripts
 
-`--codec rs` uses matrix recovery by default on receive; no extra flag needed.
-Use `--rs-recover=legacy` only when comparing against the old Berlekamp path.
-Set your own RS(n,k) with `--rs-k=N --rs-parity=M` or `--rs-profile=K+R`
-(see `docs/RS_CODEC.md`).
+`--codec rs` uses matrix erasure recovery. Set your own RS(n,k) with
+`--rs-k=N --rs-parity=M` or `--rs-profile=K+R` (see `docs/RS_CODEC.md`).
 
 ```bash
 make integration-test

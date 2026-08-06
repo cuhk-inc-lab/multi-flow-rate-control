@@ -29,8 +29,7 @@ static void print_result(const char *label, uint64_t elapsed_ns)
            label, us_per_block, source_mbps);
 }
 
-static int benchmark_recovery(RsRecoverMode mode, uint16_t present_mask,
-                              const char *label)
+static int benchmark_recovery(uint16_t present_mask, const char *label)
 {
     unsigned char encoded[RS_FEC_ENCODE_BLOCK];
     unsigned char work[RS_FEC_ENCODE_BLOCK];
@@ -43,9 +42,6 @@ static int benchmark_recovery(RsRecoverMode mode, uint16_t present_mask,
 
     for (byte = 0; byte < DECODE_BLOCK; byte++) {
         encoded[byte] = (unsigned char)(byte * 37u + 9u);
-    }
-    if (RsCodec_set_recover_mode(mode) != 0) {
-        return -1;
     }
     Codec_encode(RsCodec_get(), encoded, sizeof(encoded));
     codec_present_from_u64(present_bits, RS_FEC_TOTAL_SHARDS, present_mask);
@@ -76,7 +72,7 @@ int main(void)
     uint64_t started = monotonic_nanoseconds();
     uint64_t finished;
 
-    if (RsCodec_prepare_matrix() != 0) {
+    if (RsCodec_set_params(4u, 2u) != 0 || RsCodec_prepare_matrix() != 0) {
         fputs("matrix initialization failed\n", stderr);
         return 1;
     }
@@ -85,20 +81,12 @@ int main(void)
            (double)(finished - started) / 1000.0,
            (double)RsCodec_matrix_init_ns() / 1000.0);
 
-    if (benchmark_recovery(RS_RECOVER_LEGACY, 0x3bu,
-                           "legacy recover (1 loss)") != 0 ||
-        benchmark_recovery(RS_RECOVER_LEGACY, 0x2du,
-                           "legacy recover (2 losses)") != 0 ||
-        benchmark_recovery(RS_RECOVER_MATRIX, 0x3bu,
-                           "matrix recover (1 loss)") != 0 ||
-        benchmark_recovery(RS_RECOVER_MATRIX, 0x2du,
-                           "matrix recover (2 losses)") != 0 ||
-        benchmark_recovery(RS_RECOVER_MATRIX, 0x3fu,
-                           "matrix recover (no loss)") != 0) {
+    if (benchmark_recovery(0x3bu, "matrix recover (1 loss)") != 0 ||
+        benchmark_recovery(0x2du, "matrix recover (2 losses)") != 0 ||
+        benchmark_recovery(0x3fu, "matrix recover (no loss)") != 0) {
         fputs("recovery benchmark failed\n", stderr);
         return 1;
     }
 
-    (void)RsCodec_set_recover_mode(RS_RECOVER_MATRIX);
     return 0;
 }

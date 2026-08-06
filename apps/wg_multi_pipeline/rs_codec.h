@@ -6,17 +6,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef enum RsRecoverMode {
-    RS_RECOVER_LEGACY = 0,
-    RS_RECOVER_MATRIX
-} RsRecoverMode;
-
 /*
  * Runtime RS(n,k), n = data_shards + parity_shards.
  * Working size follows RsCodec_set_params / CLI.
  *
  * present_bits is a bit array (see codec.h) — no 16/32-bit integer width cap.
  * Practical ceiling: RS_ABS_MAX_SHARDS = 255 (GF(256) byte-symbol RS).
+ * Recover always uses the matrix erasure path.
  */
 #define RS_ABS_MAX_SHARDS 255u
 
@@ -43,9 +39,6 @@ int RsCodec_params_is_wire_shard_count(uint16_t shard_count);
 
 int RsCodec_set_profile_from_shard_count(uint16_t shard_count);
 int RsCodec_profile_is_wire_shard_count(uint16_t shard_count);
-
-int RsCodec_set_recover_mode(RsRecoverMode mode);
-RsRecoverMode RsCodec_get_recover_mode(void);
 
 int RsCodec_prepare_matrix(void);
 int RsCodec_matrix_ready(void);

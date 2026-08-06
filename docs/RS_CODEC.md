@@ -38,7 +38,7 @@ with `--rs-k=16 --rs-parity=2`.
 | --- | --- |
 | `rs_codec.c` / `rs_codec.h` | Params, encode, recover |
 | `codec.h` | `CodecVTable`, `present_bits` bit array helpers |
-| `third_party/rscode/` | Used for default 4+2 encode / legacy recover |
+| `third_party/rscode/` | Used for default 4+2 encode |
 | `wire_udp.c` | Sharding; applies params from `shard_count` |
 
 ## 3. API syntax
@@ -71,10 +71,7 @@ RsCodec_set_params_from_shard_count(header.shard_count);
 Codec_recover(codec, shards, present_bits, shard_count);
 ```
 
-| Mode | When |
-| --- | --- |
-| matrix (default) | All supported (k, r) |
-| legacy | Only **4+2** |
+Recover always uses the **matrix** erasure path (supports all configured (k, r)).
 
 ### CLI
 
@@ -99,7 +96,6 @@ Codec_recover(codec, shards, present_bits, shard_count);
 | `--rs-k=N` | Data shards \(k\) |
 | `--rs-parity=M` | Parity shards \(r\) |
 | `--rs-profile=K+R` | Shorthand for k+r (also accepts `4+1` / `4+2` / `4+3`) |
-| `--rs-recover=matrix\|legacy` | Recover algorithm |
 
 ## 4. Bounds (follow your settings)
 

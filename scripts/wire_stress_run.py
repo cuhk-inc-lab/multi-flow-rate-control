@@ -666,16 +666,10 @@ class Orchestrator:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 rg.remote_dir = str(out_dir)
                 rg.prefix = str(out_dir / prefix_name)
-                rs_recover_args: List[str] = []
-                if rg.codec == "rs":
-                    override = os.environ.get("RS_RECOVER_OPTION", "").strip()
-                    if override:
-                        rs_recover_args = [override]
                 cmd = [
                     str(self.bin_path),
                     "--codec",
                     rg.codec,
-                    *rs_recover_args,
                     "--lock-memory",
                     "--udp-recv",
                     str(rg.port),
@@ -705,16 +699,11 @@ class Orchestrator:
                     f"--out-suffix {shlex.quote(f'{st.id}:{st.file_ext}')}"
                     for st in sorted(rg.streams, key=lambda x: x.id)
                 )
-                rs_recover_opt = ""
-                if rg.codec == "rs":
-                    override = os.environ.get("RS_RECOVER_OPTION", "").strip()
-                    if override:
-                        rs_recover_opt = f" {shlex.quote(override)}"
                 remote_cmd = (
                     f"cd {shlex.quote(node.remote_repo)} && "
                     f"rm -rf {shlex.quote(remote_dir)} && "
                     f"mkdir -p {shlex.quote(remote_dir)} && "
-                    f"exec {bin_rel} --codec {shlex.quote(rg.codec)}{rs_recover_opt} "
+                    f"exec {bin_rel} --codec {shlex.quote(rg.codec)} "
                     f"--lock-memory "
                     f"--udp-recv {rg.port} {shlex.quote(rg.prefix)} "
                     f"--max-flows {len(rg.streams)} --idle-sec {rg.idle_sec} "

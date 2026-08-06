@@ -8,13 +8,12 @@
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 \
 #       a.bin b.bin c.bin d.bin
 #
-# For codec=rs, matrix recovery is the binary default (no extra flag needed).
-# Override with RS_RECOVER_OPTION=--rs-recover=legacy if comparing the old path.
+# For codec=rs, recover uses the matrix erasure path (no extra flag).
 # Teaching decode-mark (footer proves Codec_decode; status MARKED):
 #   DECODE_MARK=1 KEEP_REMOTE_OUTPUT=1 CODECS="xor-fec" RATES="10" \
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 a.bin b.bin
 #
-# Or one seed file (legacy): script synthesizes FLOWS distinct payloads:
+# Or one seed file (legacy seed mode): script synthesizes FLOWS distinct payloads:
 #   FLOWS=4 DURATION_S=10 RATES="10 20" \
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 seed.ts
 #
@@ -115,8 +114,6 @@ Env:
   NODE3_SSH=fyp1@10.10.10.163   NODE3_IFACES="ap1 station2"
   RECEIVER_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/wire-multiflow-<timestamp>
-  RS_RECOVER_OPTION      for codec=rs, binary already defaults to matrix;
-                         set RS_RECOVER_OPTION=--rs-recover=legacy to force legacy
 EOF
 }
 
@@ -700,11 +697,6 @@ for codec in $codecs; do
         if [ "$rate" = "0" ] && [ "$user_files" -ne 1 ]; then
             die "RATES=0 (no wire pace) requires user input files; seed mode needs rate>0"
         fi
-        # Binary defaults to matrix for --codec rs; only pass an override.
-        rs_recover_opt=
-        if [ "$codec" = "rs" ] && [ -n "${RS_RECOVER_OPTION:-}" ]; then
-            rs_recover_opt=$RS_RECOVER_OPTION
-        fi
         port=$((port_base + case_number))
         label="${codec}-${rate}m-${flows}f"
         case_dir="$result_dir/out/$label"
@@ -800,7 +792,7 @@ for codec in $codecs; do
 
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
-            "cd '$remote_repo' && exec $bin_rel --codec '$codec' $rs_recover_opt --lock-memory \
+            "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
               --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle' \
               $out_suffix_args $decode_mark_opt" \
             > "$receiver_log" 2>&1 &

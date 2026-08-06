@@ -289,7 +289,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
             "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] [--rs-recover=legacy|matrix] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Wire v3: header carries final_dst + ttl (defaults final-dst=4, ttl=8).\n"
@@ -304,7 +304,6 @@ static void print_usage(const char *prog)
             "        rs (column-wise RS(n,k); default RS(6,4)), none (file/FIFO relay; --no-codec)\n"
             "RS params: --rs-k=N --rs-parity=M  or  --rs-profile=K+R  (e.g. 16+2); default 4+2.\n"
             "           Receiver must use the same --rs-k; parity may follow each group's shard_count.\n"
-            "RS recovery: matrix is the default; --rs-recover=legacy is 4+2 only.\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
@@ -411,23 +410,6 @@ int main(int argc, char **argv)
             if (RsCodec_set_params((size_t)k, (size_t)r) != 0) {
                 fprintf(stderr, "rs profile %s initialization failed\n",
                         profile);
-                return EXIT_FAILURE;
-            }
-            argi++;
-        } else if (strncmp(argv[argi], "--rs-recover=", 13) == 0) {
-            const char *mode = argv[argi] + 13;
-
-            if (strcmp(mode, "legacy") == 0) {
-                if (RsCodec_set_recover_mode(RS_RECOVER_LEGACY) != 0) {
-                    return EXIT_FAILURE;
-                }
-            } else if (strcmp(mode, "matrix") == 0) {
-                if (RsCodec_set_recover_mode(RS_RECOVER_MATRIX) != 0) {
-                    fprintf(stderr, "rs matrix recovery initialization failed\n");
-                    return EXIT_FAILURE;
-                }
-            } else {
-                print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
             argi++;

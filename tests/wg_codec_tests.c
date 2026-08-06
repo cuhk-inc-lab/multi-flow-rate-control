@@ -146,74 +146,49 @@ static void fill_rs_source(unsigned char *block, size_t block_len, unsigned seed
     }
 }
 
-static int test_rs_matrix_exhaustive_compatibility(void)
+static int test_rs_matrix_exhaustive_recovery(void)
 {
     const uint16_t valid_mask = 0x3fu;
     uint16_t mask;
 
-    if (RsCodec_prepare_matrix() != 0 || !RsCodec_matrix_ready()) {
+    if (RsCodec_set_params(4u, 2u) != 0 ||
+        RsCodec_prepare_matrix() != 0 || !RsCodec_matrix_ready()) {
         return -1;
     }
 
     for (mask = 0; mask <= valid_mask; mask++) {
         unsigned char encoded[RS_FEC_ENCODE_BLOCK];
         unsigned char source[DECODE_BLOCK];
-        unsigned char legacy[RS_FEC_ENCODE_BLOCK];
-        unsigned char matrix[RS_FEC_ENCODE_BLOCK];
         unsigned present = popcount_mask(mask);
         size_t shard;
-        CodecRecoverStatus legacy_status;
-        CodecRecoverStatus matrix_status;
+        CodecRecoverStatus status;
 
         fill_rs_source(encoded, sizeof(encoded), 0x4d2u + mask);
         memcpy(source, encoded, sizeof(source));
-        if (RsCodec_set_recover_mode(RS_RECOVER_LEGACY) != 0) {
-            return -1;
-        }
         Codec_encode(RsCodec_get(), encoded, sizeof(encoded));
-        memcpy(legacy, encoded, sizeof(legacy));
-        memcpy(matrix, encoded, sizeof(matrix));
 
         for (shard = 0; shard < RS_FEC_TOTAL_SHARDS; shard++) {
             if ((mask & (uint16_t)(1u << shard)) == 0) {
-                memset(legacy + shard * PKG_SIZE, 0, PKG_SIZE);
-                memset(matrix + shard * PKG_SIZE, 0, PKG_SIZE);
+                memset(encoded + shard * PKG_SIZE, 0, PKG_SIZE);
             }
         }
 
-        legacy_status = recover_mask(RsCodec_get(), legacy, 6u, mask);
-        if (RsCodec_set_recover_mode(RS_RECOVER_MATRIX) != 0) {
-            return -1;
-        }
-        matrix_status = recover_mask(RsCodec_get(), matrix, 6u, mask);
+        status = recover_mask(RsCodec_get(), encoded, 6u, mask);
 
         if (present < RS_FEC_DATA_SHARDS) {
-            if (legacy_status != CODEC_RECOVER_UNAVAILABLE ||
-                matrix_status != CODEC_RECOVER_UNAVAILABLE) {
+            if (status != CODEC_RECOVER_UNAVAILABLE) {
                 return -1;
             }
             continue;
         }
 
-        if (legacy_status != CODEC_RECOVER_OK ||
-            matrix_status != CODEC_RECOVER_OK ||
-            memcmp(matrix, source, sizeof(source)) != 0) {
+        if (status != CODEC_RECOVER_OK ||
+            memcmp(encoded, source, sizeof(source)) != 0) {
             return -1;
-        }
-
-        /*
-         * Matrix mode deliberately skips parity-only reconstruction when all
-         * systematic data shards are present. Otherwise it must reproduce the
-         * complete legacy 6-shard result byte-for-byte.
-         */
-        if ((mask & 0x0fu) != 0x0fu) {
-            if (memcmp(matrix, legacy, sizeof(matrix)) != 0) {
-                return -1;
-            }
         }
     }
 
-    return RsCodec_set_recover_mode(RS_RECOVER_MATRIX);
+    return 0;
 }
 
 static int test_rs_profile_one(size_t k, size_t r, uint64_t present_mask)
@@ -227,8 +202,7 @@ static int test_rs_profile_one(size_t k, size_t r, uint64_t present_mask)
     uint8_t *bits = NULL;
     int rc = -1;
 
-    if (RsCodec_set_params(k, r) != 0 ||
-        RsCodec_set_recover_mode(RS_RECOVER_MATRIX) != 0) {
+    if (RsCodec_set_params(k, r) != 0) {
         return -1;
     }
     total = Codec_output_block_size(RsCodec_get());
@@ -324,8 +298,8 @@ int main(void)
         return 1;
     }
 
-    if (test_rs_matrix_exhaustive_compatibility() != 0) {
-        fprintf(stderr, "rscode RS matrix exhaustive compatibility test failed\n");
+    if (test_rs_matrix_exhaustive_recovery() != 0) {
+        fprintf(stderr, "rscode RS matrix exhaustive recovery test failed\n");
         return 1;
     }
 

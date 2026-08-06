@@ -102,8 +102,8 @@ RS codec (architecture, API, runtime profiles):
 - Configurable multi-stream stress (YAML/JSON; see `scripts/examples/stress_lab.yaml`):
   - `./scripts/run_wire_stress.sh scripts/examples/stress_lab.yaml`
 
-For `--codec rs`, matrix recovery is the default on receive; wire scripts only
-need `RS_RECOVER_OPTION=--rs-recover=legacy` when comparing the old path.
+For `--codec rs`, recover uses the matrix erasure path (see
+[`docs/RS_CODEC.md`](docs/RS_CODEC.md)).
 Details: [`apps/wg_multi_pipeline/README.md`](apps/wg_multi_pipeline/README.md).
 
 ## Build & test

@@ -27,7 +27,6 @@ static pthread_mutex_t rs_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned char   rs_generator[RS_ABS_MAX_SHARDS][RS_ABS_MAX_SHARDS];
 static int             rs_matrix_ready;
 static uint64_t        rs_matrix_init_ns;
-static RsRecoverMode   rs_recover_mode = RS_RECOVER_MATRIX;
 static RsGeometry      rs_geo = {.k = 4u, .r = 2u, .n = 6u};
 
 static uint64_t monotonic_nanoseconds(void)
@@ -256,10 +255,6 @@ int RsCodec_set_params(size_t data_shards, size_t parity_shards)
     rs_matrix_ready = rebuild_generator() == 0;
     pthread_mutex_unlock(&rs_lock);
 
-    if (rs_recover_mode == RS_RECOVER_LEGACY &&
-        !(rs_geo.k == 4u && rs_geo.r == 2u)) {
-        rs_recover_mode = RS_RECOVER_MATRIX;
-    }
     return rs_matrix_ready ? 0 : -1;
 }
 
@@ -325,27 +320,6 @@ int RsCodec_set_profile_from_shard_count(uint16_t shard_count)
 int RsCodec_profile_is_wire_shard_count(uint16_t shard_count)
 {
     return RsCodec_params_is_wire_shard_count(shard_count);
-}
-
-int RsCodec_set_recover_mode(RsRecoverMode mode)
-{
-    if (mode != RS_RECOVER_LEGACY && mode != RS_RECOVER_MATRIX) {
-        return -1;
-    }
-    if (mode == RS_RECOVER_MATRIX && RsCodec_prepare_matrix() != 0) {
-        return -1;
-    }
-    if (mode == RS_RECOVER_LEGACY &&
-        !(rs_geo.k == 4u && rs_geo.r == 2u)) {
-        return -1;
-    }
-    rs_recover_mode = mode;
-    return 0;
-}
-
-RsRecoverMode RsCodec_get_recover_mode(void)
-{
-    return rs_recover_mode;
 }
 
 static void rs_encode_rscode_4_2(unsigned char *data)
@@ -462,75 +436,10 @@ static int rs_data_shards_present(const uint8_t *present_bits, size_t k)
     return 1;
 }
 
-static CodecRecoverStatus rs_recover_legacy(const Codec *self,
-                                            unsigned char *shards,
-                                            const uint8_t *present_bits,
-                                            size_t shard_count)
-{
-    int erasures[6];
-    size_t shard;
-    size_t received = 0;
-    size_t missing_count = 0;
-    size_t byte;
-    int ok = 1;
-
-    (void)self;
-
-    if (!(rs_geo.k == 4u && rs_geo.r == 2u) || shards == NULL ||
-        present_bits == NULL || shard_count != 6u || !rs_ready()) {
-        return CODEC_RECOVER_ERR;
-    }
-
-    for (shard = 0; shard < 6u; shard++) {
-        if (codec_present_get(present_bits, shard)) {
-            received++;
-        } else {
-            erasures[missing_count++] = 5 - (int)shard;
-            memset(shards + shard * PKG_SIZE, 0, PKG_SIZE);
-        }
-    }
-
-    if (missing_count == 0) {
-        return CODEC_RECOVER_OK;
-    }
-    if (received < 4u) {
-        return CODEC_RECOVER_UNAVAILABLE;
-    }
-
-    pthread_mutex_lock(&rs_lock);
-    for (byte = 0; byte < PKG_SIZE; byte++) {
-        unsigned char codeword[6];
-
-        for (shard = 0; shard < 6u; shard++) {
-            codeword[shard] = shards[shard * PKG_SIZE + byte];
-        }
-
-        decode_data(codeword, 6);
-        if (check_syndrome() == 0) {
-            continue;
-        }
-
-        if (!correct_errors_erasures(codeword, 6, (int)missing_count,
-                                     erasures)) {
-            ok = 0;
-            break;
-        }
-
-        for (shard = 0; shard < 6u; shard++) {
-            if (!codec_present_get(present_bits, shard)) {
-                shards[shard * PKG_SIZE + byte] = codeword[shard];
-            }
-        }
-    }
-    pthread_mutex_unlock(&rs_lock);
-
-    return ok ? CODEC_RECOVER_OK : CODEC_RECOVER_ERR;
-}
-
-static CodecRecoverStatus rs_recover_matrix(const Codec *self,
-                                            unsigned char *shards,
-                                            const uint8_t *present_bits,
-                                            size_t shard_count)
+static CodecRecoverStatus rs_recover(const Codec *self,
+                                     unsigned char *shards,
+                                     const uint8_t *present_bits,
+                                     size_t shard_count)
 {
     unsigned char survivors[RS_ABS_MAX_SHARDS];
     unsigned char submatrix[RS_ABS_MAX_SHARDS * RS_ABS_MAX_SHARDS];
@@ -611,17 +520,6 @@ static CodecRecoverStatus rs_recover_matrix(const Codec *self,
         }
     }
     return CODEC_RECOVER_OK;
-}
-
-static CodecRecoverStatus rs_recover(const Codec *self,
-                                     unsigned char *shards,
-                                     const uint8_t *present_bits,
-                                     size_t shard_count)
-{
-    if (rs_recover_mode == RS_RECOVER_MATRIX) {
-        return rs_recover_matrix(self, shards, present_bits, shard_count);
-    }
-    return rs_recover_legacy(self, shards, present_bits, shard_count);
 }
 
 static const CodecVTable rs_vtable = {

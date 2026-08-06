@@ -61,8 +61,6 @@ Helper (kept for multiflow / stress relay NIC sampling):
 
 **Key env**
 - `CODECS`, `RATES`
-- `RS_RECOVER_OPTION` — for `codec=rs`, binary defaults to matrix recovery;
-  set `RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path
 - `RECEIVER_REPO`
 - `IDLE_SEC`, `PORT_BASE`
 - `KEEP_REMOTE_OUTPUT` (`1` keep, `0` delete)
@@ -89,8 +87,6 @@ Helper (kept for multiflow / stress relay NIC sampling):
 
 **Key env**
 - `CODECS`, `RATES`, `FLOWS`, `DURATION_S`
-- `RS_RECOVER_OPTION` — for `codec=rs`, binary defaults to matrix recovery;
-  set `RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path
 - `RECEIVER_REPO`, `IDLE_SEC`, `PORT_BASE`
 - `FETCH_OUTPUT`, `KEEP_REMOTE_OUTPUT`
 - `DECODE_MARK` (teaching mode: receiver `--decode-mark`; status `MARKED`)
@@ -126,8 +122,6 @@ Helper (kept for multiflow / stress relay NIC sampling):
 
 **Key env / flags**
 - `RESULT_DIR` or `--result-dir DIR` (default `build/wire-stress-<ts>/`)
-- `RS_RECOVER_OPTION` — for `codec=rs`, binary defaults to matrix recovery;
-  set `RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path
 - Artifacts: `results.md`, `streams.csv`, `logs/`, `monitor/`, `charts/*.svg`,
   config copy
 

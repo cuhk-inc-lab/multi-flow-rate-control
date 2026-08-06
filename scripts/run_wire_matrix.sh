@@ -6,8 +6,7 @@
 #   CODECS="copy block xor-fec rs-fec rs" RATES="20 24 28 32" \
 #     ./scripts/run_wire_matrix.sh fyp1@10.10.10.164 10.10.34.2 input-128m.ts
 #
-# For codec=rs, matrix recovery is the binary default (no extra flag needed).
-# Override with RS_RECOVER_OPTION=--rs-recover=legacy if comparing the old path.
+# For codec=rs, recover uses the matrix erasure path (no extra flag).
 # Artifacts (kept lean):
 #   results.md   — short table: status + loss% + key latency
 #   results.csv  — machine-readable (includes full latency columns)
@@ -35,8 +34,6 @@ usage() {
     echo "Set CODECS, RATES, RECEIVER_REPO, IDLE_SEC, PORT_BASE, RESULT_DIR," >&2
     echo "KEEP_REMOTE_OUTPUT=0 to delete receiver output after hash check," >&2
     echo "DECODE_MARK=1 to append a decode proof footer into the received file." >&2
-    echo "For codec=rs, binary defaults to matrix recovery;" >&2
-    echo "override with RS_RECOVER_OPTION=--rs-recover=legacy." >&2
     echo "Receiver output uses the same file suffix as INPUT_FILE." >&2
 }
 
@@ -199,11 +196,6 @@ pass_count=0
 total_count=0
 for codec in $codecs; do
     for rate in $rates; do
-        # Binary defaults to matrix for --codec rs; only pass an override.
-        rs_recover_opt=
-        if [ "$codec" = "rs" ] && [ -n "${RS_RECOVER_OPTION:-}" ]; then
-            rs_recover_opt=$RS_RECOVER_OPTION
-        fi
         port=$((port_base + case_number))
         label="${codec}-${rate}m"
         remote_output="$remote_repo/build/wire-matrix-$timestamp-$label$input_ext"
@@ -218,7 +210,7 @@ for codec in $codecs; do
         echo "=== $label: UDP port $port ==="
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
-            "cd '$remote_repo' && exec ./build/wg_multi_pipeline --codec '$codec' $rs_recover_opt --udp-recv '$port' '$remote_output' --idle-sec '$idle_sec' $decode_mark_opt" \
+            "cd '$remote_repo' && exec ./build/wg_multi_pipeline --codec '$codec' --udp-recv '$port' '$remote_output' --idle-sec '$idle_sec' $decode_mark_opt" \
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1

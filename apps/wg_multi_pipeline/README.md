@@ -93,8 +93,6 @@ Receiver must use the same `--rs-k`. Parity can follow each group's
 `shard_count`. Working size follows your `(k,r)`; the GF(256) ceiling is
 `k+r ≤ 255` (presence uses a bit array, not a 32-bit mask).
 
-Wire scripts: `RS_RECOVER_OPTION=--rs-recover=legacy` forces the old 4+2 path.
-
 ## Per-block latency and jitter
 
 Wire sender/receiver transfers record per-block timestamps automatically. The
