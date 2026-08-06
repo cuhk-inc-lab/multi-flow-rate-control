@@ -57,10 +57,12 @@ Helper (kept for multiflow / stress relay NIC sampling):
   - records counters/latency in markdown + CSV
 
 **Usage**
-- `CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" ./scripts/run_wire_matrix.sh RECEIVER_SSH RECEIVER_DATA_IP INPUT_FILE`
+- `CODECS="copy block xor-fec rs-fec rs" RATES="20 24 28 32" ./scripts/run_wire_matrix.sh RECEIVER_SSH RECEIVER_DATA_IP INPUT_FILE`
 
 **Key env**
 - `CODECS`, `RATES`
+- `RS_RECOVER_OPTION` — for `codec=rs`, binary defaults to matrix recovery;
+  set `RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path
 - `RECEIVER_REPO`
 - `IDLE_SEC`, `PORT_BASE`
 - `KEEP_REMOTE_OUTPUT` (`1` keep, `0` delete)
@@ -81,12 +83,14 @@ Helper (kept for multiflow / stress relay NIC sampling):
 
 **Usage**
 - User files mode (recommended):
-  - `CODECS="copy xor-fec" RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh RECEIVER_SSH RECEIVER_DATA_IP file0 file1 ...`
+  - `CODECS="copy xor-fec rs" RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh RECEIVER_SSH RECEIVER_DATA_IP file0 file1 ...`
 - Seed mode:
   - `FLOWS=4 DURATION_S=10 RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh RECEIVER_SSH RECEIVER_DATA_IP seed.ts`
 
 **Key env**
 - `CODECS`, `RATES`, `FLOWS`, `DURATION_S`
+- `RS_RECOVER_OPTION` — for `codec=rs`, binary defaults to matrix recovery;
+  set `RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path
 - `RECEIVER_REPO`, `IDLE_SEC`, `PORT_BASE`
 - `FETCH_OUTPUT`, `KEEP_REMOTE_OUTPUT`
 - `DECODE_MARK` (teaching mode: receiver `--decode-mark`; status `MARKED`)
@@ -122,6 +126,8 @@ Helper (kept for multiflow / stress relay NIC sampling):
 
 **Key env / flags**
 - `RESULT_DIR` or `--result-dir DIR` (default `build/wire-stress-<ts>/`)
+- `RS_RECOVER_OPTION` — for `codec=rs`, binary defaults to matrix recovery;
+  set `RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path
 - Artifacts: `results.md`, `streams.csv`, `logs/`, `monitor/`, `charts/*.svg`,
   config copy
 

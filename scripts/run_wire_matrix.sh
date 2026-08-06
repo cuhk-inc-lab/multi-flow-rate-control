@@ -3,9 +3,11 @@
 # Run from Node1. Node4 must accept key-based SSH from Node1.
 #
 # Example:
-#   CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" \
+#   CODECS="copy block xor-fec rs-fec rs" RATES="20 24 28 32" \
 #     ./scripts/run_wire_matrix.sh fyp1@10.10.10.164 10.10.34.2 input-128m.ts
 #
+# For codec=rs, matrix recovery is the binary default (no extra flag needed).
+# Override with RS_RECOVER_OPTION=--rs-recover=legacy if comparing the old path.
 # Artifacts (kept lean):
 #   results.md   — short table: status + loss% + key latency
 #   results.csv  — machine-readable (includes full latency columns)

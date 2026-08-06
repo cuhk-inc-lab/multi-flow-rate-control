@@ -289,7 +289,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
             "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-recover=legacy|matrix] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] [--rs-recover=legacy|matrix] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Wire v3: header carries final_dst + ttl (defaults final-dst=4, ttl=8).\n"
@@ -301,8 +301,10 @@ static void print_usage(const char *prog)
             "\n"
             "Codecs: block (default, existing demo), copy (4-to-8 benchmark without arithmetic),\n"
             "        xor-fec (4 data + 1 XOR parity), rs-fec (liberasurecode RS 4+2),\n"
-            "        rs (hqm/rscode column-wise RS 4+2), none (file/FIFO relay; --no-codec)\n"
-            "RS recovery: matrix is the default; --rs-recover=legacy selects the old path.\n"
+            "        rs (column-wise RS(n,k); default RS(6,4)), none (file/FIFO relay; --no-codec)\n"
+            "RS params: --rs-k=N --rs-parity=M  or  --rs-profile=K+R  (e.g. 16+2); default 4+2.\n"
+            "           Receiver must use the same --rs-k; parity may follow each group's shard_count.\n"
+            "RS recovery: matrix is the default; --rs-recover=legacy is 4+2 only.\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
@@ -338,6 +340,79 @@ int main(int argc, char **argv)
             argi++;
         } else if (strcmp(argv[argi], "--no-codec") == 0) {
             codec_kind = CODEC_KIND_NONE;
+            argi++;
+        } else if (strncmp(argv[argi], "--rs-k=", 7) == 0) {
+            char *end = NULL;
+            unsigned long k = strtoul(argv[argi] + 7, &end, 10);
+            size_t cur_k = 0;
+            size_t cur_r = 0;
+
+            if (end == argv[argi] + 7 || *end != '\0' || k == 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            RsCodec_get_params(&cur_k, &cur_r);
+            if (RsCodec_set_params((size_t)k, cur_r) != 0) {
+                fprintf(stderr, "rs params k=%lu parity=%zu rejected\n", k,
+                        cur_r);
+                return EXIT_FAILURE;
+            }
+            argi++;
+        } else if (strncmp(argv[argi], "--rs-parity=", 12) == 0) {
+            char *end = NULL;
+            unsigned long r = strtoul(argv[argi] + 12, &end, 10);
+            size_t cur_k = 0;
+            size_t cur_r = 0;
+
+            if (end == argv[argi] + 12 || *end != '\0' || r == 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            RsCodec_get_params(&cur_k, &cur_r);
+            if (RsCodec_set_params(cur_k, (size_t)r) != 0) {
+                fprintf(stderr, "rs params k=%zu parity=%lu rejected\n", cur_k,
+                        r);
+                return EXIT_FAILURE;
+            }
+            argi++;
+        } else if (strncmp(argv[argi], "--rs-profile=", 13) == 0) {
+            const char *profile = argv[argi] + 13;
+            unsigned long k = 0;
+            unsigned long r = 0;
+            char *plus;
+            char *end = NULL;
+
+            if (strcmp(profile, "4+1") == 0) {
+                k = 4;
+                r = 1;
+            } else if (strcmp(profile, "4+2") == 0) {
+                k = 4;
+                r = 2;
+            } else if (strcmp(profile, "4+3") == 0) {
+                k = 4;
+                r = 3;
+            } else {
+                plus = strchr(profile, '+');
+                if (plus == NULL) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                k = strtoul(profile, &end, 10);
+                if (end != plus || k == 0) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                r = strtoul(plus + 1, &end, 10);
+                if (end == plus + 1 || *end != '\0' || r == 0) {
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+            }
+            if (RsCodec_set_params((size_t)k, (size_t)r) != 0) {
+                fprintf(stderr, "rs profile %s initialization failed\n",
+                        profile);
+                return EXIT_FAILURE;
+            }
             argi++;
         } else if (strncmp(argv[argi], "--rs-recover=", 13) == 0) {
             const char *mode = argv[argi] + 13;

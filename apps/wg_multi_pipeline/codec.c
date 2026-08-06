@@ -47,11 +47,16 @@ static int none_is_systematic(const Codec *codec)
 
 static CodecRecoverStatus none_recover(const Codec *codec,
                                        unsigned char *shards,
-                                       uint16_t present_mask)
+                                       const uint8_t *present_bits,
+                                       size_t shard_count)
 {
     (void)codec;
     (void)shards;
-    return present_mask == 1u ? CODEC_RECOVER_OK : CODEC_RECOVER_UNAVAILABLE;
+    if (present_bits == NULL || shard_count != 1u) {
+        return CODEC_RECOVER_UNAVAILABLE;
+    }
+    return codec_present_get(present_bits, 0) ? CODEC_RECOVER_OK
+                                              : CODEC_RECOVER_UNAVAILABLE;
 }
 
 static const CodecVTable none_codec_vtable = {
@@ -133,13 +138,15 @@ int Codec_is_systematic(const Codec *codec)
 
 CodecRecoverStatus Codec_recover(const Codec *codec,
                                  unsigned char *shards,
-                                 uint16_t present_mask)
+                                 const uint8_t *present_bits,
+                                 size_t shard_count)
 {
     if (codec == NULL || codec->vtable == NULL ||
-        codec->vtable->recover == NULL) {
+        codec->vtable->recover == NULL || present_bits == NULL ||
+        shard_count == 0) {
         return CODEC_RECOVER_UNAVAILABLE;
     }
-    return codec->vtable->recover(codec, shards, present_mask);
+    return codec->vtable->recover(codec, shards, present_bits, shard_count);
 }
 
 const Codec *Codec_get(CodecKind kind)

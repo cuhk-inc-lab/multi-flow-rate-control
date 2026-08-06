@@ -81,7 +81,8 @@ static int xor_fec_is_systematic(const Codec *self)
 
 static CodecRecoverStatus xor_fec_recover(const Codec *self,
                                           unsigned char *shards,
-                                          uint16_t present_mask)
+                                          const uint8_t *present_bits,
+                                          size_t shard_count)
 {
     unsigned char *shard_ptrs[XOR_FEC_SHARD_COUNT];
     bool present[XOR_FEC_SHARD_COUNT];
@@ -90,13 +91,14 @@ static CodecRecoverStatus xor_fec_recover(const Codec *self,
 
     (void)self;
 
-    if (shards == NULL || (present_mask & (uint16_t)~0x1fu) != 0) {
+    if (shards == NULL || present_bits == NULL ||
+        shard_count != XOR_FEC_SHARD_COUNT) {
         return CODEC_RECOVER_ERR;
     }
 
     for (shard = 0; shard < XOR_FEC_SHARD_COUNT; shard++) {
         shard_ptrs[shard] = shards + shard * PKG_SIZE;
-        present[shard] = (present_mask & (uint16_t)(1u << shard)) != 0;
+        present[shard] = codec_present_get(present_bits, shard) != 0;
     }
 
     recovered = XorFecCodec_recover_one(shard_ptrs, present);

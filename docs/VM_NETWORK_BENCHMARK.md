@@ -54,6 +54,10 @@ in the former reserved bytes. They support the following codecs:
 - `rs-fec`: RS(4,2), with four data shards and two parity shards. The receiver
   restores up to two missing shards when at least four shards arrive; its
   systematic `--best-effort` behavior is the same as `xor-fec`.
+- `rs`: RS(4,2) via vendored hqm/rscode (column-wise encode; GPL). Same shard
+  geometry and erasure capability as `rs-fec`, but **not wire-compatible**
+  (different parity). Recovery defaults to the calibrated matrix path; use
+  `--rs-recover=legacy` only for comparison with the old Berlekamp decoder.
 
 On VM2 (direct two-node test; `local_node_id` defaults to 4, so set it to match
 `--final-dst` or use the defaults with `final_dst=4` even on a two-node run):
@@ -171,9 +175,12 @@ writes a lean report under `build/wire-matrix-*`:
   (same suffix as the input file; set `KEEP_REMOTE_OUTPUT=0` to delete after hash check)
 
 ```bash
-CODECS="copy block xor-fec rs-fec" RATES="20 24 28 32" \
+CODECS="copy block xor-fec rs-fec rs" RATES="20 24 28 32" \
   ./scripts/run_wire_matrix.sh fyp1@VM4_MANAGEMENT_IP VM4_DATA_IP input.ts
 ```
+
+For `codec=rs`, the binary already uses matrix recovery; set
+`RS_RECOVER_OPTION=--rs-recover=legacy` to force the old path.
 
 Optional teaching mode: append a `[WG_DECODE_MARK]` footer after `Codec_decode`
 into the received file (hash will no longer match; status becomes `MARKED`):

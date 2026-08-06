@@ -74,23 +74,26 @@ sudo apt-get install liberasurecode-dev
 byte-aligned column across the six shards (same 4+2 erasure capability as
 `rs-fec`, independent implementation).
 
-### `rs` recovery modes
+### `rs` recovery modes and runtime params
 
-`--codec rs` defaults to calibrated matrix recovery (erasure-only). The
-legacy per-column Berlekamp path remains available for comparison:
+See **[docs/RS_CODEC.md](../../docs/RS_CODEC.md)** for architecture, API, and
+bounds.
+
+Default is **RS(6,4)** (`k=4`, `parity=2`). Set your own numbers:
 
 ```bash
-./build/wg_multi_pipeline --codec rs --rs-recover=legacy \
-  --udp-recv 9000 received.ts
+./build/wg_multi_pipeline --codec rs --rs-k=16 --rs-parity=2 \
+  --udp-send 10.10.34.2 9000 input.bin
+# or: --rs-profile=16+2
+
+./build/wg_multi_pipeline --codec rs --rs-k=16 --udp-recv 9000 out.bin
 ```
 
-Matrix recovery derives its generator from the existing rscode encoder, so
-sender encoding and parity bytes are unchanged. It only handles known UDP
-shard erasures; the wire protocol has no per-shard CRC/checksum, so silent
-payload corruption cannot be detected and must not be treated as an erasure.
+Receiver must use the same `--rs-k`. Parity can follow each group's
+`shard_count`. Working size follows your `(k,r)`; the GF(256) ceiling is
+`k+r ≤ 255` (presence uses a bit array, not a 32-bit mask).
 
-Wire scripts still accept `RS_RECOVER_OPTION=--rs-recover=legacy` to force
-the old path when needed.
+Wire scripts: `RS_RECOVER_OPTION=--rs-recover=legacy` forces the old 4+2 path.
 
 ## Per-block latency and jitter
 

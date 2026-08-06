@@ -2,7 +2,17 @@
 #include "rs_codec.h"
 #include "stream_config.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+static CodecRecoverStatus recover_mask(const Codec *codec, unsigned char *shards,
+                                       size_t shard_count, uint64_t mask)
+{
+    uint8_t bits[codec_present_bytes(64)];
+
+    codec_present_from_u64(bits, shard_count, mask);
+    return Codec_recover(codec, shards, bits, shard_count);
+}
 
 static int test_copy_codec_preserves_systematic_payload(void)
 {
@@ -38,12 +48,12 @@ static int test_xor_fec_recovers_one_shard(void)
     Codec_encode(XorFecCodec_get(), encoded, sizeof(encoded));
 
     memset(encoded + 2 * PKG_SIZE, 0, PKG_SIZE);
-    if (Codec_recover(XorFecCodec_get(), encoded, 0x1bu) != CODEC_RECOVER_OK ||
+    if (recover_mask(XorFecCodec_get(), encoded, 5u, 0x1bu) != CODEC_RECOVER_OK ||
         memcmp(encoded + 2 * PKG_SIZE, original + 2 * PKG_SIZE, PKG_SIZE) != 0) {
         return -1;
     }
 
-    if (Codec_recover(XorFecCodec_get(), encoded, 0x1cu) !=
+    if (recover_mask(XorFecCodec_get(), encoded, 5u, 0x1cu) !=
         CODEC_RECOVER_UNAVAILABLE) {
         return -1;
     }
@@ -65,12 +75,12 @@ static int test_rs_fec_recovers_two_shards(void)
 
     memset(encoded + PKG_SIZE, 0, PKG_SIZE);
     memset(encoded + 4u * PKG_SIZE, 0, PKG_SIZE);
-    if (Codec_recover(RsFecCodec_get(), encoded, 0x2du) != CODEC_RECOVER_OK ||
+    if (recover_mask(RsFecCodec_get(), encoded, 6u, 0x2du) != CODEC_RECOVER_OK ||
         memcmp(encoded, original, sizeof(original)) != 0) {
         return -1;
     }
 
-    if (Codec_recover(RsFecCodec_get(), encoded, 0x29u) !=
+    if (recover_mask(RsFecCodec_get(), encoded, 6u, 0x29u) !=
         CODEC_RECOVER_UNAVAILABLE) {
         return -1;
     }
@@ -92,18 +102,18 @@ static int test_rs_recovers_two_shards(void)
 
     memset(encoded + PKG_SIZE, 0, PKG_SIZE);
     memset(encoded + 4u * PKG_SIZE, 0, PKG_SIZE);
-    if (Codec_recover(RsCodec_get(), encoded, 0x2du) != CODEC_RECOVER_OK ||
+    if (recover_mask(RsCodec_get(), encoded, 6u, 0x2du) != CODEC_RECOVER_OK ||
         memcmp(encoded, original, sizeof(original)) != 0) {
         return -1;
     }
 
     memset(encoded + 2u * PKG_SIZE, 0, PKG_SIZE);
-    if (Codec_recover(RsCodec_get(), encoded, 0x3bu) != CODEC_RECOVER_OK ||
+    if (recover_mask(RsCodec_get(), encoded, 6u, 0x3bu) != CODEC_RECOVER_OK ||
         memcmp(encoded, original, sizeof(original)) != 0) {
         return -1;
     }
 
-    if (Codec_recover(RsCodec_get(), encoded, 0x29u) !=
+    if (recover_mask(RsCodec_get(), encoded, 6u, 0x29u) !=
         CODEC_RECOVER_UNAVAILABLE) {
         return -1;
     }
@@ -122,17 +132,18 @@ static unsigned popcount_mask(uint16_t mask)
     return count;
 }
 
-static void fill_rs_source(unsigned char block[RS_FEC_ENCODE_BLOCK],
-                           unsigned seed)
+static void fill_rs_source(unsigned char *block, size_t block_len, unsigned seed)
 {
     size_t byte;
     unsigned state = seed;
 
-    for (byte = 0; byte < DECODE_BLOCK; byte++) {
+    for (byte = 0; byte < DECODE_BLOCK && byte < block_len; byte++) {
         state = state * 1103515245u + 12345u;
         block[byte] = (unsigned char)(state >> 16);
     }
-    memset(block + DECODE_BLOCK, 0, RS_FEC_ENCODE_BLOCK - DECODE_BLOCK);
+    if (block_len > DECODE_BLOCK) {
+        memset(block + DECODE_BLOCK, 0, block_len - DECODE_BLOCK);
+    }
 }
 
 static int test_rs_matrix_exhaustive_compatibility(void)
@@ -154,7 +165,7 @@ static int test_rs_matrix_exhaustive_compatibility(void)
         CodecRecoverStatus legacy_status;
         CodecRecoverStatus matrix_status;
 
-        fill_rs_source(encoded, 0x4d2u + mask);
+        fill_rs_source(encoded, sizeof(encoded), 0x4d2u + mask);
         memcpy(source, encoded, sizeof(source));
         if (RsCodec_set_recover_mode(RS_RECOVER_LEGACY) != 0) {
             return -1;
@@ -170,11 +181,11 @@ static int test_rs_matrix_exhaustive_compatibility(void)
             }
         }
 
-        legacy_status = Codec_recover(RsCodec_get(), legacy, mask);
+        legacy_status = recover_mask(RsCodec_get(), legacy, 6u, mask);
         if (RsCodec_set_recover_mode(RS_RECOVER_MATRIX) != 0) {
             return -1;
         }
-        matrix_status = Codec_recover(RsCodec_get(), matrix, mask);
+        matrix_status = recover_mask(RsCodec_get(), matrix, 6u, mask);
 
         if (present < RS_FEC_DATA_SHARDS) {
             if (legacy_status != CODEC_RECOVER_UNAVAILABLE ||
@@ -205,6 +216,87 @@ static int test_rs_matrix_exhaustive_compatibility(void)
     return RsCodec_set_recover_mode(RS_RECOVER_MATRIX);
 }
 
+static int test_rs_profile_one(size_t k, size_t r, uint64_t present_mask)
+{
+    unsigned char *encoded = NULL;
+    unsigned char *source = NULL;
+    size_t total;
+    size_t shard;
+    size_t n;
+    size_t input_len;
+    uint8_t *bits = NULL;
+    int rc = -1;
+
+    if (RsCodec_set_params(k, r) != 0 ||
+        RsCodec_set_recover_mode(RS_RECOVER_MATRIX) != 0) {
+        return -1;
+    }
+    total = Codec_output_block_size(RsCodec_get());
+    input_len = Codec_input_block_size(RsCodec_get());
+    n = Codec_data_shards(RsCodec_get()) + Codec_parity_shards(RsCodec_get());
+    if (total != n * PKG_SIZE || input_len != k * PKG_SIZE) {
+        return -1;
+    }
+
+    encoded = malloc(total);
+    source = malloc(input_len);
+    bits = malloc(codec_present_bytes(n));
+    if (encoded == NULL || source == NULL || bits == NULL) {
+        goto out;
+    }
+
+    fill_rs_source(encoded, total, 0xABCDu + (unsigned)(k * 31u + r));
+    memcpy(source, encoded, input_len);
+    Codec_encode(RsCodec_get(), encoded, total);
+
+    codec_present_from_u64(bits, n, present_mask);
+    for (shard = 0; shard < n; shard++) {
+        if (!codec_present_get(bits, shard)) {
+            memset(encoded + shard * PKG_SIZE, 0, PKG_SIZE);
+        }
+    }
+    if (Codec_recover(RsCodec_get(), encoded, bits, n) != CODEC_RECOVER_OK ||
+        memcmp(encoded, source, input_len) != 0) {
+        goto out;
+    }
+    rc = 0;
+out:
+    free(encoded);
+    free(source);
+    free(bits);
+    return rc;
+}
+
+static int test_rs_profiles_recover(void)
+{
+    /* 4+1: drop shard 2 → mask 0x1b */
+    if (test_rs_profile_one(4u, 1u, 0x1bu) != 0) {
+        return -1;
+    }
+    /* 4+2: drop shards 1 and 4 → mask 0x2d */
+    if (test_rs_profile_one(4u, 2u, 0x2du) != 0) {
+        return -1;
+    }
+    /* 4+3: drop shards 0,3,5 → mask 0x56 */
+    if (test_rs_profile_one(4u, 3u, 0x56u) != 0) {
+        return -1;
+    }
+    /* custom 8+2: drop shards 1 and 7 → mask with bits 0,2,3,4,5,6,8,9 */
+    if (test_rs_profile_one(8u, 2u, 0x3f5u) != 0) {
+        return -1;
+    }
+    /* Beyond former uint32 ceiling: 40+2 drop shards 10 and 41 */
+    if (test_rs_profile_one(40u, 2u, ((1ull << 42) - 1ull) ^ (1ull << 10) ^
+                                      (1ull << 41)) != 0) {
+        return -1;
+    }
+    /* GF(256) ceiling: n=256 must be rejected */
+    if (RsCodec_set_params(254u, 2u) == 0) {
+        return -1;
+    }
+    return RsCodec_set_params(4u, 2u);
+}
+
 int main(void)
 {
     if (test_copy_codec_preserves_systematic_payload() != 0) {
@@ -222,6 +314,11 @@ int main(void)
         return 1;
     }
 
+    if (RsCodec_set_params(4u, 2u) != 0) {
+        fprintf(stderr, "rs default params init failed\n");
+        return 1;
+    }
+
     if (test_rs_recovers_two_shards() != 0) {
         fprintf(stderr, "rscode RS codec test failed\n");
         return 1;
@@ -232,6 +329,11 @@ int main(void)
         return 1;
     }
 
-    puts("XOR, RS FEC, and rscode RS codec tests passed (22 valid masks checked)");
+    if (test_rs_profiles_recover() != 0) {
+        fprintf(stderr, "rs runtime profile recovery test failed\n");
+        return 1;
+    }
+
+    puts("XOR, RS FEC, and rscode RS codec tests passed");
     return 0;
 }

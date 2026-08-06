@@ -96,7 +96,8 @@ static int rs_fec_is_systematic(const Codec *self)
 
 static CodecRecoverStatus rs_fec_recover(const Codec *self,
                                           unsigned char *shards,
-                                          uint16_t present_mask)
+                                          const uint8_t *present_bits,
+                                          size_t shard_count)
 {
     char *data_shards[RS_FEC_DATA_SHARDS];
     char *parity_shards[RS_FEC_PARITY_SHARDS];
@@ -107,13 +108,13 @@ static CodecRecoverStatus rs_fec_recover(const Codec *self,
 
     (void)self;
 
-    if (shards == NULL || (present_mask & (uint16_t)~0x3fu) != 0 ||
-        !rs_fec_ready()) {
+    if (shards == NULL || present_bits == NULL ||
+        shard_count != RS_FEC_TOTAL_SHARDS || !rs_fec_ready()) {
         return CODEC_RECOVER_ERR;
     }
 
     for (shard = 0; shard < RS_FEC_TOTAL_SHARDS; shard++) {
-        if ((present_mask & (uint16_t)(1u << shard)) != 0) {
+        if (codec_present_get(present_bits, shard)) {
             received++;
         } else {
             missing[missing_count++] = (int)shard;

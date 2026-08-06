@@ -88,17 +88,23 @@ Cross-VM TCP/UDP baseline and wire-codec benchmark:
 **[docs/VM_NETWORK_BENCHMARK.md](docs/VM_NETWORK_BENCHMARK.md)**.
 Script catalog (purpose + usage + key env):
 **[docs/SCRIPTS.md](docs/SCRIPTS.md)**.
+RS codec (architecture, API, runtime profiles):
+**[docs/RS_CODEC.md](docs/RS_CODEC.md)**.
 
 ## Common script entry points
 
 - Baseline path check (single sender/receiver):
   - `sh scripts/run_vm_baseline.sh VM2_IP 10`
 - Single-flow codec matrix (Node1 -> Node4):
-  - `CODECS="copy block xor-fec rs-fec none" RATES="20 24 28 32" ./scripts/run_wire_matrix.sh NODE4_SSH NODE4_DATA_IP input.ts`
+  - `CODECS="copy block xor-fec rs-fec rs none" RATES="20 24 28 32" ./scripts/run_wire_matrix.sh NODE4_SSH NODE4_DATA_IP input.ts`
 - Multi-flow matrix (one file per flow):
-  - `CODECS="copy xor-fec none" RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh NODE4_SSH NODE4_DATA_IP a.bin b.bin`
+  - `CODECS="copy xor-fec rs none" RATES="10 20" ./scripts/run_wire_multiflow_matrix.sh NODE4_SSH NODE4_DATA_IP a.bin b.bin`
 - Configurable multi-stream stress (YAML/JSON; see `scripts/examples/stress_lab.yaml`):
   - `./scripts/run_wire_stress.sh scripts/examples/stress_lab.yaml`
+
+For `--codec rs`, matrix recovery is the default on receive; wire scripts only
+need `RS_RECOVER_OPTION=--rs-recover=legacy` when comparing the old path.
+Details: [`apps/wg_multi_pipeline/README.md`](apps/wg_multi_pipeline/README.md).
 
 ## Build & test
 

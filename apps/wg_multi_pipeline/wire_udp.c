@@ -2,6 +2,7 @@
 
 #include "codec.h"
 #include "flow_peer_map.h"
+#include "rs_codec.h"
 #include "stream_config.h"
 #include "wire_header.h"
 
@@ -71,11 +72,11 @@ typedef struct WireGroup {
     uint64_t      block_id;
     uint16_t      shard_count;
     uint16_t      valid_len;
-    uint16_t      received_mask;
+    uint8_t      *received_bits;
     uint64_t      encode_begin_ns;
     uint64_t      encode_end_ns;
     bool          timing_valid;
-    unsigned char data[CODEC_MAX_ENCODE_BLOCK];
+    unsigned char *data;
 } WireGroup;
 
 typedef struct LatencySample {
@@ -626,6 +627,16 @@ static int open_receiver_socket(uint16_t port)
     return sock;
 }
 
+static void release_group(WireGroup *group)
+{
+    if (group == NULL) {
+        return;
+    }
+    free(group->data);
+    free(group->received_bits);
+    memset(group, 0, sizeof(*group));
+}
+
 static WireGroup *find_group(WireGroup groups[WIRE_GROUP_WINDOW], uint64_t block_id)
 {
     size_t index;
@@ -645,9 +656,28 @@ static WireGroup *allocate_group(WireGroup groups[WIRE_GROUP_WINDOW],
                                  uint64_t encode_end_ns)
 {
     size_t index;
+    size_t data_bytes;
+    size_t bit_bytes;
+    unsigned char *data;
+    uint8_t *bits;
+
+    if (shard_count == 0 || shard_count > WIRE_MAX_SHARDS) {
+        return NULL;
+    }
+
+    data_bytes = (size_t)shard_count * PKG_SIZE;
+    bit_bytes = codec_present_bytes(shard_count);
+    data = calloc(1, data_bytes);
+    bits = calloc(1, bit_bytes);
+    if (data == NULL || bits == NULL) {
+        free(data);
+        free(bits);
+        return NULL;
+    }
 
     for (index = 0; index < WIRE_GROUP_WINDOW; index++) {
         if (!groups[index].in_use) {
+            release_group(&groups[index]);
             groups[index] = (WireGroup){
                 .in_use = true,
                 .block_id = block_id,
@@ -657,37 +687,47 @@ static WireGroup *allocate_group(WireGroup groups[WIRE_GROUP_WINDOW],
                 .encode_end_ns = encode_end_ns,
                 .timing_valid = encode_begin_ns != 0 &&
                                 encode_end_ns >= encode_begin_ns,
+                .received_bits = bits,
+                .data = data,
             };
             return &groups[index];
         }
     }
+    free(data);
+    free(bits);
     return NULL;
 }
 
 static bool group_complete(const WireGroup *group)
 {
-    uint16_t required;
+    size_t shard;
 
-    if (group == NULL || group->shard_count == 0 || group->shard_count > 16) {
+    if (group == NULL || group->shard_count == 0 ||
+        group->received_bits == NULL ||
+        group->shard_count > WIRE_MAX_SHARDS) {
         return false;
     }
-    required = (uint16_t)((1u << group->shard_count) - 1u);
-    return group->received_mask == required;
+    for (shard = 0; shard < group->shard_count; shard++) {
+        if (!codec_present_get(group->received_bits, shard)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static unsigned group_received_count(const WireGroup *group)
 {
-    uint16_t mask;
+    size_t shard;
     unsigned count = 0;
 
-    if (group == NULL) {
+    if (group == NULL || group->received_bits == NULL) {
         return 0;
     }
 
-    mask = group->received_mask;
-    while (mask != 0) {
-        count += mask & 1u;
-        mask >>= 1;
+    for (shard = 0; shard < group->shard_count; shard++) {
+        if (codec_present_get(group->received_bits, shard)) {
+            count++;
+        }
     }
     return count;
 }
@@ -702,12 +742,18 @@ static int recover_group(WireGroup *group, const Codec *codec,
         return 0;
     }
 
+    if (codec == RsCodec_get() &&
+        RsCodec_set_profile_from_shard_count(group->shard_count) != 0) {
+        return -1;
+    }
+
     data_shards = Codec_data_shards(codec);
     if (data_shards == 0 || group_received_count(group) < data_shards) {
         return 0;
     }
 
-    status = Codec_recover(codec, group->data, group->received_mask);
+    status = Codec_recover(codec, group->data, group->received_bits,
+                           group->shard_count);
     if (status == CODEC_RECOVER_UNAVAILABLE) {
         return 0;
     }
@@ -715,7 +761,7 @@ static int recover_group(WireGroup *group, const Codec *codec,
         return -1;
     }
 
-    group->received_mask = (uint16_t)((1u << group->shard_count) - 1u);
+    codec_present_set_all(group->received_bits, group->shard_count);
     if (recovered_groups != NULL) {
         (*recovered_groups)++;
     }
@@ -866,12 +912,12 @@ static int write_decoded_group(WireGroup *group, const Codec *codec,
                                LatencyStats *latency_stats)
 {
     size_t input_size = Codec_input_block_size(codec);
-    size_t output_size = Codec_output_block_size(codec);
+    size_t output_size = (size_t)group->shard_count * PKG_SIZE;
     uint64_t decode_ready_ns;
     uint64_t decode_done_ns;
 
     if (group == NULL || group->valid_len == 0 || group->valid_len > input_size ||
-        group->shard_count * PKG_SIZE != output_size) {
+        output_size == 0 || output_size > CODEC_MAX_ENCODE_BLOCK) {
         return -1;
     }
 
@@ -897,7 +943,7 @@ static int write_decoded_group(WireGroup *group, const Codec *codec,
         return -1;
     }
     *output_bytes += group->valid_len;
-    group->in_use = false;
+    release_group(group);
     return 0;
 }
 
@@ -952,7 +998,7 @@ static int write_best_effort_group(WireGroup *group, const Codec *codec,
     for (shard = 0; shard < data_shards && remaining > 0; shard++) {
         size_t shard_len = remaining > PKG_SIZE ? PKG_SIZE : remaining;
 
-        if ((group->received_mask & (uint16_t)(1u << shard)) != 0) {
+        if (codec_present_get(group->received_bits, shard)) {
             if (fwrite(group->data + shard * PKG_SIZE, 1, shard_len, output) != shard_len) {
                 return -1;
             }
@@ -963,7 +1009,7 @@ static int write_best_effort_group(WireGroup *group, const Codec *codec,
         remaining -= shard_len;
     }
 
-    group->in_use = false;
+    release_group(group);
     return 0;
 }
 
@@ -1225,8 +1271,13 @@ static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
 
 static void wire_flow_close(WireFlowCtx *flow)
 {
+    size_t index;
+
     if (flow == NULL || !flow->active) {
         return;
+    }
+    for (index = 0; index < WIRE_GROUP_WINDOW; index++) {
+        release_group(&flow->groups[index]);
     }
     free(flow->latency_stats.samples);
     flow->latency_stats.samples = NULL;
@@ -1237,20 +1288,30 @@ static void wire_flow_close(WireFlowCtx *flow)
     flow->active = false;
 }
 
+static int wire_shard_count_acceptable(const Codec *codec, uint16_t shard_count,
+                                       uint16_t expected_shards)
+{
+    if (codec == RsCodec_get()) {
+        return RsCodec_profile_is_wire_shard_count(shard_count);
+    }
+    return shard_count == expected_shards;
+}
+
 static int wire_flow_process_datagram(WireFlowCtx *flow, const WireHeader *header,
                                       const unsigned char *payload,
                                       size_t input_size, uint16_t expected_shards,
                                       const Codec *codec, int best_effort)
 {
     WireGroup *group;
-    uint16_t   bit;
 
     if (flow == NULL || header == NULL || codec == NULL || flow->complete) {
         return 0;
     }
 
     if (header->type == WIRE_TYPE_END) {
-        if (header->shard_count != expected_shards || header->payload_len != 0 ||
+        if (!wire_shard_count_acceptable(codec, header->shard_count,
+                                         expected_shards) ||
+            header->payload_len != 0 ||
             (flow->end_seen && header->block_id != flow->end_block_count)) {
             flow->malformed_datagrams++;
             return 0;
@@ -1274,8 +1335,10 @@ static int wire_flow_process_datagram(WireFlowCtx *flow, const WireHeader *heade
         return 0;
     }
 
-    if (header->type != WIRE_TYPE_DATA || header->shard_count != expected_shards ||
-        header->shard_index >= expected_shards ||
+    if (header->type != WIRE_TYPE_DATA ||
+        !wire_shard_count_acceptable(codec, header->shard_count,
+                                     expected_shards) ||
+        header->shard_index >= header->shard_count ||
         header->valid_len == 0 || header->valid_len > input_size ||
         header->payload_len != PKG_SIZE) {
         flow->malformed_datagrams++;
@@ -1304,13 +1367,17 @@ static int wire_flow_process_datagram(WireFlowCtx *flow, const WireHeader *heade
         flow->malformed_datagrams++;
         return 0;
     }
-    bit = (uint16_t)(1u << header->shard_index);
-    if ((group->received_mask & bit) != 0) {
+    if (header->shard_index >= group->shard_count ||
+        group->received_bits == NULL || group->data == NULL) {
+        flow->malformed_datagrams++;
+        return 0;
+    }
+    if (codec_present_get(group->received_bits, header->shard_index)) {
         flow->duplicate_datagrams++;
         return 0;
     }
     memcpy(group->data + (size_t)header->shard_index * PKG_SIZE, payload, PKG_SIZE);
-    group->received_mask |= bit;
+    codec_present_set(group->received_bits, header->shard_index);
     flow->received_datagrams++;
 
     if (flush_recoverable_groups(flow->groups, &flow->next_block, codec,
@@ -1529,15 +1596,17 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             if (header.type == WIRE_TYPE_DATA) {
                 if ((size_t)received != WIRE_HEADER_SIZE + header.payload_len ||
                     header.payload_len != PKG_SIZE ||
-                    header.shard_count != expected_shards ||
-                    header.shard_index >= expected_shards ||
+                    !wire_shard_count_acceptable(codec, header.shard_count,
+                                                 expected_shards) ||
+                    header.shard_index >= header.shard_count ||
                     header.valid_len == 0 || header.valid_len > input_size) {
                     continue;
                 }
             } else if (header.type == WIRE_TYPE_END) {
                 if ((size_t)received != WIRE_HEADER_SIZE ||
                     header.payload_len != 0 ||
-                    header.shard_count != expected_shards) {
+                    !wire_shard_count_acceptable(codec, header.shard_count,
+                                                 expected_shards)) {
                     continue;
                 }
             } else {

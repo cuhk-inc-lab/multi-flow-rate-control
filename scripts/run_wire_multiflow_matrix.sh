@@ -4,10 +4,12 @@
 # Run from Node1. Node4 must accept key-based SSH from Node1.
 #
 # Provide one local file per flow (recommended):
-#   CODECS="copy xor-fec" RATES="10 20" \
+#   CODECS="copy xor-fec rs" RATES="10 20" \
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 \
 #       a.bin b.bin c.bin d.bin
 #
+# For codec=rs, matrix recovery is the binary default (no extra flag needed).
+# Override with RS_RECOVER_OPTION=--rs-recover=legacy if comparing the old path.
 # Teaching decode-mark (footer proves Codec_decode; status MARKED):
 #   DECODE_MARK=1 KEEP_REMOTE_OUTPUT=1 CODECS="xor-fec" RATES="10" \
 #     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 a.bin b.bin

@@ -45,7 +45,8 @@ match the original payload for offline `cmp`.
 |------|------|------|
 | Default (`--codec block`) | Demo 1, Demo 3 live script, `make integration-test` | Full BlockCodec encode/decode |
 | `--codec xor-fec` | File/FIFO/UDP demo | 4 data TS packets + 1 XOR parity packet |
-| `--codec rs-fec` | File/FIFO/UDP demo | RS(4,2): 4 data TS packets + 2 parity packets |
+| `--codec rs-fec` | File/FIFO/UDP demo | RS(4,2): 4 data TS packets + 2 parity packets (liberasurecode) |
+| `--codec rs` | File/FIFO/UDP demo | RS(4,2): 4 data + 2 parity shards (hqm/rscode; GPL; not wire-compatible with `rs-fec`) |
 | `--no-codec` | Optional relay | Skip BlockCodec; pointer-only pass-through |
 
 | Concept | Value / location |
@@ -64,7 +65,8 @@ match the original payload for offline `cmp`.
 | `--no-pace` | Disable timeline pacing (needed for `cmp`; live demos use it because `ffmpeg -re` already paces) |
 | `--codec block` | Default existing `+/-` BlockCodec demo transform |
 | `--codec xor-fec` | Select XOR FEC (4 data packets + 1 parity packet) |
-| `--codec rs-fec` | Select RS(4,2) FEC (4 data packets + 2 parity packets) |
+| `--codec rs-fec` | Select RS(4,2) FEC via liberasurecode (4 data + 2 parity packets) |
+| `--codec rs` | Select RS(4,2) FEC via hqm/rscode (4 data + 2 parity; matrix recovery by default on wire receive) |
 | `--codec none` / `--no-codec` | Skip coding; relay only (not used by Demo 3 script) |
 | `--multi` | Multiple `input output` pairs (required for 2+ flows) |
 | (default) | Pacing **on** + BlockCodec **on** |
@@ -237,7 +239,7 @@ make wg-demo
 # Select another method:
 ./scripts/run_dual_fifo.sh --codec xor-fec
 ./scripts/run_dual_fifo.sh --codec rs-fec
-# Available: block (default), copy, xor-fec, rs-fec, none
+# Available: block (default), copy, xor-fec, rs-fec, rs, none
 ```
 
 What the script does:

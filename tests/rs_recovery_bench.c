@@ -34,6 +34,7 @@ static int benchmark_recovery(RsRecoverMode mode, uint16_t present_mask,
 {
     unsigned char encoded[RS_FEC_ENCODE_BLOCK];
     unsigned char work[RS_FEC_ENCODE_BLOCK];
+    uint8_t present_bits[codec_present_bytes(RS_FEC_TOTAL_SHARDS)];
     size_t byte;
     size_t shard;
     unsigned iteration;
@@ -47,17 +48,18 @@ static int benchmark_recovery(RsRecoverMode mode, uint16_t present_mask,
         return -1;
     }
     Codec_encode(RsCodec_get(), encoded, sizeof(encoded));
+    codec_present_from_u64(present_bits, RS_FEC_TOTAL_SHARDS, present_mask);
 
     started = monotonic_nanoseconds();
     for (iteration = 0; iteration < BENCH_ITERATIONS; iteration++) {
         memcpy(work, encoded, sizeof(work));
         for (shard = 0; shard < RS_FEC_TOTAL_SHARDS; shard++) {
-            if ((present_mask & (uint16_t)(1u << shard)) == 0) {
+            if (!codec_present_get(present_bits, shard)) {
                 memset(work + shard * PKG_SIZE, 0, PKG_SIZE);
             }
         }
-        if (Codec_recover(RsCodec_get(), work, present_mask) !=
-            CODEC_RECOVER_OK) {
+        if (Codec_recover(RsCodec_get(), work, present_bits,
+                          RS_FEC_TOTAL_SHARDS) != CODEC_RECOVER_OK) {
             return -1;
         }
     }
