@@ -79,6 +79,7 @@ WG_OBJS = \
 	$(OBJ_DIR)/wg_rs_fec_codec.o \
 	$(OBJ_DIR)/wg_rs_codec.o \
 	$(OBJ_DIR)/wg_wire_udp.o \
+	$(OBJ_DIR)/wg_wire_flow_decoder.o \
 	$(OBJ_DIR)/wg_file_drain.o
 
 WG_TEST_IN0  = $(OBJ_DIR)/wg_test_in0.ts
