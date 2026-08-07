@@ -238,6 +238,7 @@ static void test_local_copy_end_matches_source(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 4;
@@ -304,6 +305,7 @@ static void test_nonlocal_still_tx_empty_output(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 2;
@@ -362,6 +364,7 @@ static void test_local_ttl_unchanged(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 4;
@@ -414,6 +417,7 @@ static void test_local_no_cache_no_egress(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 4;
@@ -470,6 +474,7 @@ static void test_missing_shard_strict_no_corrupt_output(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.best_effort = 0;
@@ -494,7 +499,7 @@ static void test_missing_shard_strict_no_corrupt_output(void)
 
     wait_local(ctx, 4, 2000);
     EXPECT(!local_decode_hub_is_complete(&hub));
-    EXPECT(hub.flow_bound);
+    EXPECT(local_decode_hub_active_count(&hub) > 0);
     EXPECT(local_decode_hub_strict_check(&hub) != 0);
     EXPECT(read_file(out_path, got, sizeof(got), &got_len) == 0);
     EXPECT(!(got_len == sizeof(plaintext) &&
@@ -506,7 +511,7 @@ static void test_missing_shard_strict_no_corrupt_output(void)
     unlink(out_path);
 }
 
-static void test_second_flow_rejected(void)
+static void test_single_output_still_rejects_second_flow(void)
 {
     RelayCtx *ctx = NULL;
     TxCapture cap;
@@ -526,6 +531,7 @@ static void test_second_flow_rejected(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 4;
@@ -578,6 +584,7 @@ static void test_local_encoder_not_blocked_with_decode(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 4;
@@ -621,6 +628,7 @@ static void test_delivery_rejects_nonlocal_final_dst(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.local_node_id = 4;
@@ -635,7 +643,7 @@ static void test_delivery_rejects_nonlocal_final_dst(void)
     hst = local_decode_hub_stats(&hub);
     EXPECT(hst != NULL && hst->metadata_mismatch >= 1);
     EXPECT(hst->delivered == 0);
-    EXPECT(!hub.flow_bound);
+    EXPECT(local_decode_hub_active_count(&hub) == 0);
     EXPECT(read_file(out_path, got, sizeof(got), &got_len) == 0);
     EXPECT(got_len == 0);
     EXPECT(local_decode_hub_strict_check(&hub) != 0);
@@ -669,11 +677,12 @@ static void test_output_io_failure_sets_ingest_error(void)
     }
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output = fp; /* hub does not own; test fclose after destroy */
     hcfg.local_node_id = 4;
     EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
-    EXPECT(hub.close_output == 0);
+    EXPECT(hub.single_close_output == 0);
 
     EXPECT(build_copy_block_datagrams(datagrams, lens, &shards, plaintext,
                                       sizeof(plaintext), 8, 0, 4, 8) == 0);
@@ -716,6 +725,7 @@ static void test_strict_incomplete_helper_fails(void)
     unlink(out_path);
 
     memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
     hcfg.codec_kind = CODEC_KIND_COPY;
     hcfg.output_path = out_path;
     hcfg.best_effort = 0;
@@ -734,13 +744,434 @@ static void test_strict_incomplete_helper_fails(void)
     EXPECT(wire_header_decode(&hdr, endbuf, end_len) == 0);
     EXPECT(local_decode_hub_delivery(endbuf, end_len, &hdr, &hub) == 0);
 
-    EXPECT(hub.flow_bound);
+    EXPECT(local_decode_hub_active_count(&hub) > 0);
     EXPECT(!local_decode_hub_is_complete(&hub));
     /* Same predicate main uses to flip RELAY_OK → RELAY_ERR. */
     EXPECT(local_decode_hub_strict_check(&hub) != 0);
 
     local_decode_hub_destroy(&hub);
     unlink(out_path);
+}
+
+static const char *k_multi_dir = "build/relay_ld_multi_out";
+
+static void multi_dir_cleanup(void)
+{
+    char path[256];
+    size_t i;
+
+    for (i = 0; i < RELAY_MAX_FLOWS + 4u; i++) {
+        /* Remove a small fixed set of known test flow ids and sequential ids. */
+        (void)i;
+    }
+    /* Known filenames used by L2 tests. */
+    unlink("build/relay_ld_multi_out/flow_101.bin");
+    unlink("build/relay_ld_multi_out/flow_202.bin");
+    unlink("build/relay_ld_multi_out/flow_1.bin");
+    for (i = 0; i < RELAY_MAX_FLOWS + 2u; i++) {
+        snprintf(path, sizeof(path), "build/relay_ld_multi_out/flow_%u.bin",
+                 (unsigned)(10u + i));
+        unlink(path);
+    }
+    rmdir(k_multi_dir);
+}
+
+static int multi_dir_prepare(void)
+{
+    multi_dir_cleanup();
+    if (mkdir(k_multi_dir, 0755) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int inject_copy_flow_complete(RelayCtx *ctx, uint32_t flow_id,
+                                     const uint8_t *plaintext, size_t plen,
+                                     uint8_t final_dst, uint8_t ttl)
+{
+    uint8_t datagrams[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    size_t lens[PACKAGES_PER_ENCODE_BLOCK];
+    uint16_t shards = 0;
+    uint8_t endbuf[WIRE_HEADER_SIZE];
+    size_t end_len;
+    uint16_t i;
+
+    if (build_copy_block_datagrams(datagrams, lens, &shards, plaintext, plen,
+                                   flow_id, 0, final_dst, ttl) != 0) {
+        return -1;
+    }
+    for (i = 0; i < shards; i++) {
+        if (relay_inject_wire_datagram(ctx, datagrams[i], lens[i]) !=
+            RELAY_INGRESS_OK) {
+            return -1;
+        }
+    }
+    end_len = make_end(endbuf, sizeof(endbuf), flow_id, 1, shards, final_dst,
+                       ttl);
+    if (relay_inject_wire_datagram(ctx, endbuf, end_len) != RELAY_INGRESS_OK) {
+        return -1;
+    }
+    return (int)shards + 1;
+}
+
+static void test_multiflow_interleaved_outputs(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg;
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    uint8_t pt101[200];
+    uint8_t pt202[300];
+    uint8_t d101[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    uint8_t d202[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    size_t l101[PACKAGES_PER_ENCODE_BLOCK];
+    size_t l202[PACKAGES_PER_ENCODE_BLOCK];
+    uint16_t s101 = 0;
+    uint16_t s202 = 0;
+    uint8_t endbuf[WIRE_HEADER_SIZE];
+    size_t end_len;
+    uint8_t got[512];
+    size_t got_len = 0;
+    uint16_t i;
+    uint64_t local_want;
+
+    memset(pt101, 0x11, sizeof(pt101));
+    memset(pt202, 0x22, sizeof(pt202));
+    for (i = 0; i < sizeof(pt101); i++) {
+        pt101[i] = (uint8_t)(i + 1u);
+    }
+    for (i = 0; i < sizeof(pt202); i++) {
+        pt202[i] = (uint8_t)(0x80u + (i & 0x3fu));
+    }
+
+    EXPECT(multi_dir_prepare() == 0);
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_FORWARD);
+    cfg.delivery_fn = local_decode_hub_delivery;
+    cfg.delivery_ctx = &hub;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    EXPECT(build_copy_block_datagrams(d101, l101, &s101, pt101, sizeof(pt101),
+                                      101, 0, 4, 8) == 0);
+    EXPECT(build_copy_block_datagrams(d202, l202, &s202, pt202, sizeof(pt202),
+                                      202, 0, 4, 8) == 0);
+
+    /* Interleave shards: 101[0], 202[0], 101[1], 202[1], ... */
+    for (i = 0; i < s101 || i < s202; i++) {
+        if (i < s101) {
+            EXPECT(relay_inject_wire_datagram(ctx, d101[i], l101[i]) ==
+                   RELAY_INGRESS_OK);
+        }
+        if (i < s202) {
+            EXPECT(relay_inject_wire_datagram(ctx, d202[i], l202[i]) ==
+                   RELAY_INGRESS_OK);
+        }
+    }
+    end_len = make_end(endbuf, sizeof(endbuf), 101, 1, s101, 4, 8);
+    EXPECT(relay_inject_wire_datagram(ctx, endbuf, end_len) ==
+           RELAY_INGRESS_OK);
+    end_len = make_end(endbuf, sizeof(endbuf), 202, 1, s202, 4, 8);
+    EXPECT(relay_inject_wire_datagram(ctx, endbuf, end_len) ==
+           RELAY_INGRESS_OK);
+
+    local_want = (uint64_t)s101 + (uint64_t)s202 + 2u;
+    wait_local(ctx, local_want, 3000);
+    EXPECT(local_decode_hub_is_complete(&hub));
+    EXPECT(local_decode_hub_strict_check(&hub) == 0);
+    EXPECT(tx_capture_count(&cap) == 0);
+    EXPECT(local_decode_hub_active_count(&hub) == 2);
+
+    EXPECT(read_file("build/relay_ld_multi_out/flow_101.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == sizeof(pt101));
+    EXPECT(memcmp(got, pt101, sizeof(pt101)) == 0);
+    EXPECT(read_file("build/relay_ld_multi_out/flow_202.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == sizeof(pt202));
+    EXPECT(memcmp(got, pt202, sizeof(pt202)) == 0);
+
+    relay_harness_close(ctx);
+    local_decode_hub_destroy(&hub);
+    pthread_mutex_destroy(&cap.mu);
+    multi_dir_cleanup();
+}
+
+static void test_multiflow_same_block_id_isolated(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg;
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    uint8_t pt101[180];
+    uint8_t pt202[180];
+    uint8_t got[256];
+    size_t got_len = 0;
+    int n;
+
+    memset(pt101, 0xA1, sizeof(pt101));
+    memset(pt202, 0xB2, sizeof(pt202));
+    EXPECT(multi_dir_prepare() == 0);
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_FORWARD);
+    cfg.delivery_fn = local_decode_hub_delivery;
+    cfg.delivery_ctx = &hub;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    /* Both flows use block_id=0 inside inject_copy_flow_complete. */
+    n = inject_copy_flow_complete(ctx, 101, pt101, sizeof(pt101), 4, 8);
+    EXPECT(n > 0);
+    n = inject_copy_flow_complete(ctx, 202, pt202, sizeof(pt202), 4, 8);
+    EXPECT(n > 0);
+    wait_local(ctx, (uint64_t)(2 * n), 3000);
+
+    EXPECT(local_decode_hub_strict_check(&hub) == 0);
+    EXPECT(read_file("build/relay_ld_multi_out/flow_101.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == sizeof(pt101) && memcmp(got, pt101, sizeof(pt101)) == 0);
+    EXPECT(read_file("build/relay_ld_multi_out/flow_202.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == sizeof(pt202) && memcmp(got, pt202, sizeof(pt202)) == 0);
+
+    relay_harness_close(ctx);
+    local_decode_hub_destroy(&hub);
+    pthread_mutex_destroy(&cap.mu);
+    multi_dir_cleanup();
+}
+
+static void test_one_flow_end_other_continues(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg;
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    uint8_t pt101[120];
+    uint8_t pt202[220];
+    uint8_t got[256];
+    size_t got_len = 0;
+    size_t size101_after_end = 0;
+    int n101;
+    int n202;
+
+    memset(pt101, 0x31, sizeof(pt101));
+    memset(pt202, 0x32, sizeof(pt202));
+    EXPECT(multi_dir_prepare() == 0);
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_FORWARD);
+    cfg.delivery_fn = local_decode_hub_delivery;
+    cfg.delivery_ctx = &hub;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    n101 = inject_copy_flow_complete(ctx, 101, pt101, sizeof(pt101), 4, 8);
+    EXPECT(n101 > 0);
+    wait_local(ctx, (uint64_t)n101, 2000);
+    EXPECT(read_file("build/relay_ld_multi_out/flow_101.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == sizeof(pt101));
+    size101_after_end = got_len;
+
+    n202 = inject_copy_flow_complete(ctx, 202, pt202, sizeof(pt202), 4, 8);
+    EXPECT(n202 > 0);
+    wait_local(ctx, (uint64_t)(n101 + n202), 3000);
+
+    EXPECT(read_file("build/relay_ld_multi_out/flow_101.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == size101_after_end);
+    EXPECT(memcmp(got, pt101, sizeof(pt101)) == 0);
+    EXPECT(read_file("build/relay_ld_multi_out/flow_202.bin", got, sizeof(got),
+                     &got_len) == 0);
+    EXPECT(got_len == sizeof(pt202) && memcmp(got, pt202, sizeof(pt202)) == 0);
+    EXPECT(local_decode_hub_is_complete(&hub));
+    EXPECT(local_decode_hub_strict_check(&hub) == 0);
+
+    relay_harness_close(ctx);
+    local_decode_hub_destroy(&hub);
+    pthread_mutex_destroy(&cap.mu);
+    multi_dir_cleanup();
+}
+
+static void test_output_dir_capacity_reject(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg;
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    uint8_t plaintext[32];
+    uint8_t datagrams[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    size_t lens[PACKAGES_PER_ENCODE_BLOCK];
+    uint16_t shards = 0;
+    uint32_t i;
+    const LocalDecodeHubStats *hst;
+    RelayIngressStatus st;
+
+    memset(plaintext, 0x44, sizeof(plaintext));
+    EXPECT(multi_dir_prepare() == 0);
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_CACHE);
+    cfg.delivery_fn = local_decode_hub_delivery;
+    cfg.delivery_ctx = &hub;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    for (i = 0; i < RELAY_MAX_FLOWS; i++) {
+        EXPECT(build_copy_block_datagrams(datagrams, lens, &shards, plaintext,
+                                          sizeof(plaintext), 10u + i, 0, 4,
+                                          8) == 0);
+        EXPECT(relay_inject_wire_datagram(ctx, datagrams[0], lens[0]) ==
+               RELAY_INGRESS_OK);
+    }
+    wait_local(ctx, RELAY_MAX_FLOWS, 2000);
+    EXPECT(local_decode_hub_active_count(&hub) == RELAY_MAX_FLOWS);
+
+    EXPECT(build_copy_block_datagrams(datagrams, lens, &shards, plaintext,
+                                      sizeof(plaintext), 10u + RELAY_MAX_FLOWS,
+                                      0, 4, 8) == 0);
+    st = relay_inject_wire_datagram(ctx, datagrams[0], lens[0]);
+    /* Delivery returns -1 but ingress still OK (local path swallows). */
+    EXPECT(st == RELAY_INGRESS_OK);
+    wait_local(ctx, RELAY_MAX_FLOWS + 1u, 1000);
+
+    hst = local_decode_hub_stats(&hub);
+    EXPECT(hst != NULL && hst->flow_rejected >= 1);
+    EXPECT(local_decode_hub_active_count(&hub) == RELAY_MAX_FLOWS);
+    EXPECT(tx_capture_count(&cap) == 0);
+    EXPECT(generation_cache_count(relay_generation_cache(ctx)) == 0);
+    EXPECT(relay_total_stats(ctx)->forward == 0);
+    EXPECT(local_decode_hub_strict_check(&hub) != 0);
+
+    relay_harness_close(ctx);
+    local_decode_hub_destroy(&hub);
+    pthread_mutex_destroy(&cap.mu);
+    multi_dir_cleanup();
+}
+
+static void test_output_dir_local_only(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg;
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    uint8_t local_pt[64];
+    uint8_t remote_pt[64];
+    uint8_t datagrams[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    size_t lens[PACKAGES_PER_ENCODE_BLOCK];
+    uint16_t shards = 0;
+    int n;
+
+    memset(local_pt, 0x51, sizeof(local_pt));
+    memset(remote_pt, 0x52, sizeof(remote_pt));
+    EXPECT(multi_dir_prepare() == 0);
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_CACHE);
+    cfg.delivery_fn = local_decode_hub_delivery;
+    cfg.delivery_ctx = &hub;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    n = inject_copy_flow_complete(ctx, 101, local_pt, sizeof(local_pt), 4, 8);
+    EXPECT(n > 0);
+    wait_local(ctx, (uint64_t)n, 2000);
+    EXPECT(generation_cache_count(relay_generation_cache(ctx)) == 0);
+    EXPECT(tx_capture_count(&cap) == 0);
+
+    EXPECT(build_copy_block_datagrams(datagrams, lens, &shards, remote_pt,
+                                      sizeof(remote_pt), 1, 0, 9, 8) == 0);
+    EXPECT(relay_inject_wire_datagram(ctx, datagrams[0], lens[0]) ==
+           RELAY_INGRESS_OK);
+    wait_forward(ctx, 1, 1000);
+    EXPECT(relay_total_stats(ctx)->forward >= 1);
+    EXPECT(tx_capture_count(&cap) >= 1);
+    EXPECT(generation_cache_count(relay_generation_cache(ctx)) >= 1);
+
+    relay_harness_close(ctx);
+    local_decode_hub_destroy(&hub);
+    pthread_mutex_destroy(&cap.mu);
+    multi_dir_cleanup();
+}
+
+static void test_output_dir_rejects_nonlocal_delivery(void)
+{
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    uint8_t plaintext[48];
+    uint8_t datagrams[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    size_t lens[PACKAGES_PER_ENCODE_BLOCK];
+    uint16_t shards = 0;
+    WireHeader hdr;
+    struct stat st;
+
+    memset(plaintext, 0x61, sizeof(plaintext));
+    EXPECT(multi_dir_prepare() == 0);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    EXPECT(build_copy_block_datagrams(datagrams, lens, &shards, plaintext,
+                                      sizeof(plaintext), 101, 0, 2, 8) == 0);
+    EXPECT(wire_header_decode(&hdr, datagrams[0], lens[0]) == 0);
+    EXPECT(local_decode_hub_delivery(datagrams[0], lens[0], &hdr, &hub) == -1);
+    EXPECT(local_decode_hub_active_count(&hub) == 0);
+    EXPECT(stat("build/relay_ld_multi_out/flow_101.bin", &st) != 0);
+    EXPECT(local_decode_hub_strict_check(&hub) != 0);
+
+    local_decode_hub_destroy(&hub);
+    multi_dir_cleanup();
 }
 
 int main(void)
@@ -754,11 +1185,18 @@ int main(void)
     test_local_ttl_unchanged();
     test_local_no_cache_no_egress();
     test_missing_shard_strict_no_corrupt_output();
-    test_second_flow_rejected();
+    test_single_output_still_rejects_second_flow();
     test_local_encoder_not_blocked_with_decode();
     test_delivery_rejects_nonlocal_final_dst();
     test_output_io_failure_sets_ingest_error();
     test_strict_incomplete_helper_fails();
+
+    test_multiflow_interleaved_outputs();
+    test_multiflow_same_block_id_isolated();
+    test_one_flow_end_other_continues();
+    test_output_dir_capacity_reject();
+    test_output_dir_local_only();
+    test_output_dir_rejects_nonlocal_delivery();
 
     if (g_failures != 0) {
         fprintf(stderr, "relay_local_decode_tests: %d failure(s)\n", g_failures);

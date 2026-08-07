@@ -17,12 +17,12 @@ Generation key is `(flow_id, block_id)`. Do not invent a separate
 | **1** | Opaque multi-flow forward + global EgressQueue + wire-level inject | **Implemented** |
 | **2** | Copy-based GenerationCache + process hook; still opaque forward | **Implemented** |
 | **L0** | Extract reusable `WireFlowDecoder` from udp-recv | **Implemented** |
-| **L1** | Explicit-hop relay local-destination decode (`--local-decode`) | **Implemented** |
-| **L2** | Multi-flow local decode (`--output-dir`) | Future |
+| **L1** | Explicit-hop relay local-destination decode (`--output FILE`) | **Implemented** |
+| **L2** | Multi-flow local decode (`--output-dir DIR`) | **Implemented** |
 | **3A** | Decode-and-reencode relay (recover source, re-run current FEC encoder) | Future |
 | **3B** | True network recode | Future — requires new wire version |
 
-### Local destination decode (L1)
+### Local destination decode (L1 / L2)
 
 When `--local-decode` is set on `wire_relay`:
 
@@ -30,22 +30,30 @@ When `--local-decode` is set on `wire_relay`:
 UDP RX / inject
   → ingress_mu
   → if wire_header_is_local(header, local_node_id):
-       LocalDecodeHub → WireFlowDecoder → --output FILE
+       LocalDecodeHub
+         L1 --output FILE:      one WireFlowDecoder → FILE
+         L2 --output-dir DIR:   per-flow WireFlowDecoder → DIR/flow_<id>.bin
        (no TTL--, no GenerationCache, no EgressQueue, no sendto)
   → else: existing Phase 1/2 forward path unchanged
 ```
 
 - Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
-- L1 is **single flow** + fixed `--codec` geometry; a second `flow_id` is
-  rejected (`local_decode_flow_rejected`). Multi-flow `--output-dir` is L2.
-- Shard metadata that does not match the configured codec is counted as
-  decode metadata mismatch and dropped.
+- Exactly one sink: `--output` **or** `--output-dir` (not both); `--codec` required.
+- **L1** (`--output FILE`): single `flow_id`; a second id is rejected
+  (`local_decode_flow_rejected`).
+- **L2** (`--output-dir DIR`): up to `RELAY_MAX_FLOWS` concurrent local flows;
+  each binds a slot until hub destroy (no slot reuse after END); overflow
+  rejects with `local_decode_flow_rejected` (capacity). `DIR` must already exist.
+- All flows share one process-wide codec / FEC geometry; mismatched shard
+  metadata → metadata mismatch + drop.
 - With `--local-decode`, `reject_local_encoder_loopback` is cleared so
   `LOCAL_ENCODER` packets with `final_dst==local` can sink-decode.
-- Without `--local-decode`, delivery stays count-only (default); all existing
-  relay tests remain compatible.
+- Without `--local-decode`, delivery stays count-only (default).
+- Strict exit via `local_decode_hub_strict_check`: hub errors/rejections, or any
+  active incomplete / per-flow ingest_error → process `EXIT_FAILURE`.
 
-L1 is **not** Phase 3A mid-hop recode.
+Local decode is **not** Phase 3A mid-hop recode and does **not** use
+GenerationCache for decoder state.
 
 ### Phase 1
 

@@ -14,17 +14,19 @@ static void print_usage(const char *prog)
             "     [--process forward|cache]\n"
             "     [--gen-timeout-ms N] [--max-gens N]\n"
             "     [--max-gens-per-flow N] [--max-cache-bytes N]\n"
-            "     [--local-decode --codec copy|xor-fec|rs-fec|rs --output FILE]\n"
+            "     [--local-decode --codec copy|xor-fec|rs-fec|rs\n"
+            "         (--output FILE | --output-dir DIR)]\n"
             "\n"
             "Explicit-hop opaque UDP relay (wire header v3).\n"
             "RX -> destination check(final_dst) -> TTL-- ->\n"
             "  [--process cache: GenerationCache observe] ->\n"
             "  global EgressQueue -> TX sendto(next-hop).\n"
-            "With --local-decode: final_dst==local_node_id packets are decoded\n"
-            "via WireFlowDecoder into --output (single flow / L1). Local packets\n"
-            "skip TTL--, GenerationCache, EgressQueue, and next-hop send.\n"
-            "Local destination is decided only by wire_header_is_local (never\n"
-            "UDP/IP dst). Multi-flow --output-dir is L2 work.\n",
+            "With --local-decode: final_dst==local_node_id packets decode via\n"
+            "LocalDecodeHub / WireFlowDecoder. Local packets skip TTL--,\n"
+            "GenerationCache, EgressQueue, and next-hop send.\n"
+            "Locality is only wire_header_is_local (never UDP/IP dst).\n"
+            "  --output FILE      L1 single-flow sink\n"
+            "  --output-dir DIR   L2 multi-flow: DIR/flow_<id>.bin\n",
             prog);
 }
 
@@ -119,6 +121,7 @@ int main(int argc, char **argv)
     int have_codec = 0;
     CodecKind codec_kind = CODEC_KIND_COPY;
     const char *output_path = NULL;
+    const char *output_dir = NULL;
     int hub_inited = 0;
     RelayStatus st;
     const LocalDecodeHubStats *hub_stats;
@@ -256,6 +259,13 @@ int main(int argc, char **argv)
             }
             output_path = argv[argi + 1];
             argi += 2;
+        } else if (strcmp(argv[argi], "--output-dir") == 0) {
+            if (argi + 1 >= argc || argv[argi + 1][0] == '\0') {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            output_dir = argv[argi + 1];
+            argi += 2;
         } else {
             print_usage(argv[0]);
             return EXIT_FAILURE;
@@ -267,15 +277,23 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     if (local_decode) {
-        if (output_path == NULL || !have_codec) {
-            fprintf(stderr,
-                    "wire-relay: --local-decode requires --codec and --output\n");
+        if (!have_codec) {
+            fprintf(stderr, "wire-relay: --local-decode requires --codec\n");
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
-    } else if (have_codec || output_path != NULL) {
+        if ((output_path == NULL && output_dir == NULL) ||
+            (output_path != NULL && output_dir != NULL)) {
+            fprintf(stderr,
+                    "wire-relay: --local-decode requires exactly one of "
+                    "--output FILE or --output-dir DIR\n");
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    } else if (have_codec || output_path != NULL || output_dir != NULL) {
         fprintf(stderr,
-                "wire-relay: --codec/--output require --local-decode\n");
+                "wire-relay: --codec/--output/--output-dir require "
+                "--local-decode\n");
         return EXIT_FAILURE;
     }
 
@@ -299,9 +317,15 @@ int main(int argc, char **argv)
     if (local_decode) {
         memset(&hub_cfg, 0, sizeof(hub_cfg));
         hub_cfg.codec_kind = codec_kind;
-        hub_cfg.output_path = output_path;
         hub_cfg.best_effort = 0;
         hub_cfg.local_node_id = local_node_id;
+        if (output_dir != NULL) {
+            hub_cfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+            hub_cfg.output_dir = output_dir;
+        } else {
+            hub_cfg.mode = LOCAL_DECODE_MODE_SINGLE_FILE;
+            hub_cfg.output_path = output_path;
+        }
         if (local_decode_hub_init(&hub, &hub_cfg) != 0) {
             fprintf(stderr, "wire-relay: local_decode hub init failed\n");
             return EXIT_FAILURE;
@@ -321,11 +345,12 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "wire-relay local-decode: delivered=%llu "
                     "metadata_mismatch=%llu flow_rejected=%llu "
-                    "ingest_error=%llu complete=%d\n",
+                    "ingest_error=%llu active=%zu complete=%d\n",
                     (unsigned long long)hub_stats->delivered,
                     (unsigned long long)hub_stats->metadata_mismatch,
                     (unsigned long long)hub_stats->flow_rejected,
                     (unsigned long long)hub_stats->ingest_error,
+                    local_decode_hub_active_count(&hub),
                     local_decode_hub_is_complete(&hub));
         }
         if (st == RELAY_OK && local_decode_hub_strict_check(&hub) != 0) {
