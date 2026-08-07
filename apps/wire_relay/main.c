@@ -1,3 +1,4 @@
+#include "local_decode.h"
 #include "relay.h"
 
 #include <stdio.h>
@@ -13,13 +14,17 @@ static void print_usage(const char *prog)
             "     [--process forward|cache]\n"
             "     [--gen-timeout-ms N] [--max-gens N]\n"
             "     [--max-gens-per-flow N] [--max-cache-bytes N]\n"
+            "     [--local-decode --codec copy|xor-fec|rs-fec|rs --output FILE]\n"
             "\n"
             "Explicit-hop opaque UDP relay (wire header v3).\n"
             "RX -> destination check(final_dst) -> TTL-- ->\n"
             "  [--process cache: GenerationCache observe] ->\n"
             "  global EgressQueue -> TX sendto(next-hop).\n"
-            "Local injection API accepts only already-encoded wire v3 datagrams.\n"
-            "Default --process forward (Phase 1). cache still opaque-forwards.\n",
+            "With --local-decode: final_dst==local_node_id packets are decoded\n"
+            "via WireFlowDecoder into --output (single flow / L1). Local packets\n"
+            "skip TTL--, GenerationCache, EgressQueue, and next-hop send.\n"
+            "Local destination is decided only by wire_header_is_local (never\n"
+            "UDP/IP dst). Multi-flow --output-dir is L2 work.\n",
             prog);
 }
 
@@ -68,9 +73,35 @@ static int parse_ulong_arg(const char *text, unsigned long *out)
     return 0;
 }
 
+static int parse_codec_kind(const char *text, CodecKind *out)
+{
+    if (text == NULL || out == NULL) {
+        return -1;
+    }
+    if (strcmp(text, "copy") == 0) {
+        *out = CODEC_KIND_COPY;
+        return 0;
+    }
+    if (strcmp(text, "xor-fec") == 0) {
+        *out = CODEC_KIND_XOR_FEC;
+        return 0;
+    }
+    if (strcmp(text, "rs-fec") == 0) {
+        *out = CODEC_KIND_RS_FEC;
+        return 0;
+    }
+    if (strcmp(text, "rs") == 0) {
+        *out = CODEC_KIND_RS;
+        return 0;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
     RelayConfig cfg;
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hub_cfg;
     char next_hop_host[256];
     uint8_t local_node_id = 0;
     uint16_t listen_port = 0;
@@ -84,8 +115,16 @@ int main(int argc, char **argv)
     uint64_t max_cache_bytes = GEN_CACHE_DEFAULT_MAX_BYTES;
     int argi = 1;
     int have_next_hop = 0;
+    int local_decode = 0;
+    int have_codec = 0;
+    CodecKind codec_kind = CODEC_KIND_COPY;
+    const char *output_path = NULL;
+    int hub_inited = 0;
+    RelayStatus st;
+    const LocalDecodeHubStats *hub_stats;
 
     memset(&cfg, 0, sizeof(cfg));
+    memset(&hub, 0, sizeof(hub));
     memset(next_hop_host, 0, sizeof(next_hop_host));
 
     if (argc < 2) {
@@ -199,6 +238,24 @@ int main(int argc, char **argv)
             }
             max_cache_bytes = (uint64_t)parsed;
             argi += 2;
+        } else if (strcmp(argv[argi], "--local-decode") == 0) {
+            local_decode = 1;
+            argi += 1;
+        } else if (strcmp(argv[argi], "--codec") == 0) {
+            if (argi + 1 >= argc ||
+                parse_codec_kind(argv[argi + 1], &codec_kind) != 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            have_codec = 1;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--output") == 0) {
+            if (argi + 1 >= argc || argv[argi + 1][0] == '\0') {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            output_path = argv[argi + 1];
+            argi += 2;
         } else {
             print_usage(argv[0]);
             return EXIT_FAILURE;
@@ -209,6 +266,18 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
+    if (local_decode) {
+        if (output_path == NULL || !have_codec) {
+            fprintf(stderr,
+                    "wire-relay: --local-decode requires --codec and --output\n");
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    } else if (have_codec || output_path != NULL) {
+        fprintf(stderr,
+                "wire-relay: --codec/--output require --local-decode\n");
+        return EXIT_FAILURE;
+    }
 
     cfg.local_node_id = local_node_id;
     cfg.listen_port = listen_port;
@@ -216,6 +285,7 @@ int main(int argc, char **argv)
     cfg.next_hop_port = next_hop_port;
     cfg.recode_fn = NULL;
     cfg.delivery_fn = NULL;
+    cfg.delivery_ctx = NULL;
     cfg.process_mode = process_mode;
     cfg.process_fn = NULL;
     cfg.idle_exit_sec = idle_exit_sec;
@@ -226,5 +296,46 @@ int main(int argc, char **argv)
     cfg.max_gens_per_flow = max_gens_per_flow;
     cfg.max_cache_bytes = max_cache_bytes;
 
-    return relay_run(&cfg) == RELAY_OK ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (local_decode) {
+        memset(&hub_cfg, 0, sizeof(hub_cfg));
+        hub_cfg.codec_kind = codec_kind;
+        hub_cfg.output_path = output_path;
+        hub_cfg.best_effort = 0;
+        hub_cfg.local_node_id = local_node_id;
+        if (local_decode_hub_init(&hub, &hub_cfg) != 0) {
+            fprintf(stderr, "wire-relay: local_decode hub init failed\n");
+            return EXIT_FAILURE;
+        }
+        hub_inited = 1;
+        cfg.delivery_fn = local_decode_hub_delivery;
+        cfg.delivery_ctx = &hub;
+        /* Allow LOCAL_ENCODER inject when final_dst==local for sink decode. */
+        cfg.reject_local_encoder_loopback = 0;
+    }
+
+    st = relay_run(&cfg);
+
+    if (hub_inited) {
+        hub_stats = local_decode_hub_stats(&hub);
+        if (hub_stats != NULL) {
+            fprintf(stderr,
+                    "wire-relay local-decode: delivered=%llu "
+                    "metadata_mismatch=%llu flow_rejected=%llu "
+                    "ingest_error=%llu complete=%d\n",
+                    (unsigned long long)hub_stats->delivered,
+                    (unsigned long long)hub_stats->metadata_mismatch,
+                    (unsigned long long)hub_stats->flow_rejected,
+                    (unsigned long long)hub_stats->ingest_error,
+                    local_decode_hub_is_complete(&hub));
+        }
+        if (st == RELAY_OK && local_decode_hub_strict_check(&hub) != 0) {
+            fprintf(stderr,
+                    "wire-relay: local-decode strict incomplete or error; "
+                    "exiting failure\n");
+            st = RELAY_ERR;
+        }
+        local_decode_hub_destroy(&hub);
+    }
+
+    return st == RELAY_OK ? EXIT_SUCCESS : EXIT_FAILURE;
 }

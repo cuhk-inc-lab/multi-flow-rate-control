@@ -94,15 +94,31 @@ RELAY_OBJS = \
 	$(OBJ_DIR)/relay_relay.o \
 	$(OBJ_DIR)/relay_recode.o \
 	$(OBJ_DIR)/relay_egress_queue.o \
-	$(OBJ_DIR)/relay_generation_cache.o
+	$(OBJ_DIR)/relay_generation_cache.o \
+	$(OBJ_DIR)/relay_local_decode.o
 
-RELAY_LIB_OBJS = \
+RELAY_CORE_OBJS = \
 	$(OBJ_DIR)/relay_relay.o \
 	$(OBJ_DIR)/relay_recode.o \
 	$(OBJ_DIR)/relay_egress_queue.o \
 	$(OBJ_DIR)/relay_generation_cache.o
 
+RELAY_LIB_OBJS = \
+	$(RELAY_CORE_OBJS) \
+	$(OBJ_DIR)/relay_local_decode.o
+
+RELAY_DECODE_OBJS = \
+	$(OBJ_DIR)/wg_wire_flow_decoder.o \
+	$(OBJ_DIR)/wg_codec.o \
+	$(OBJ_DIR)/wg_block_codec.o \
+	$(OBJ_DIR)/wg_copy_codec.o \
+	$(OBJ_DIR)/wg_xor_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o \
+	$(RSCODE_OBJS)
+
 RELAY_GEN_CACHE_TEST_BIN = $(OBJ_DIR)/relay_gen_cache_tests
+RELAY_LOCAL_DECODE_TEST_BIN = $(OBJ_DIR)/relay_local_decode_tests
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
@@ -120,13 +136,15 @@ fec-trace: $(FEC_TRACE_BIN)
 rs-recovery-bench: $(RS_RECOVERY_BENCH_BIN)
 	./$(RS_RECOVERY_BENCH_BIN)
 
-test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN)
+test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN)
 	./$(TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
+	./$(RELAY_LOCAL_DECODE_TEST_BIN)
 
-integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN)
+integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN)
 	./$(WG_CODEC_TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
+	./$(RELAY_LOCAL_DECODE_TEST_BIN)
 	dd if=/dev/urandom of=$(WG_TEST_IN0) bs=1400 count=20 status=none
 	dd if=/dev/urandom of=$(WG_TEST_IN1) bs=5600 count=5 status=none
 	dd if=/dev/urandom of=$(WG_TEST_IN2) bs=1400 count=40 status=none
@@ -184,16 +202,24 @@ $(OBJ_DIR)/rscode_%.o: $(RSCODE_DIR)/%.c $(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
 $(WG_BIN): $(WG_OBJS) $(RSCODE_OBJS) $(LIB_OBJS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) $(WG_OBJS) $(RSCODE_OBJS) $(LIB_OBJS) -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
-$(OBJ_DIR)/relay_%.o: $(RELAY_DIR)/%.c $(INCLUDE_HDRS) $(RELAY_HDRS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(RELAY_DIR) -c $< -o $@
+$(OBJ_DIR)/relay_%.o: $(RELAY_DIR)/%.c $(INCLUDE_HDRS) $(RELAY_HDRS) $(WG_HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -I$(WG_DIR) -c $< -o $@
 
-$(RELAY_BIN): $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(RELAY_DIR) $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o -o $@ $(LDFLAGS)
+$(RELAY_BIN): $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o $(RELAY_DECODE_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -I$(WG_DIR) $(RELAY_OBJS) $(OBJ_DIR)/wire_header.o \
+		$(RELAY_DECODE_OBJS) -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
-$(RELAY_GEN_CACHE_TEST_BIN): $(TEST_DIR)/relay_gen_cache_tests.c $(RELAY_LIB_OBJS) \
+$(RELAY_GEN_CACHE_TEST_BIN): $(TEST_DIR)/relay_gen_cache_tests.c $(RELAY_CORE_OBJS) \
 	$(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(RELAY_DIR) $(TEST_DIR)/relay_gen_cache_tests.c \
-		$(RELAY_LIB_OBJS) $(OBJ_DIR)/wire_header.o -o $@ $(LDFLAGS)
+		$(RELAY_CORE_OBJS) $(OBJ_DIR)/wire_header.o -o $@ $(LDFLAGS)
+
+$(RELAY_LOCAL_DECODE_TEST_BIN): $(TEST_DIR)/relay_local_decode_tests.c \
+	$(RELAY_LIB_OBJS) $(OBJ_DIR)/wire_header.o $(RELAY_DECODE_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -I$(WG_DIR) \
+		$(TEST_DIR)/relay_local_decode_tests.c \
+		$(RELAY_LIB_OBJS) $(OBJ_DIR)/wire_header.o $(RELAY_DECODE_OBJS) \
+		-o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(WG_CODEC_TEST_BIN): $(TEST_DIR)/wg_codec_tests.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
