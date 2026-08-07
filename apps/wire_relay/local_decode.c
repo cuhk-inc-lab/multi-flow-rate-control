@@ -176,28 +176,33 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
         return -1;
     }
 
+    if (pthread_mutex_init(&hub->mu, NULL) != 0) {
+        return -1;
+    }
+    hub->mu_inited = 1;
+
     hub->mode = cfg->mode;
     hub->local_node_id = cfg->local_node_id;
     hub->codec = Codec_get(cfg->codec_kind);
     if (hub->codec == NULL) {
-        return -1;
+        goto fail;
     }
     if (cfg->best_effort && !Codec_is_systematic(hub->codec)) {
-        return -1;
+        goto fail;
     }
     hub->best_effort = cfg->best_effort;
     hub->input_size = Codec_input_block_size(hub->codec);
     output_size = Codec_output_block_size(hub->codec);
     if (hub->input_size == 0 || output_size == 0 ||
         output_size > CODEC_MAX_ENCODE_BLOCK || output_size % PKG_SIZE != 0) {
-        return -1;
+        goto fail;
     }
     hub->expected_shards = (uint16_t)(output_size / PKG_SIZE);
     if (hub->expected_shards == 0 ||
         hub->expected_shards > WIRE_FLOW_MAX_SHARDS ||
         hub->expected_shards !=
             Codec_data_shards(hub->codec) + Codec_parity_shards(hub->codec)) {
-        return -1;
+        goto fail;
     }
 
     if (cfg->mode == LOCAL_DECODE_MODE_SINGLE_FILE) {
@@ -207,23 +212,35 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
         } else if (cfg->output_path != NULL) {
             hub->single_output = fopen(cfg->output_path, "wb");
             if (hub->single_output == NULL) {
-                return -1;
+                goto fail;
             }
             hub->single_close_output = 1;
         } else {
-            return -1;
+            goto fail;
         }
     } else {
         if (cfg->output_dir == NULL || validate_output_dir(cfg->output_dir) != 0) {
-            return -1;
+            goto fail;
         }
         dir_len = strlen(cfg->output_dir);
         if (dir_len == 0 || dir_len >= sizeof(hub->output_dir)) {
-            return -1;
+            goto fail;
         }
         memcpy(hub->output_dir, cfg->output_dir, dir_len + 1u);
     }
     return 0;
+
+fail:
+    if (hub->single_close_output && hub->single_output != NULL) {
+        fclose(hub->single_output);
+        hub->single_output = NULL;
+    }
+    if (hub->mu_inited) {
+        pthread_mutex_destroy(&hub->mu);
+        hub->mu_inited = 0;
+    }
+    memset(hub, 0, sizeof(*hub));
+    return -1;
 }
 
 void local_decode_hub_destroy(LocalDecodeHub *hub)
@@ -232,6 +249,14 @@ void local_decode_hub_destroy(LocalDecodeHub *hub)
 
     if (hub == NULL) {
         return;
+    }
+    /*
+     * Caller must guarantee no concurrent delivery (after relay_run /
+     * harness close). Lock once to serialize vs a stray late call, then
+     * tear down under the lock before destroying the mutex.
+     */
+    if (hub->mu_inited) {
+        pthread_mutex_lock(&hub->mu);
     }
     for (i = 0; i < RELAY_MAX_FLOWS; i++) {
         LocalDecodeFlow *flow = &hub->flows[i];
@@ -251,8 +276,29 @@ void local_decode_hub_destroy(LocalDecodeHub *hub)
         fclose(hub->single_output);
     }
     hub->single_output = NULL;
+    if (hub->mu_inited) {
+        pthread_mutex_unlock(&hub->mu);
+        pthread_mutex_destroy(&hub->mu);
+        hub->mu_inited = 0;
+    }
     memset(hub, 0, sizeof(*hub));
 }
+
+static size_t active_count_unlocked(const LocalDecodeHub *hub)
+{
+    size_t i;
+    size_t n = 0;
+
+    for (i = 0; i < RELAY_MAX_FLOWS; i++) {
+        if (hub->flows[i].active) {
+            n++;
+        }
+    }
+    return n;
+}
+
+__attribute__((weak)) void local_decode_test_locked_enter(void) {}
+__attribute__((weak)) void local_decode_test_locked_leave(void) {}
 
 int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
                               const WireHeader *hdr, void *ctx)
@@ -262,11 +308,15 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
     const uint8_t *payload;
     size_t payload_len;
     int capacity_reject = 0;
+    int rc = 0;
 
-    if (hub == NULL || datagram == NULL || hdr == NULL ||
+    if (hub == NULL || !hub->mu_inited || datagram == NULL || hdr == NULL ||
         len < WIRE_HEADER_SIZE) {
         return -1;
     }
+
+    pthread_mutex_lock(&hub->mu);
+    local_decode_test_locked_enter();
 
     if (!wire_header_is_local(hdr, hub->local_node_id)) {
         hub->stats.metadata_mismatch++;
@@ -275,7 +325,8 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
                 "(final_dst=%u local_node_id=%u)\n",
                 (unsigned)hdr->final_dst,
                 (unsigned)hub->local_node_id);
-        return -1;
+        rc = -1;
+        goto out;
     }
 
     if (hdr->type != WIRE_TYPE_DATA && hdr->type != WIRE_TYPE_END) {
@@ -283,7 +334,8 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
         fprintf(stderr,
                 "local_decode: decode metadata mismatch (type=%u)\n",
                 (unsigned)hdr->type);
-        return 0;
+        rc = 0;
+        goto out;
     }
 
     if (!wire_flow_decoder_shard_count_ok(hub->codec, hdr->shard_count,
@@ -293,19 +345,21 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
                 "local_decode: decode metadata mismatch "
                 "(shard_count=%u expected=%u)\n",
                 (unsigned)hdr->shard_count, (unsigned)hub->expected_shards);
-        return 0;
+        rc = 0;
+        goto out;
     }
 
     flow = find_flow(hub, hdr->flow_id);
     if (flow == NULL) {
         if (hub->mode == LOCAL_DECODE_MODE_SINGLE_FILE &&
-            local_decode_hub_active_count(hub) > 0) {
+            active_count_unlocked(hub) > 0) {
             hub->stats.flow_rejected++;
             fprintf(stderr,
                     "local_decode_flow_rejected: flow_id=%u "
                     "(L1 --output FILE single-flow only; use --output-dir)\n",
                     (unsigned)hdr->flow_id);
-            return 0;
+            rc = 0;
+            goto out;
         }
 
         flow = bind_new_flow(hub, hdr->flow_id, &capacity_reject);
@@ -316,10 +370,12 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
                         "local_decode_flow_rejected: flow_id=%u "
                         "capacity=%u (no free LocalDecodeFlow slot)\n",
                         (unsigned)hdr->flow_id, (unsigned)RELAY_MAX_FLOWS);
-                return -1;
+                rc = -1;
+                goto out;
             }
             hub->stats.ingest_error++;
-            return -1;
+            rc = -1;
+            goto out;
         }
     }
 
@@ -331,7 +387,8 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
             fprintf(stderr,
                     "local_decode: decode metadata mismatch "
                     "(DATA len/payload)\n");
-            return 0;
+            rc = 0;
+            goto out;
         }
         payload = datagram + WIRE_HEADER_SIZE;
         payload_len = hdr->payload_len;
@@ -342,7 +399,8 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
             fprintf(stderr,
                     "local_decode: decode metadata mismatch "
                     "(END len/payload)\n");
-            return 0;
+            rc = 0;
+            goto out;
         }
         payload = NULL;
         payload_len = 0;
@@ -351,42 +409,53 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
     if (wire_flow_decoder_ingest(flow->dec, hdr, payload, payload_len) != 0) {
         flow->ingest_error++;
         hub->stats.ingest_error++;
-        return -1;
+        rc = -1;
+        goto out;
     }
     flow->delivered++;
     hub->stats.delivered++;
+    rc = 0;
+
+out:
+    local_decode_test_locked_leave();
+    pthread_mutex_unlock(&hub->mu);
+    return rc;
+}
+
+int local_decode_hub_get_stats(LocalDecodeHub *hub, LocalDecodeHubStats *out)
+{
+    if (hub == NULL || out == NULL || !hub->mu_inited) {
+        return -1;
+    }
+    pthread_mutex_lock(&hub->mu);
+    *out = hub->stats;
+    pthread_mutex_unlock(&hub->mu);
     return 0;
 }
 
-const LocalDecodeHubStats *local_decode_hub_stats(const LocalDecodeHub *hub)
+size_t local_decode_hub_active_count(LocalDecodeHub *hub)
 {
-    return hub != NULL ? &hub->stats : NULL;
-}
+    size_t n;
 
-size_t local_decode_hub_active_count(const LocalDecodeHub *hub)
-{
-    size_t i;
-    size_t n = 0;
-
-    if (hub == NULL) {
+    if (hub == NULL || !hub->mu_inited) {
         return 0;
     }
-    for (i = 0; i < RELAY_MAX_FLOWS; i++) {
-        if (hub->flows[i].active) {
-            n++;
-        }
-    }
+    pthread_mutex_lock(&hub->mu);
+    n = active_count_unlocked(hub);
+    pthread_mutex_unlock(&hub->mu);
     return n;
 }
 
-int local_decode_hub_is_complete(const LocalDecodeHub *hub)
+int local_decode_hub_is_complete(LocalDecodeHub *hub)
 {
     size_t i;
     size_t active = 0;
+    int complete = 0;
 
-    if (hub == NULL) {
+    if (hub == NULL || !hub->mu_inited) {
         return 0;
     }
+    pthread_mutex_lock(&hub->mu);
     for (i = 0; i < RELAY_MAX_FLOWS; i++) {
         const LocalDecodeFlow *flow = &hub->flows[i];
 
@@ -395,24 +464,31 @@ int local_decode_hub_is_complete(const LocalDecodeHub *hub)
         }
         active++;
         if (flow->dec == NULL || !wire_flow_decoder_is_complete(flow->dec)) {
-            return 0;
+            complete = 0;
+            goto out;
         }
     }
-    return active > 0;
+    complete = active > 0;
+out:
+    pthread_mutex_unlock(&hub->mu);
+    return complete;
 }
 
-int local_decode_hub_strict_check(const LocalDecodeHub *hub)
+int local_decode_hub_strict_check(LocalDecodeHub *hub)
 {
     const LocalDecodeHubStats *st;
     size_t i;
+    int rc = 0;
 
-    if (hub == NULL) {
+    if (hub == NULL || !hub->mu_inited) {
         return -1;
     }
+    pthread_mutex_lock(&hub->mu);
     st = &hub->stats;
     if (st->ingest_error != 0 || st->metadata_mismatch != 0 ||
         st->flow_rejected != 0) {
-        return -1;
+        rc = -1;
+        goto out;
     }
     for (i = 0; i < RELAY_MAX_FLOWS; i++) {
         const LocalDecodeFlow *flow = &hub->flows[i];
@@ -421,11 +497,16 @@ int local_decode_hub_strict_check(const LocalDecodeHub *hub)
             continue;
         }
         if (flow->ingest_error != 0) {
-            return -1;
+            rc = -1;
+            goto out;
         }
         if (flow->dec == NULL || !wire_flow_decoder_is_complete(flow->dec)) {
-            return -1;
+            rc = -1;
+            goto out;
         }
     }
-    return 0;
+    rc = 0;
+out:
+    pthread_mutex_unlock(&hub->mu);
+    return rc;
 }

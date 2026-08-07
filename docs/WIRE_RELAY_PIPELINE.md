@@ -39,6 +39,10 @@ UDP RX / inject
 
 - Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
 - Exactly one sink: `--output` **or** `--output-dir` (not both); `--codec` required.
+- **P0A:** `delivery_fn` / LocalDecodeHub decode+I/O run **outside**
+  `RelayCtx.ingress_mu`. Hub serializes ingest via its own `hub->mu`.
+  This is not an async decode worker: the RX/inject caller still waits for
+  the callback to return.
 - **L1** (`--output FILE`): single `flow_id`; a second id is rejected
   (`local_decode_flow_rejected`).
 - **L2** (`--output-dir DIR`): up to `RELAY_MAX_FLOWS` concurrent local flows;
@@ -153,10 +157,11 @@ Per `(flow_id, block_id)` entry:
 **Contract:** call `relay_harness_close(ctx)` only after the caller has stopped
 and **joined** every thread that might call `relay_inject_wire_datagram(ctx, ...)`.
 
-- Close may wait for an inject that has already entered ingress (`inject_in_flight`)
-  to finish, then requires `inject_in_flight == 0` before destroying cache/mutex.
-- Close does **not** support fully concurrent inject vs close: a thread blocked
-  waiting to acquire `ingress_mu` is outside `inject_in_flight` and must be
-  joined first.
+- Close waits for an already-admitted inject until its entire submit path,
+  including a deferred `RelayDeliveryFn` invocation outside `ingress_mu`, has
+  returned (`inject_in_flight` stays elevated across that callback).
+- Close does **not** support arbitrary concurrent inject-vs-close for threads
+  that have not yet acquired `ingress_mu` / incremented `inject_in_flight`;
+  those threads must be stopped and joined first.
 - Production `relay_run` owns its stack `RelayCtx`; RX exits before cleanup, so
   there is no external inject-after-shutdown pointer problem.

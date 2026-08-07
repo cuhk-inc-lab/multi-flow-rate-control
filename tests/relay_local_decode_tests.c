@@ -6,8 +6,10 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_failures = 0;
@@ -228,7 +230,7 @@ static void test_local_copy_end_matches_source(void)
     uint8_t got[512];
     size_t got_len = 0;
     uint16_t i;
-    const LocalDecodeHubStats *hst;
+    LocalDecodeHubStats hst;
 
     for (i = 0; i < sizeof(plaintext); i++) {
         plaintext[i] = (uint8_t)(i * 17u + 3u);
@@ -271,9 +273,9 @@ static void test_local_copy_end_matches_source(void)
     EXPECT(got_len == sizeof(plaintext));
     EXPECT(memcmp(got, plaintext, sizeof(plaintext)) == 0);
 
-    hst = local_decode_hub_stats(&hub);
-    EXPECT(hst != NULL && hst->flow_rejected == 0 &&
-           hst->metadata_mismatch == 0);
+    EXPECT(local_decode_hub_get_stats(&hub, &hst) == 0);
+    EXPECT(hst.flow_rejected == 0 &&
+           hst.metadata_mismatch == 0);
 
     relay_harness_close(ctx);
     local_decode_hub_destroy(&hub);
@@ -523,7 +525,7 @@ static void test_single_output_still_rejects_second_flow(void)
     uint8_t datagrams[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
     size_t lens[PACKAGES_PER_ENCODE_BLOCK];
     uint16_t shards = 0;
-    const LocalDecodeHubStats *hst;
+    LocalDecodeHubStats hst;
 
     memset(plaintext, 0x33, sizeof(plaintext));
     memset(&cap, 0, sizeof(cap));
@@ -555,8 +557,8 @@ static void test_single_output_still_rejects_second_flow(void)
            RELAY_INGRESS_OK);
     wait_local(ctx, 2, 1000);
 
-    hst = local_decode_hub_stats(&hub);
-    EXPECT(hst != NULL && hst->flow_rejected >= 1);
+    EXPECT(local_decode_hub_get_stats(&hub, &hst) == 0);
+    EXPECT(hst.flow_rejected >= 1);
     EXPECT(local_decode_hub_strict_check(&hub) != 0);
 
     relay_harness_close(ctx);
@@ -622,7 +624,7 @@ static void test_delivery_rejects_nonlocal_final_dst(void)
     WireHeader hdr;
     uint8_t got[64];
     size_t got_len = 0;
-    const LocalDecodeHubStats *hst;
+    LocalDecodeHubStats hst;
 
     memset(plaintext, 0x55, sizeof(plaintext));
     unlink(out_path);
@@ -640,9 +642,9 @@ static void test_delivery_rejects_nonlocal_final_dst(void)
     EXPECT(hdr.final_dst == 2);
     EXPECT(local_decode_hub_delivery(datagrams[0], lens[0], &hdr, &hub) == -1);
 
-    hst = local_decode_hub_stats(&hub);
-    EXPECT(hst != NULL && hst->metadata_mismatch >= 1);
-    EXPECT(hst->delivered == 0);
+    EXPECT(local_decode_hub_get_stats(&hub, &hst) == 0);
+    EXPECT(hst.metadata_mismatch >= 1);
+    EXPECT(hst.delivered == 0);
     EXPECT(local_decode_hub_active_count(&hub) == 0);
     EXPECT(read_file(out_path, got, sizeof(got), &got_len) == 0);
     EXPECT(got_len == 0);
@@ -665,7 +667,7 @@ static void test_output_io_failure_sets_ingest_error(void)
     size_t end_len;
     WireHeader hdr;
     uint16_t i;
-    const LocalDecodeHubStats *hst;
+    LocalDecodeHubStats hst;
     int saw_err = 0;
 
     memset(plaintext, 0x66, sizeof(plaintext));
@@ -699,8 +701,8 @@ static void test_output_io_failure_sets_ingest_error(void)
         (void)local_decode_hub_delivery(endbuf, end_len, &hdr, &hub);
     }
 
-    hst = local_decode_hub_stats(&hub);
-    EXPECT(hst != NULL && hst->ingest_error >= 1);
+    EXPECT(local_decode_hub_get_stats(&hub, &hst) == 0);
+    EXPECT(hst.ingest_error >= 1);
     EXPECT(local_decode_hub_strict_check(&hub) != 0);
 
     local_decode_hub_destroy(&hub);
@@ -1034,7 +1036,7 @@ static void test_output_dir_capacity_reject(void)
     size_t lens[PACKAGES_PER_ENCODE_BLOCK];
     uint16_t shards = 0;
     uint32_t i;
-    const LocalDecodeHubStats *hst;
+    LocalDecodeHubStats hst;
     RelayIngressStatus st;
 
     memset(plaintext, 0x44, sizeof(plaintext));
@@ -1073,8 +1075,8 @@ static void test_output_dir_capacity_reject(void)
     EXPECT(st == RELAY_INGRESS_OK);
     wait_local(ctx, RELAY_MAX_FLOWS + 1u, 1000);
 
-    hst = local_decode_hub_stats(&hub);
-    EXPECT(hst != NULL && hst->flow_rejected >= 1);
+    EXPECT(local_decode_hub_get_stats(&hub, &hst) == 0);
+    EXPECT(hst.flow_rejected >= 1);
     EXPECT(local_decode_hub_active_count(&hub) == RELAY_MAX_FLOWS);
     EXPECT(tx_capture_count(&cap) == 0);
     EXPECT(generation_cache_count(relay_generation_cache(ctx)) == 0);
@@ -1174,6 +1176,369 @@ static void test_output_dir_rejects_nonlocal_delivery(void)
     multi_dir_cleanup();
 }
 
+/* ---- P0A: local delivery outside ingress_mu ---- */
+
+typedef struct BlockingDeliveryCtx {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             entered;
+    int             release;
+    int             seen;
+} BlockingDeliveryCtx;
+
+static int blocking_local_delivery(const uint8_t *datagram, size_t len,
+                                   const WireHeader *hdr, void *ctx)
+{
+    BlockingDeliveryCtx *bc = ctx;
+
+    (void)datagram;
+    (void)len;
+    (void)hdr;
+    pthread_mutex_lock(&bc->mu);
+    bc->entered = 1;
+    bc->seen++;
+    pthread_cond_broadcast(&bc->cv);
+    while (!bc->release) {
+        pthread_cond_wait(&bc->cv, &bc->mu);
+    }
+    pthread_mutex_unlock(&bc->mu);
+    return 0;
+}
+
+typedef struct LocalInjectArg {
+    RelayCtx *ctx;
+    uint8_t   buf[RELAY_MAX_DATAGRAM];
+    size_t    len;
+    int       done;
+    RelayIngressStatus st;
+} LocalInjectArg;
+
+static void *local_inject_thread(void *arg)
+{
+    LocalInjectArg *a = arg;
+
+    a->st = relay_inject_wire_datagram(a->ctx, a->buf, a->len);
+    a->done = 1;
+    return NULL;
+}
+
+static void test_local_delivery_does_not_hold_ingress_mu(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg;
+    BlockingDeliveryCtx bc;
+    LocalInjectArg larg;
+    pthread_t th;
+    uint8_t remote[WIRE_HEADER_SIZE + 16];
+    size_t remote_len;
+    WireHeader rhdr;
+    int waited;
+
+    memset(&bc, 0, sizeof(bc));
+    pthread_mutex_init(&bc.mu, NULL);
+    pthread_cond_init(&bc.cv, NULL);
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_FORWARD);
+    cfg.delivery_fn = blocking_local_delivery;
+    cfg.delivery_ctx = &bc;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    memset(&larg, 0, sizeof(larg));
+    larg.ctx = ctx;
+    larg.len = make_end(larg.buf, sizeof(larg.buf), 1, 0, 8, 4, 8);
+    EXPECT(larg.len == WIRE_HEADER_SIZE);
+    EXPECT(pthread_create(&th, NULL, local_inject_thread, &larg) == 0);
+
+    pthread_mutex_lock(&bc.mu);
+    waited = 0;
+    while (!bc.entered && waited < 2000) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        (void)pthread_cond_timedwait(&bc.cv, &bc.mu, &ts);
+        waited++;
+    }
+    EXPECT(bc.entered == 1);
+    pthread_mutex_unlock(&bc.mu);
+
+    /* While local callback is blocked, non-local inject must still forward. */
+    remote_len =
+        make_end(remote, sizeof(remote), 2, 0, 8, 9, 5); /* final_dst=9 */
+    EXPECT(remote_len == WIRE_HEADER_SIZE);
+    EXPECT(relay_inject_wire_datagram(ctx, remote, remote_len) ==
+           RELAY_INGRESS_OK);
+    wait_forward(ctx, 1, 2000);
+    {
+        uint8_t captured[RELAY_MAX_DATAGRAM];
+        size_t captured_len = 0;
+
+        pthread_mutex_lock(&cap.mu);
+        EXPECT(cap.count == 1);
+        if (cap.count >= 1 && cap.lens[0] <= sizeof(captured)) {
+            memcpy(captured, cap.packets[0], cap.lens[0]);
+            captured_len = cap.lens[0];
+        }
+        pthread_mutex_unlock(&cap.mu);
+        EXPECT(captured_len == WIRE_HEADER_SIZE);
+        EXPECT(wire_header_decode(&rhdr, captured, captured_len) == 0);
+        EXPECT(rhdr.ttl == 4); /* 5 - 1 */
+        EXPECT(rhdr.final_dst == 9);
+    }
+
+    pthread_mutex_lock(&bc.mu);
+    bc.release = 1;
+    pthread_cond_broadcast(&bc.cv);
+    pthread_mutex_unlock(&bc.mu);
+    EXPECT(pthread_join(th, NULL) == 0);
+    EXPECT(larg.done == 1);
+    EXPECT(larg.st == RELAY_INGRESS_OK);
+    EXPECT(relay_total_stats(ctx)->local_deliver >= 1);
+    EXPECT(relay_total_stats(ctx)->forward == 1);
+
+    relay_harness_close(ctx);
+    pthread_mutex_destroy(&bc.mu);
+    pthread_cond_destroy(&bc.cv);
+    pthread_mutex_destroy(&cap.mu);
+}
+
+typedef struct CloseThreadArg {
+    RelayCtx       *ctx;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             close_returned;
+} CloseThreadArg;
+
+static void *harness_close_thread(void *arg)
+{
+    CloseThreadArg *a = arg;
+
+    relay_harness_close(a->ctx);
+    a->ctx = NULL; /* ctx freed; do not touch again */
+    pthread_mutex_lock(&a->mu);
+    a->close_returned = 1;
+    pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->mu);
+    return NULL;
+}
+
+/*
+ * P0A: close must wait for an already-admitted inject whose deferred local
+ * delivery is still running outside ingress_mu. Does not cover injectors that
+ * have not yet incremented inject_in_flight.
+ */
+static void test_harness_close_waits_for_deferred_local_delivery(void)
+{
+    RelayCtx *ctx = NULL;
+    RelayConfig cfg;
+    BlockingDeliveryCtx bc;
+    LocalInjectArg larg;
+    CloseThreadArg carg;
+    pthread_t inject_th;
+    pthread_t close_th;
+    int waited;
+    int close_seen_early;
+
+    memset(&bc, 0, sizeof(bc));
+    pthread_mutex_init(&bc.mu, NULL);
+    pthread_cond_init(&bc.cv, NULL);
+
+    memset(&carg, 0, sizeof(carg));
+    pthread_mutex_init(&carg.mu, NULL);
+    pthread_cond_init(&carg.cv, NULL);
+
+    cfg = harness_cfg(4, RELAY_PROCESS_FORWARD);
+    cfg.delivery_fn = blocking_local_delivery;
+    cfg.delivery_ctx = &bc;
+    cfg.reject_local_encoder_loopback = 0;
+    EXPECT(relay_harness_open(&ctx, &cfg, NULL, NULL) == RELAY_OK);
+
+    memset(&larg, 0, sizeof(larg));
+    larg.ctx = ctx;
+    larg.len = make_end(larg.buf, sizeof(larg.buf), 1, 0, 8, 4, 8);
+    EXPECT(larg.len == WIRE_HEADER_SIZE);
+    EXPECT(pthread_create(&inject_th, NULL, local_inject_thread, &larg) == 0);
+
+    /* Wait until deferred delivery has entered (ingress_mu already released). */
+    pthread_mutex_lock(&bc.mu);
+    waited = 0;
+    while (!bc.entered && waited < 2000) {
+        struct timespec ts;
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        (void)pthread_cond_timedwait(&bc.cv, &bc.mu, &ts);
+        waited++;
+    }
+    EXPECT(bc.entered == 1);
+    EXPECT(bc.seen == 1);
+    pthread_mutex_unlock(&bc.mu);
+
+    /* Stats only before close starts destroying ctx. */
+    EXPECT(relay_total_stats(ctx)->local_deliver >= 1);
+
+    carg.ctx = ctx;
+    ctx = NULL; /* ownership moves to close thread */
+    EXPECT(pthread_create(&close_th, NULL, harness_close_thread, &carg) == 0);
+
+    /*
+     * Sync window: close must not return while deferred callback is blocked.
+     * Use timed waits on close_cv (signaled only when close returns).
+     */
+    pthread_mutex_lock(&carg.mu);
+    close_seen_early = 0;
+    waited = 0;
+    while (!carg.close_returned && waited < 50) {
+        struct timespec ts;
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        (void)pthread_cond_timedwait(&carg.cv, &carg.mu, &ts);
+        waited++;
+    }
+    close_seen_early = carg.close_returned;
+    EXPECT(close_seen_early == 0);
+    pthread_mutex_unlock(&carg.mu);
+
+    /* Release deferred callback; inject then close should complete. */
+    pthread_mutex_lock(&bc.mu);
+    bc.release = 1;
+    pthread_cond_broadcast(&bc.cv);
+    pthread_mutex_unlock(&bc.mu);
+
+    EXPECT(pthread_join(inject_th, NULL) == 0);
+    EXPECT(larg.done == 1);
+    EXPECT(larg.st == RELAY_INGRESS_OK);
+
+    EXPECT(pthread_join(close_th, NULL) == 0);
+    pthread_mutex_lock(&carg.mu);
+    EXPECT(carg.close_returned == 1);
+    pthread_mutex_unlock(&carg.mu);
+
+    /* Independent of freed RelayCtx. */
+    EXPECT(bc.seen == 1);
+
+    pthread_mutex_destroy(&bc.mu);
+    pthread_cond_destroy(&bc.cv);
+    pthread_mutex_destroy(&carg.mu);
+    pthread_cond_destroy(&carg.cv);
+}
+
+static atomic_int g_lock_depth;
+static atomic_int g_lock_max;
+
+void local_decode_test_locked_enter(void)
+{
+    int d = atomic_fetch_add_explicit(&g_lock_depth, 1, memory_order_relaxed) + 1;
+    int cur_max;
+
+    do {
+        cur_max = atomic_load_explicit(&g_lock_max, memory_order_relaxed);
+        if (d <= cur_max) {
+            break;
+        }
+    } while (!atomic_compare_exchange_weak_explicit(
+        &g_lock_max, &cur_max, d, memory_order_relaxed, memory_order_relaxed));
+    usleep(2000);
+}
+
+void local_decode_test_locked_leave(void)
+{
+    atomic_fetch_sub_explicit(&g_lock_depth, 1, memory_order_relaxed);
+}
+
+typedef struct HubDeliveryArg {
+    LocalDecodeHub *hub;
+    uint8_t         buf[RELAY_MAX_DATAGRAM];
+    size_t          len;
+    WireHeader      hdr;
+    int             rc;
+} HubDeliveryArg;
+
+static void *hub_delivery_thread(void *arg)
+{
+    HubDeliveryArg *a = arg;
+
+    a->rc = local_decode_hub_delivery(a->buf, a->len, &a->hdr, a->hub);
+    return NULL;
+}
+
+static void test_local_decode_hub_serializes_delivery(void)
+{
+    LocalDecodeHub hub;
+    LocalDecodeHubConfig hcfg;
+    const char *out_path = "build/relay_ld_p0a_serial.bin";
+    uint8_t plaintext[64];
+    uint8_t d0[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    uint8_t d1[PACKAGES_PER_ENCODE_BLOCK][RELAY_MAX_DATAGRAM];
+    size_t l0[PACKAGES_PER_ENCODE_BLOCK];
+    size_t l1[PACKAGES_PER_ENCODE_BLOCK];
+    uint16_t s0 = 0;
+    uint16_t s1 = 0;
+    HubDeliveryArg a0;
+    HubDeliveryArg a1;
+    pthread_t t0;
+    pthread_t t1;
+
+    memset(plaintext, 0x7a, sizeof(plaintext));
+    unlink(out_path);
+    atomic_store(&g_lock_depth, 0);
+    atomic_store(&g_lock_max, 0);
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
+    /* Reuse multi dir for two-flow concurrent delivery into hub. */
+    EXPECT(multi_dir_prepare() == 0);
+    hcfg.codec_kind = CODEC_KIND_COPY;
+    hcfg.output_dir = k_multi_dir;
+    hcfg.local_node_id = 4;
+    EXPECT(local_decode_hub_init(&hub, &hcfg) == 0);
+
+    EXPECT(build_copy_block_datagrams(d0, l0, &s0, plaintext, sizeof(plaintext),
+                                      101, 0, 4, 8) == 0);
+    EXPECT(build_copy_block_datagrams(d1, l1, &s1, plaintext, sizeof(plaintext),
+                                      202, 0, 4, 8) == 0);
+
+    memset(&a0, 0, sizeof(a0));
+    memset(&a1, 0, sizeof(a1));
+    a0.hub = &hub;
+    a1.hub = &hub;
+    memcpy(a0.buf, d0[0], l0[0]);
+    a0.len = l0[0];
+    memcpy(a1.buf, d1[0], l1[0]);
+    a1.len = l1[0];
+    EXPECT(wire_header_decode(&a0.hdr, a0.buf, a0.len) == 0);
+    EXPECT(wire_header_decode(&a1.hdr, a1.buf, a1.len) == 0);
+
+    EXPECT(pthread_create(&t0, NULL, hub_delivery_thread, &a0) == 0);
+    EXPECT(pthread_create(&t1, NULL, hub_delivery_thread, &a1) == 0);
+    EXPECT(pthread_join(t0, NULL) == 0);
+    EXPECT(pthread_join(t1, NULL) == 0);
+    EXPECT(a0.rc == 0);
+    EXPECT(a1.rc == 0);
+    EXPECT(atomic_load(&g_lock_max) == 1);
+    EXPECT(local_decode_hub_active_count(&hub) == 2);
+
+    local_decode_hub_destroy(&hub);
+    multi_dir_cleanup();
+    (void)out_path;
+}
+
 int main(void)
 {
     if (mkdir("build", 0755) != 0) {
@@ -1197,6 +1562,10 @@ int main(void)
     test_output_dir_capacity_reject();
     test_output_dir_local_only();
     test_output_dir_rejects_nonlocal_delivery();
+
+    test_local_delivery_does_not_hold_ingress_mu();
+    test_harness_close_waits_for_deferred_local_delivery();
+    test_local_decode_hub_serializes_delivery();
 
     if (g_failures != 0) {
         fprintf(stderr, "relay_local_decode_tests: %d failure(s)\n", g_failures);

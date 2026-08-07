@@ -124,7 +124,6 @@ int main(int argc, char **argv)
     const char *output_dir = NULL;
     int hub_inited = 0;
     RelayStatus st;
-    const LocalDecodeHubStats *hub_stats;
 
     memset(&cfg, 0, sizeof(cfg));
     memset(&hub, 0, sizeof(hub));
@@ -340,16 +339,17 @@ int main(int argc, char **argv)
     st = relay_run(&cfg);
 
     if (hub_inited) {
-        hub_stats = local_decode_hub_stats(&hub);
-        if (hub_stats != NULL) {
+        LocalDecodeHubStats hub_stats_snap;
+
+        if (local_decode_hub_get_stats(&hub, &hub_stats_snap) == 0) {
             fprintf(stderr,
                     "wire-relay local-decode: delivered=%llu "
                     "metadata_mismatch=%llu flow_rejected=%llu "
                     "ingest_error=%llu active=%zu complete=%d\n",
-                    (unsigned long long)hub_stats->delivered,
-                    (unsigned long long)hub_stats->metadata_mismatch,
-                    (unsigned long long)hub_stats->flow_rejected,
-                    (unsigned long long)hub_stats->ingest_error,
+                    (unsigned long long)hub_stats_snap.delivered,
+                    (unsigned long long)hub_stats_snap.metadata_mismatch,
+                    (unsigned long long)hub_stats_snap.flow_rejected,
+                    (unsigned long long)hub_stats_snap.ingest_error,
                     local_decode_hub_active_count(&hub),
                     local_decode_hub_is_complete(&hub));
         }

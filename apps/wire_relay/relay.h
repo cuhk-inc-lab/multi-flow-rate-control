@@ -28,6 +28,17 @@ typedef enum {
 
 typedef int (*RelayDeliveryFn)(const uint8_t *datagram, size_t len,
                                const WireHeader *hdr, void *ctx);
+/*
+ * Local-destination delivery callback (final_dst == local_node_id).
+ *
+ * Invoked AFTER RelayCtx.ingress_mu is released. Do not assume ingress_mu is
+ * held. Thread-safety is the callback owner's responsibility (LocalDecodeHub
+ * serializes via its own mutex). Codec recover/decode and file I/O must not
+ * run under ingress_mu.
+ *
+ * Behavior change vs early Phase-1/2: delivery is no longer serialized by
+ * ingress_mu alone.
+ */
 
 /* Optional TX capture for tests; when set, sendto is skipped. */
 typedef void (*RelayTxCaptureFn)(const uint8_t *datagram, size_t len,
@@ -64,6 +75,7 @@ typedef struct RelayConfig {
      */
     RelayRecodeFn       recode_fn;
     void               *recode_ctx;
+    /* See RelayDeliveryFn: runs outside ingress_mu (P0A). */
     RelayDeliveryFn     delivery_fn;
     void               *delivery_ctx;
     RelayProcessMode    process_mode; /* default FORWARD */
@@ -120,12 +132,15 @@ uint64_t relay_mono_ns(void);
  * In-process harness (no listen socket). TX calls capture_fn instead of
  * sendto when capture_fn != NULL. Used by Phase-2 unit tests.
  *
- * Lifecycle: relay_harness_close(ctx) may be called only after the caller has
- * stopped and joined every thread that might call
- * relay_inject_wire_datagram(ctx, ...). Close waits for injects that already
- * hold ingress_mu / are inside submit, then requires inject_in_flight == 0
- * before destroying mutex/cache. It does NOT support arbitrary concurrent
- * inject vs close (threads blocked waiting for ingress_mu are not covered).
+ * Lifecycle:
+ * relay_harness_close() waits for an already-admitted inject until its
+ * entire submit path, including a deferred RelayDeliveryFn invocation
+ * outside ingress_mu, has returned.
+ *
+ * It still does NOT support arbitrary concurrent inject-vs-close for
+ * threads that have not yet acquired ingress_mu / incremented
+ * inject_in_flight. Callers must stop and join all potential injectors
+ * before close.
  */
 RelayStatus relay_harness_open(RelayCtx **out, const RelayConfig *config,
                                RelayTxCaptureFn capture_fn, void *capture_ctx);

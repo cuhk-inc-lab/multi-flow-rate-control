@@ -269,13 +269,48 @@ static int enqueue_forward(RelayCtx *ctx, RelayFlowStats *slot,
 }
 
 /*
- * Takes ownership of *datagram_owned on all paths (frees or moves to egress).
- * Caller must hold ingress_mu.
+ * Local delivery selected under ingress_mu, executed after unlock (P0A).
+ * When active != 0, caller owns datagram and must free it after callback.
+ */
+typedef struct DeferredLocalDelivery {
+    int              active;
+    RelayDeliveryFn  fn;
+    void            *ctx;
+    WireHeader       header;
+    uint8_t         *datagram;
+    size_t           len;
+} DeferredLocalDelivery;
+
+static void run_deferred_local_delivery(DeferredLocalDelivery *deferred)
+{
+    if (deferred == NULL || !deferred->active) {
+        return;
+    }
+    if (deferred->fn != NULL && deferred->datagram != NULL) {
+        (void)deferred->fn(deferred->datagram, deferred->len, &deferred->header,
+                           deferred->ctx);
+    }
+    free(deferred->datagram);
+    deferred->datagram = NULL;
+    deferred->active = 0;
+    deferred->fn = NULL;
+    deferred->ctx = NULL;
+    deferred->len = 0;
+}
+
+/*
+ * Takes ownership of *datagram_owned on all paths that do not defer local
+ * delivery (frees or moves to egress). When deferred->active is set, ownership
+ * of the local datagram moves into *deferred for the caller to free after the
+ * callback (outside ingress_mu).
+ *
+ * Caller must hold ingress_mu. Must NOT invoke delivery_fn here.
  */
 static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
                                                uint8_t **datagram_owned,
                                                size_t len,
-                                               RelayPacketSource source)
+                                               RelayPacketSource source,
+                                               DeferredLocalDelivery *deferred)
 {
     WireHeader header;
     RelayFlowStats *slot;
@@ -286,6 +321,10 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
     GenerationEntry *gen = NULL;
     GenerationInsertStatus insert_st = GEN_INSERT_INVALID;
     RelayProcessAction action = RELAY_PROCESS_CONTINUE_FORWARD;
+
+    if (deferred != NULL) {
+        memset(deferred, 0, sizeof(*deferred));
+    }
 
     if (ctx == NULL || datagram_owned == NULL || *datagram_owned == NULL ||
         len < WIRE_HEADER_SIZE) {
@@ -329,9 +368,18 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
     if (wire_header_is_local(&header, ctx->config.local_node_id)) {
         slot->local_deliver++;
         ctx->total.local_deliver++;
-        if (ctx->config.delivery_fn != NULL) {
-            (void)ctx->config.delivery_fn(datagram, len, &header,
-                                          ctx->config.delivery_ctx);
+        /*
+         * Select local delivery under ingress_mu; run callback after unlock.
+         * Do not TTL--, cache, enqueue, or TX.
+         */
+        if (ctx->config.delivery_fn != NULL && deferred != NULL) {
+            deferred->active = 1;
+            deferred->fn = ctx->config.delivery_fn;
+            deferred->ctx = ctx->config.delivery_ctx;
+            deferred->header = header;
+            deferred->datagram = datagram;
+            deferred->len = len;
+            return RELAY_INGRESS_OK;
         }
         free(datagram);
         return RELAY_INGRESS_OK;
@@ -427,6 +475,7 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
 {
     uint8_t *owned;
     RelayIngressStatus st;
+    DeferredLocalDelivery deferred;
 
     if (ctx == NULL || datagram == NULL || len < WIRE_HEADER_SIZE ||
         len > RELAY_MAX_DATAGRAM) {
@@ -438,6 +487,7 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
         return RELAY_INGRESS_ERR_ALLOC;
     }
     memcpy(owned, datagram, len);
+    memset(&deferred, 0, sizeof(deferred));
 
     pthread_mutex_lock(&ctx->ingress_mu);
     if (ctx->stop) {
@@ -446,7 +496,18 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
         return RELAY_INGRESS_ERR_SHUTDOWN;
     }
     ctx->inject_in_flight++;
-    st = ingress_submit_owned(ctx, &owned, len, RELAY_SRC_LOCAL_ENCODER);
+    st = ingress_submit_owned(ctx, &owned, len, RELAY_SRC_LOCAL_ENCODER,
+                              &deferred);
+    /*
+     * P0A: release ingress_mu before local delivery (decode/I/O). Keep
+     * inject_in_flight elevated so harness close still waits for callback.
+     * Lock order: never take hub->mu while holding ingress_mu.
+     */
+    if (deferred.active) {
+        pthread_mutex_unlock(&ctx->ingress_mu);
+        run_deferred_local_delivery(&deferred);
+        pthread_mutex_lock(&ctx->ingress_mu);
+    }
     ctx->inject_in_flight--;
     if (ctx->inject_in_flight == 0) {
         pthread_cond_broadcast(&ctx->ingress_idle);
@@ -806,10 +867,17 @@ RelayStatus relay_run(const RelayConfig *config)
         }
         memcpy(owned, rxbuf, (size_t)received);
 
-        pthread_mutex_lock(&ctx.ingress_mu);
-        (void)ingress_submit_owned(&ctx, &owned, (size_t)received,
-                                   RELAY_SRC_PREVIOUS_NODE);
-        pthread_mutex_unlock(&ctx.ingress_mu);
+        {
+            DeferredLocalDelivery deferred;
+
+            memset(&deferred, 0, sizeof(deferred));
+            pthread_mutex_lock(&ctx.ingress_mu);
+            (void)ingress_submit_owned(&ctx, &owned, (size_t)received,
+                                       RELAY_SRC_PREVIOUS_NODE, &deferred);
+            pthread_mutex_unlock(&ctx.ingress_mu);
+            /* P0A: local decode/I/O outside ingress_mu (RX still waits). */
+            run_deferred_local_delivery(&deferred);
+        }
     }
 
     ctx.stop = 1;
