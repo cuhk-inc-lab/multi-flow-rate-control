@@ -1,6 +1,6 @@
 # wire_relay
 
-Single-threaded opaque UDP relay for wire header **v3** (`final_dst` + `ttl`).
+Explicit-hop opaque UDP relay for wire header **v3** (`final_dst` + `ttl`).
 
 ## Build
 
@@ -11,17 +11,25 @@ make wire-relay
 
 Binary: `build/wire_relay`.
 
-## Role
+## Role (Phase 1)
 
 ```text
-recvfrom(listen)
+recvfrom(listen)  [or relay_inject_wire_datagram — wire-level only]
+  → copy into owned datagram
   → parse WireHeader
-  → if final_dst == local_node_id → local delivery callback (default: count only)
-  → else ttl-- → sendto(next-hop)   # payload unchanged
+  → if final_dst == local_node_id → local delivery callback (default: count)
+  → else ttl-- (wire_header_encode back into datagram bytes)
+  → move datagram into global EgressQueue (no second memcpy)
+  → TX worker: sendto(next-hop) using datagram bytes only; free
 ```
 
-Does **not** encode, decode, or recode. Optional `RelayRecodeFn` exists but is
-disabled by default (`NULL`).
+- Does **not** encode/decode.
+- `relay_inject_wire_datagram()` accepts **already encoded wire v3 datagrams**
+  only (not raw local data → encoder).
+- Optional `RelayRecodeFn` remains disabled by default (`NULL`).
+- GenerationCache / true network recode: later phases (3A decode-reencode;
+  3B needs a future wire version with coding vectors).
+  See [`docs/WIRE_RELAY_PIPELINE.md`](../../docs/WIRE_RELAY_PIPELINE.md).
 
 ## CLI
 
@@ -30,7 +38,8 @@ disabled by default (`NULL`).
   --local-node-id 2 \
   --listen 9000 \
   --next-hop 10.10.23.2:9000 \
-  [--idle-exit-sec N]
+  [--idle-exit-sec N] \
+  [--egress-capacity N]
 ```
 
 | Flag | Meaning |
@@ -39,6 +48,7 @@ disabled by default (`NULL`).
 | `--listen` | UDP bind port |
 | `--next-hop` | `HOST:PORT` for non-local forward |
 | `--idle-exit-sec` | Optional; exit after N seconds with no RX (tests) |
+| `--egress-capacity` | Global EgressQueue slots (default 4096) |
 
 ## Four-VM linear path
 

@@ -9,12 +9,14 @@ static void print_usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s --local-node-id N --listen PORT --next-hop HOST:PORT "
-            "[--idle-exit-sec N]\n"
+            "[--idle-exit-sec N] [--egress-capacity N]\n"
             "\n"
-            "Single-threaded opaque UDP relay (wire header v3).\n"
-            "Performs destination check on final_dst, decrements ttl on "
-            "forward, and sendto(next-hop).\n"
-            "Does not encode/decode/recode payload (recode hook disabled).\n",
+            "Explicit-hop opaque UDP relay (wire header v3).\n"
+            "RX -> destination check(final_dst) -> TTL-- -> global EgressQueue "
+            "-> TX sendto(next-hop).\n"
+            "Local injection API (relay_inject_wire_datagram) accepts only "
+            "already-encoded wire v3 datagrams.\n"
+            "Does not encode/decode; recode hook default disabled.\n",
             prog);
 }
 
@@ -55,6 +57,7 @@ int main(int argc, char **argv)
     uint16_t listen_port = 0;
     uint16_t next_hop_port = 0;
     unsigned idle_exit_sec = 0;
+    size_t egress_capacity = RELAY_DEFAULT_EGRESS_CAPACITY;
     int argi = 1;
     int have_next_hop = 0;
 
@@ -123,6 +126,21 @@ int main(int argc, char **argv)
             }
             idle_exit_sec = (unsigned)parsed;
             argi += 2;
+        } else if (strcmp(argv[argi], "--egress-capacity") == 0) {
+            char *end = NULL;
+            unsigned long parsed;
+
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            parsed = strtoul(argv[argi + 1], &end, 10);
+            if (end == argv[argi + 1] || *end != '\0' || parsed == 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            egress_capacity = (size_t)parsed;
+            argi += 2;
         } else {
             print_usage(argv[0]);
             return EXIT_FAILURE;
@@ -141,6 +159,8 @@ int main(int argc, char **argv)
     cfg.recode_fn = NULL;
     cfg.delivery_fn = NULL;
     cfg.idle_exit_sec = idle_exit_sec;
+    cfg.egress_capacity = egress_capacity;
+    cfg.reject_local_encoder_loopback = 1;
 
     return relay_run(&cfg) == RELAY_OK ? EXIT_SUCCESS : EXIT_FAILURE;
 }

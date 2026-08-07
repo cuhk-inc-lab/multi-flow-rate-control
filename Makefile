@@ -91,7 +91,8 @@ WG_TEST_OUT2 = $(OBJ_DIR)/wg_test_out2.ts
 RELAY_OBJS = \
 	$(OBJ_DIR)/relay_main.o \
 	$(OBJ_DIR)/relay_relay.o \
-	$(OBJ_DIR)/relay_recode.o
+	$(OBJ_DIR)/relay_recode.o \
+	$(OBJ_DIR)/relay_egress_queue.o
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
