@@ -3,6 +3,7 @@
 #include "egress_queue.h"
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
@@ -656,7 +657,29 @@ void relay_harness_close(RelayCtx *ctx)
     if (ctx == NULL) {
         return;
     }
-    /* stop + cache destroy happen under ingress_mu inside relay_ctx_cleanup. */
+
+    /*
+     * Caller must have joined all injector threads. Wait only for injects that
+     * already entered submit (hold ingress_mu); then require idle before
+     * destroy. Does not cover threads still blocked acquiring ingress_mu.
+     */
+    pthread_mutex_lock(&ctx->ingress_mu);
+    while (ctx->inject_in_flight > 0) {
+        pthread_cond_wait(&ctx->ingress_idle, &ctx->ingress_mu);
+    }
+#ifndef NDEBUG
+    assert(ctx->inject_in_flight == 0);
+#else
+    if (ctx->inject_in_flight != 0) {
+        fprintf(stderr,
+                "wire-relay: harness_close with inject_in_flight=%d "
+                "(join all injectors before close)\n",
+                ctx->inject_in_flight);
+        abort();
+    }
+#endif
+    pthread_mutex_unlock(&ctx->ingress_mu);
+
     relay_ctx_cleanup(ctx);
     free(ctx);
 }

@@ -119,6 +119,13 @@ uint64_t relay_mono_ns(void);
 /*
  * In-process harness (no listen socket). TX calls capture_fn instead of
  * sendto when capture_fn != NULL. Used by Phase-2 unit tests.
+ *
+ * Lifecycle: relay_harness_close(ctx) may be called only after the caller has
+ * stopped and joined every thread that might call
+ * relay_inject_wire_datagram(ctx, ...). Close waits for injects that already
+ * hold ingress_mu / are inside submit, then requires inject_in_flight == 0
+ * before destroying mutex/cache. It does NOT support arbitrary concurrent
+ * inject vs close (threads blocked waiting for ingress_mu are not covered).
  */
 RelayStatus relay_harness_open(RelayCtx **out, const RelayConfig *config,
                                RelayTxCaptureFn capture_fn, void *capture_ctx);

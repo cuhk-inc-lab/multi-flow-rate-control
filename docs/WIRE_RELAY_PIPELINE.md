@@ -108,3 +108,19 @@ Per `(flow_id, block_id)` entry:
 - Eviction: LRU / oldest `last_update_ns` to satisfy per-flow, global count, or
   byte limits → `gen_evicted++`. Prefer same-flow victims when the per-flow
   limit is the binding constraint.
+
+### Test harness lifecycle
+
+`relay_harness_open` / `relay_harness_close` are for in-process unit tests
+(no listen socket; optional TX capture).
+
+**Contract:** call `relay_harness_close(ctx)` only after the caller has stopped
+and **joined** every thread that might call `relay_inject_wire_datagram(ctx, ...)`.
+
+- Close may wait for an inject that has already entered ingress (`inject_in_flight`)
+  to finish, then requires `inject_in_flight == 0` before destroying cache/mutex.
+- Close does **not** support fully concurrent inject vs close: a thread blocked
+  waiting to acquire `ingress_mu` is outside `inject_in_flight` and must be
+  joined first.
+- Production `relay_run` owns its stack `RelayCtx`; RX exits before cleanup, so
+  there is no external inject-after-shutdown pointer problem.
