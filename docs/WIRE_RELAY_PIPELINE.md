@@ -15,32 +15,43 @@ Generation key is `(flow_id, block_id)`. Do not invent a separate
 | Phase | Scope | Status |
 |-------|--------|--------|
 | **1** | Opaque multi-flow forward + global EgressQueue + wire-level inject | **Implemented** |
-| **2** | GenerationCache for DATA shards; END/control ordering | Future |
+| **2** | Copy-based GenerationCache + process hook; still opaque forward | **Implemented** |
 | **3A** | Decode-and-reencode relay (recover source, re-run current FEC encoder) | Future |
 | **3B** | True network recode | Future — requires new wire version |
 
-### Phase 1 (current)
+### Phase 1
 
 ```text
-UDP RX  ─┐
-         ├─► ingress_mu ─► dest check / TTL rewrite / process ─► EgressQueue
-inject  ─┘                                                      │
-                                                                ▼
-                                                         TX worker sendto
+UDP RX / inject → ingress_mu → dest check / TTL rewrite → EgressQueue → TX
 ```
 
-- No GenerationCache.
-- No real recode (`recode_fn` default `NULL` = FORWARD_ORIGINAL).
-- No changes to wire header, sender, receiver, or codec.
+### Phase 2
 
-### Phase 3A vs 3B (explicit split)
+```text
+UDP RX / inject
+  → ingress_mu
+  → dest check / TTL-- (encode into datagram)
+  → DATA + --process cache: copy into GenerationCache; process hook
+  → END/control: expire stale gens for flow; never cache; enqueue
+  → move current datagram → EgressQueue → TX
+```
 
-- **3A — decode-and-reencode:** After collecting enough recoverable shards for a
-  block, decode source, then call the **existing** FEC encoder to emit shards
-  recognizable by the current protocol. Possible **without** changing wire v3.
-- **3B — true network recode:** Arbitrary linear combinations at the relay.
-  **Not** claimable under wire v3. Requires a future wire version with coding
-  vector, coefficient seed, or equivalent metadata.
+Defaults:
+
+- `--process forward` — no cache (Phase 1 behavior).
+- `--process cache` — observe/store only; **still opaque-forward** every packet.
+- Limits: `gen_timeout_ms=500`, `max_gens=256`, `max_gens_per_flow=32`,
+  `max_cache_bytes=32MiB`.
+
+Cache copy and EgressPacket ownership are **independent**. On admission failure,
+default policy is **still forward** the current packet without caching
+(`gen_admission_failed++`).
+
+### Phase 3A vs 3B
+
+- **3A — decode-and-reencode:** After collecting enough recoverable shards,
+  decode source, re-run the existing FEC encoder. Possible on wire v3.
+- **3B — true network recode:** Needs a future wire version with coding vectors.
 
 ---
 
@@ -49,58 +60,51 @@ inject  ─┘                                                      │
 ### 1. Wire-level local injection
 
 `relay_inject_wire_datagram()` accepts an **already encoded** wire v3
-datagram only. It is **not** raw local data → encoder. Wiring raw bytes into
-the existing encoder remains separate integration work.
+datagram only. It is **not** raw local data → encoder.
 
 ### 2. No arbitrary network recode on wire v3
 
-See Phase 3A / 3B above. Phase 3 must not claim true network coding while the
-header stays v3.
+See Phase 3A / 3B.
 
 ### 3. TTL consistency: bytes are source of truth
 
-After TTL decrement, call `wire_header_encode()` so the on-wire datagram bytes
-match. TX worker sends **only** `EgressPacket.datagram[0..len)`; it must not
-rely on a separate in-memory header copy.
+After TTL decrement, call `wire_header_encode()`. TX sends datagram bytes only.
+Cache stores copies whose TTL is already decremented. Future recode outputs
+should use the **minimum** cached TTL; Phase 2 only records `min_ttl`.
 
-### 4. FORWARD_ORIGINAL: move, do not re-copy
+### 4. FORWARD_ORIGINAL: move for egress; copy for cache
 
-Ingress already owns `datagram`. Move ownership into `EgressPacket` /
-EgressQueue. TX frees after `sendto`. Extra copy-based paths are reserved for
-future GenerationCache only.
+Ingress moves the live datagram into EgressQueue. GenerationCache holds a
+separate `malloc` copy per shard.
 
 ### 5. Ingress thread safety
 
-UDP RX and local inject may both call ingress submit. Phase 1 serializes
-destination check, TTL rewrite, process, and enqueue under **`ingress_mu`**.
-Phase 2 GenerationCache must not be lock-free under multiple producers.
+`ingress_mu` serializes dest check, TTL rewrite, GenerationCache, process hook,
+and EgressQueue enqueue. TX worker never touches the cache.
 
-### 6. END / control vs GenerationCache (Phase 2+)
+### 6. END / control
 
-- DATA shards only enter cache keyed by `(flow_id, block_id)`.
-- END must wait until that flow’s prior cache is flushed, forwarded, or
-  explicitly dropped before entering EgressQueue.
-- Receiver must never see END before later recoded DATA of the same flow.
+- Never enter GenerationCache.
+- On END: expire timed-out gens for that flow, then enqueue END.
+- With a single global FIFO EgressQueue, DATA enqueued before END is sent first.
 
-### 7. GenerationCache consistency (Phase 2+)
+### 7. GenerationCache consistency
 
-For one cache entry:
+Per `(flow_id, block_id)` entry:
 
-- All packets must agree on `final_dst`, `shard_count`, and FEC/type semantics.
-- Drop duplicate `shard_index`.
-- If TTLs differ, future output TTL uses the **minimum already-decremented** TTL.
-- Never mix different `final_dst` into the same cache.
+- Agree on `final_dst`, `shard_count`, `type`, `valid_len`, `payload_len`.
+- Duplicate `shard_index`: do not overwrite; `gen_duplicate++`; still forward.
+- Metadata mismatch: refuse insert; `gen_metadata_mismatch++`; still forward.
+- Complete generation (`present_count == shard_count`) → `GEN_READY`; keep until
+  timeout/eviction; do **not** block opaque forward.
 
 ### 8. Monotonic timestamps
 
-Use `uint64_t` nanoseconds (`CLOCK_MONOTONIC`), not `double`.
+`uint64_t` nanoseconds (`CLOCK_MONOTONIC`), not `double`.
 
----
+### Eviction vs timeout
 
-## Phase 1 data path notes
-
-- RX: one copy from socket buffer into owned heap datagram; then move to egress.
-- Inject: one copy from caller buffer into owned heap; then same ingress path.
-- Optional `RelayRecodeFn` (if ever set) may allocate a new buffer and free the
-  original; default path does not.
-- CLI unchanged aside from optional `--egress-capacity`.
+- Timeout: idle beyond `gen_timeout_ms` → `gen_timeout++`.
+- Eviction: LRU / oldest `last_update_ns` to satisfy per-flow, global count, or
+  byte limits → `gen_evicted++`. Prefer same-flow victims when the per-flow
+  limit is the binding constraint.

@@ -11,25 +11,28 @@ make wire-relay
 
 Binary: `build/wire_relay`.
 
-## Role (Phase 1)
+## Role (Phase 1 + Phase 2)
 
 ```text
 recvfrom(listen)  [or relay_inject_wire_datagram — wire-level only]
   → copy into owned datagram
   → parse WireHeader
-  → if final_dst == local_node_id → local delivery callback (default: count)
+  → if final_dst == local_node_id → local delivery callback
   → else ttl-- (wire_header_encode back into datagram bytes)
-  → move datagram into global EgressQueue (no second memcpy)
+  → [--process cache] DATA only: copy into GenerationCache (observe)
+  → move current datagram into global EgressQueue (ownership move)
   → TX worker: sendto(next-hop) using datagram bytes only; free
 ```
 
-- Does **not** encode/decode.
-- `relay_inject_wire_datagram()` accepts **already encoded wire v3 datagrams**
-  only (not raw local data → encoder).
-- Optional `RelayRecodeFn` remains disabled by default (`NULL`).
-- GenerationCache / true network recode: later phases (3A decode-reencode;
-  3B needs a future wire version with coding vectors).
-  See [`docs/WIRE_RELAY_PIPELINE.md`](../../docs/WIRE_RELAY_PIPELINE.md).
+- Does **not** encode/decode / recode.
+- `relay_inject_wire_datagram()` accepts **already encoded wire v3 datagrams** only.
+- `--process forward` (default): Phase 1 path, no GenerationCache.
+- `--process cache`: copy-based GenerationCache + still **opaque forward** every
+  packet (including duplicates / metadata mismatches / admission failures).
+  Cache is observe/store/hook prep only; no wait-for-generation, no merge.
+- END/control never enter GenerationCache; FIFO EgressQueue keeps DATA-before-END
+  when DATA was enqueued first.
+- See [`docs/WIRE_RELAY_PIPELINE.md`](../../docs/WIRE_RELAY_PIPELINE.md).
 
 ## CLI
 
@@ -39,7 +42,12 @@ recvfrom(listen)  [or relay_inject_wire_datagram — wire-level only]
   --listen 9000 \
   --next-hop 10.10.23.2:9000 \
   [--idle-exit-sec N] \
-  [--egress-capacity N]
+  [--egress-capacity N] \
+  [--process forward|cache] \
+  [--gen-timeout-ms N] \
+  [--max-gens N] \
+  [--max-gens-per-flow N] \
+  [--max-cache-bytes N]
 ```
 
 | Flag | Meaning |
@@ -49,6 +57,25 @@ recvfrom(listen)  [or relay_inject_wire_datagram — wire-level only]
 | `--next-hop` | `HOST:PORT` for non-local forward |
 | `--idle-exit-sec` | Optional; exit after N seconds with no RX (tests) |
 | `--egress-capacity` | Global EgressQueue slots (default 4096) |
+| `--process` | `forward` (default) or `cache` |
+| `--gen-timeout-ms` | Cache idle timeout (default 500) |
+| `--max-gens` | Global generation limit (default 256) |
+| `--max-gens-per-flow` | Per-flow generation limit (default 32) |
+| `--max-cache-bytes` | Cache memory cap (default 32MiB) |
+
+### Cache-mode example (VM2)
+
+```bash
+./build/wire_relay \
+  --local-node-id 2 \
+  --listen 9000 \
+  --next-hop 10.10.23.2:9000 \
+  --process cache \
+  --gen-timeout-ms 500 \
+  --max-gens 256 \
+  --max-gens-per-flow 32 \
+  --max-cache-bytes 33554432
+```
 
 ## Four-VM linear path
 
@@ -58,30 +85,10 @@ final_dst=4         local=2             local=3             local_node_id=4
 sendto(VM2)         next=VM3            next=VM4
 ```
 
-Example:
-
-```bash
-# VM4
-./build/wg_multi_pipeline --codec copy --local-node-id 4 \
-  --udp-recv 9000 /tmp/out.ts --idle-sec 5
-
-# VM3
-./build/wire_relay --local-node-id 3 --listen 9000 --next-hop VM4_IP:9000
-
-# VM2
-./build/wire_relay --local-node-id 2 --listen 9000 --next-hop VM3_IP:9000
-
-# VM1 (UDP destination is VM2, not VM4)
-./build/wg_multi_pipeline --codec copy --final-dst 4 --ttl 8 \
-  --udp-send VM2_IP 9000 input.ts
-```
-
-Application-layer relay requires VM1 to target VM2. Do not rely on kernel
-`ip_forward` to skip the relay processes.
-
-## Loopback test
+## Loopback / unit tests
 
 ```bash
 make wire-relay wg-demo
 sh tests/wire_relay_loopback.sh ./build/wg_multi_pipeline ./build/wire_relay build
+./build/relay_gen_cache_tests
 ```

@@ -1,6 +1,8 @@
 #ifndef WIRE_RELAY_RELAY_H
 #define WIRE_RELAY_RELAY_H
 
+#include "generation_cache.h"
+#include "process.h"
 #include "recode.h"
 #include "wire_header.h"
 
@@ -27,6 +29,10 @@ typedef enum {
 typedef int (*RelayDeliveryFn)(const uint8_t *datagram, size_t len,
                                const WireHeader *hdr, void *ctx);
 
+/* Optional TX capture for tests; when set, sendto is skipped. */
+typedef void (*RelayTxCaptureFn)(const uint8_t *datagram, size_t len,
+                                 void *ctx);
+
 typedef struct RelayFlowStats {
     uint64_t rx;
     uint64_t forward;
@@ -37,6 +43,13 @@ typedef struct RelayFlowStats {
     uint64_t drop_egress_full;
     uint64_t inject_ok;
     uint64_t inject_reject_loopback;
+    uint64_t gen_created;
+    uint64_t gen_ready;
+    uint64_t gen_timeout;
+    uint64_t gen_evicted;
+    uint64_t gen_admission_failed;
+    uint64_t gen_metadata_mismatch;
+    uint64_t gen_duplicate;
 } RelayFlowStats;
 
 typedef struct RelayConfig {
@@ -47,12 +60,15 @@ typedef struct RelayConfig {
     /*
      * Optional Phase-1 hook (default NULL = FORWARD_ORIGINAL / opaque).
      * When set, must still produce a complete wire datagram; TX only sends
-     * those bytes. Not used for GenerationCache (Phase 2+).
+     * those bytes.
      */
     RelayRecodeFn       recode_fn;
     void               *recode_ctx;
     RelayDeliveryFn     delivery_fn;
     void               *delivery_ctx;
+    RelayProcessMode    process_mode; /* default FORWARD */
+    RelayProcessFn      process_fn;   /* optional; default continue forward */
+    void               *process_ctx;
     /* 0 => run until SIGINT/SIGTERM; otherwise exit after idle seconds. */
     unsigned            idle_exit_sec;
     /* Packet slots in the global EgressQueue (default 4096). */
@@ -62,6 +78,11 @@ typedef struct RelayConfig {
      * default (1). Set 0 to deliver via delivery_fn instead.
      */
     int                 reject_local_encoder_loopback;
+    /* GenerationCache limits (used when process_mode == CACHE). */
+    uint32_t            gen_timeout_ms;
+    size_t              max_gens_global;
+    size_t              max_gens_per_flow;
+    uint64_t            max_cache_bytes;
 } RelayConfig;
 
 typedef enum {
@@ -94,5 +115,16 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
 
 /* Exposed for unit tests: mono time helper. */
 uint64_t relay_mono_ns(void);
+
+/*
+ * In-process harness (no listen socket). TX calls capture_fn instead of
+ * sendto when capture_fn != NULL. Used by Phase-2 unit tests.
+ */
+RelayStatus relay_harness_open(RelayCtx **out, const RelayConfig *config,
+                               RelayTxCaptureFn capture_fn, void *capture_ctx);
+void relay_harness_close(RelayCtx *ctx);
+const RelayFlowStats *relay_total_stats(const RelayCtx *ctx);
+const GenerationCacheStats *relay_cache_stats(const RelayCtx *ctx);
+GenerationCache *relay_generation_cache(RelayCtx *ctx);
 
 #endif /* WIRE_RELAY_RELAY_H */
