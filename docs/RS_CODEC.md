@@ -38,7 +38,7 @@ with `--rs-k=16 --rs-parity=2`.
 | --- | --- |
 | `rs_codec.c` / `rs_codec.h` | Params, encode, recover |
 | `codec.h` | `CodecVTable`, `present_bits` bit array helpers |
-| `third_party/rscode/` | Used for default 4+2 encode |
+| `third_party/rscode/` | Startup: extract default 4+2 parity coeffs; optional `RS_ENCODE_RSCODE` reference encode |
 | `wire_udp.c` | Wire UDP send/recv; receiver demux by `flow_id`; validates `shard_count` |
 
 ## 3. API syntax
@@ -84,6 +84,29 @@ Codec_recover(codec, shards, present_bits, shard_count);
 ```
 
 Recover uses the process-fixed matrix for the configured `(k, r)`.
+
+### Encode plan / hot path
+
+Startup (`RsCodec_set_params` / default init) publishes an immutable
+`RsEncodePlan` (generator coeffs + optional `r×k×256` mul table, capped at
+`RS_ENCODE_MUL_TABLE_MAX_BYTES`). For default `4+2`, parity coeffs are
+extracted once from hqm/rscode `encode_data` on unit vectors so the table
+path stays bit-exact with historical wire parity. Encode workers must start
+only after configuration.
+
+| Geometry | Default (`AUTO`) path |
+| --- | --- |
+| `4+2` | optimized general table (unlocked; bit-exact vs rscode) |
+| `16+2` | specialized dual-parity table scan |
+| other `(k,r)` | optimized general table |
+
+Reference / verification only (not AUTO):
+
+- `RS_ENCODE_LEGACY` — byte-wise `gmult` against plan coeffs
+- `RS_ENCODE_RSCODE` — hqm `encode_data` for `4+2` only (holds `rs_lock`)
+
+`RsCodec_set_encode_impl()` can force `GENERAL` / `FAST_16_2` / `LEGACY` /
+`RSCODE` for tests and `rs_encode_bench`.
 
 ### CLI
 
