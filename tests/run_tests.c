@@ -7,6 +7,7 @@
 #include "wire_header.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -407,15 +408,23 @@ static void *mgr_producer_thread(void *arg)
         DataPacket *pkt;
         char payload[32];
         int n;
+        FlowManagerStatus push_st;
 
         n = snprintf(payload, sizeof(payload), "f%u-%d", ctx->flow_id, i);
         pkt = packet_create(ctx->flow_id, payload, (size_t)n + 1);
         if (pkt == NULL) {
+            fprintf(stderr,
+                    "mgr_producer: packet_create failed: flow_id=%u i=%d\n",
+                    ctx->flow_id, i);
             ctx->errors++;
             return NULL;
         }
 
-        if (flow_manager_push(ctx->mgr, &pkt) != FM_OK) {
+        push_st = flow_manager_push(ctx->mgr, &pkt);
+        if (push_st != FM_OK) {
+            fprintf(stderr,
+                    "ingress_push failed: flow_id=%u i=%d return=%d\n",
+                    ctx->flow_id, i, (int)push_st);
             packet_free(pkt);
             ctx->errors++;
             return NULL;
@@ -443,29 +452,47 @@ static int test_flow_manager_e2e(void)
     int fds[2];
     char buf0[64];
     char buf1[64];
-    ssize_t n;
+    ssize_t n0;
+    ssize_t n1;
     pthread_t t0;
     pthread_t t1;
     MgrProducerCtx p0;
     MgrProducerCtx p1;
+    int create0;
+    int create1;
+    int join0;
+    int join1;
+    uint64_t enq0;
+    uint64_t enq1;
+    uint64_t deq0;
+    uint64_t deq1;
 
     fds[0] = open("/tmp/mfrc_flow0.test", O_RDWR | O_CREAT | O_TRUNC, 0600);
     fds[1] = open("/tmp/mfrc_flow1.test", O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fds[0] < 0 || fds[1] < 0) {
-        close(fds[0]);
-        close(fds[1]);
+        fprintf(stderr,
+                "open output files failed: fd0=%d fd1=%d errno=%d\n",
+                fds[0], fds[1], errno);
+        if (fds[0] >= 0) {
+            close(fds[0]);
+        }
+        if (fds[1] >= 0) {
+            close(fds[1]);
+        }
         return 1;
     }
 
     cfg.output_fds = fds;
 
     if (flow_manager_init(&mgr, &cfg) != FM_OK) {
+        fprintf(stderr, "flow_manager_init failed\n");
         close(fds[0]);
         close(fds[1]);
         return 1;
     }
 
     if (flow_manager_start(&mgr) != FM_OK) {
+        fprintf(stderr, "flow_manager_start failed\n");
         flow_manager_destroy(&mgr);
         close(fds[0]);
         close(fds[1]);
@@ -478,8 +505,18 @@ static int test_flow_manager_e2e(void)
     p0 = (MgrProducerCtx){ .mgr = &mgr, .flow_id = 0, .count = 4, .interval_ms = 20, .errors = 0 };
     p1 = (MgrProducerCtx){ .mgr = &mgr, .flow_id = 1, .count = 4, .interval_ms = 20, .errors = 0 };
 
-    if (pthread_create(&t0, NULL, mgr_producer_thread, &p0) != 0 ||
-        pthread_create(&t1, NULL, mgr_producer_thread, &p1) != 0) {
+    create0 = pthread_create(&t0, NULL, mgr_producer_thread, &p0);
+    create1 = pthread_create(&t1, NULL, mgr_producer_thread, &p1);
+    if (create0 != 0 || create1 != 0) {
+        fprintf(stderr,
+                "producer pthread_create failed: t0=%d t1=%d\n",
+                create0, create1);
+        if (create0 == 0) {
+            pthread_join(t0, NULL);
+        }
+        if (create1 == 0) {
+            pthread_join(t1, NULL);
+        }
         flow_manager_stop(&mgr);
         flow_manager_destroy(&mgr);
         close(fds[0]);
@@ -487,12 +524,12 @@ static int test_flow_manager_e2e(void)
         return 1;
     }
 
-    pthread_join(t0, NULL);
-    pthread_join(t1, NULL);
-
-    flow_manager_stop(&mgr);
-
-    if (p0.errors != 0 || p1.errors != 0) {
+    join0 = pthread_join(t0, NULL);
+    join1 = pthread_join(t1, NULL);
+    if (join0 != 0 || join1 != 0) {
+        fprintf(stderr, "destroy/join failure: join0=%d join1=%d\n", join0,
+                join1);
+        flow_manager_stop(&mgr);
         flow_manager_destroy(&mgr);
         close(fds[0]);
         close(fds[1]);
@@ -501,10 +538,92 @@ static int test_flow_manager_e2e(void)
         return 1;
     }
 
-    if (atomic_load(&mgr.flows[0].metrics.enqueued_packets) != 4 ||
-        atomic_load(&mgr.flows[1].metrics.enqueued_packets) != 4 ||
-        atomic_load(&mgr.flows[0].metrics.dequeued_packets) != 4 ||
-        atomic_load(&mgr.flows[1].metrics.dequeued_packets) != 4) {
+    if (p0.errors != 0 || p1.errors != 0) {
+        fprintf(stderr,
+                "producer errors: flow0=%d flow1=%d\n",
+                p0.errors, p1.errors);
+        flow_manager_stop(&mgr);
+        flow_manager_destroy(&mgr);
+        close(fds[0]);
+        close(fds[1]);
+        unlink("/tmp/mfrc_flow0.test");
+        unlink("/tmp/mfrc_flow1.test");
+        return 1;
+    }
+
+    /*
+     * Push only places packets on the mixed queue; enqueued/dequeued metrics
+     * advance in the dispatcher/worker. Wait for drain before stop so shutdown
+     * does not drop in-flight packets (same expectation as other e2e waits).
+     */
+    {
+        struct timespec deadline;
+        struct timespec now;
+        const long timeout_ns = 2000000000L; /* 2s */
+
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+            fprintf(stderr, "dequeue timeout: clock_gettime failed errno=%d\n",
+                    errno);
+            flow_manager_stop(&mgr);
+            flow_manager_destroy(&mgr);
+            close(fds[0]);
+            close(fds[1]);
+            unlink("/tmp/mfrc_flow0.test");
+            unlink("/tmp/mfrc_flow1.test");
+            return 1;
+        }
+        deadline.tv_sec += timeout_ns / 1000000000L;
+        deadline.tv_nsec += timeout_ns % 1000000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+        for (;;) {
+            enq0 = atomic_load(&mgr.flows[0].metrics.enqueued_packets);
+            enq1 = atomic_load(&mgr.flows[1].metrics.enqueued_packets);
+            deq0 = atomic_load(&mgr.flows[0].metrics.dequeued_packets);
+            deq1 = atomic_load(&mgr.flows[1].metrics.dequeued_packets);
+            if (deq0 >= 4ull && deq1 >= 4ull) {
+                break;
+            }
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                now.tv_sec > deadline.tv_sec ||
+                (now.tv_sec == deadline.tv_sec &&
+                 now.tv_nsec >= deadline.tv_nsec)) {
+                fprintf(stderr,
+                        "dequeue timeout: expected deq=4/4; "
+                        "actual flow0 enq=%llu deq=%llu flow1 enq=%llu "
+                        "deq=%llu\n",
+                        (unsigned long long)enq0, (unsigned long long)deq0,
+                        (unsigned long long)enq1, (unsigned long long)deq1);
+                flow_manager_stop(&mgr);
+                flow_manager_destroy(&mgr);
+                close(fds[0]);
+                close(fds[1]);
+                unlink("/tmp/mfrc_flow0.test");
+                unlink("/tmp/mfrc_flow1.test");
+                return 1;
+            }
+            {
+                struct timespec poll = { .tv_sec = 0, .tv_nsec = 1000000L };
+                nanosleep(&poll, NULL);
+            }
+        }
+    }
+
+    flow_manager_stop(&mgr);
+
+    enq0 = atomic_load(&mgr.flows[0].metrics.enqueued_packets);
+    enq1 = atomic_load(&mgr.flows[1].metrics.enqueued_packets);
+    deq0 = atomic_load(&mgr.flows[0].metrics.dequeued_packets);
+    deq1 = atomic_load(&mgr.flows[1].metrics.dequeued_packets);
+    if (enq0 != 4 || enq1 != 4 || deq0 != 4 || deq1 != 4) {
+        fprintf(stderr,
+                "expected flow packet counts enq=4 deq=4; "
+                "actual flow0 enq=%llu deq=%llu flow1 enq=%llu deq=%llu\n",
+                (unsigned long long)enq0, (unsigned long long)deq0,
+                (unsigned long long)enq1, (unsigned long long)deq1);
         flow_manager_destroy(&mgr);
         close(fds[0]);
         close(fds[1]);
@@ -514,8 +633,11 @@ static int test_flow_manager_e2e(void)
     }
 
     lseek(fds[0], 0, SEEK_SET);
-    n = read(fds[0], buf0, sizeof(buf0) - 1);
-    if (n <= 0) {
+    n0 = read(fds[0], buf0, sizeof(buf0) - 1);
+    if (n0 <= 0) {
+        fprintf(stderr,
+                "expected bytes>0 for flow0 output; actual=%zd errno=%d\n",
+                n0, errno);
         flow_manager_destroy(&mgr);
         close(fds[0]);
         close(fds[1]);
@@ -523,11 +645,14 @@ static int test_flow_manager_e2e(void)
         unlink("/tmp/mfrc_flow1.test");
         return 1;
     }
-    buf0[n] = '\0';
+    buf0[n0] = '\0';
 
     lseek(fds[1], 0, SEEK_SET);
-    n = read(fds[1], buf1, sizeof(buf1) - 1);
-    if (n <= 0) {
+    n1 = read(fds[1], buf1, sizeof(buf1) - 1);
+    if (n1 <= 0) {
+        fprintf(stderr,
+                "expected bytes>0 for flow1 output; actual=%zd errno=%d\n",
+                n1, errno);
         flow_manager_destroy(&mgr);
         close(fds[0]);
         close(fds[1]);
@@ -535,7 +660,7 @@ static int test_flow_manager_e2e(void)
         unlink("/tmp/mfrc_flow1.test");
         return 1;
     }
-    buf1[n] = '\0';
+    buf1[n1] = '\0';
 
     flow_manager_destroy(&mgr);
     close(fds[0]);
@@ -543,7 +668,18 @@ static int test_flow_manager_e2e(void)
     unlink("/tmp/mfrc_flow0.test");
     unlink("/tmp/mfrc_flow1.test");
 
-    if (strstr(buf0, "f0-0") == NULL || strstr(buf1, "f1-0") == NULL) {
+    if (strstr(buf0, "f0-0") == NULL) {
+        fprintf(stderr,
+                "output byte mismatch: flow=0 missing substring f0-0; "
+                "bytes=%zd content=%.*s\n",
+                n0, (int)n0, buf0);
+        return 1;
+    }
+    if (strstr(buf1, "f1-0") == NULL) {
+        fprintf(stderr,
+                "output byte mismatch: flow=1 missing substring f1-0; "
+                "bytes=%zd content=%.*s\n",
+                n1, (int)n1, buf1);
         return 1;
     }
 
