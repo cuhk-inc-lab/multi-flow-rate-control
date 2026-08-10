@@ -166,10 +166,20 @@ process per VM.
 Sender uses `--udp-send-multi` + repeated `--flow` specs, receiver uses
 `--udp-recv <port> <out_prefix> --max-flows N`.
 
+**Demux rules (do not confuse):**
+
+- **Non-wire pipeline ingress** (`--udp`, fake `tuple:` file ingress): may map a
+  UDP 5-tuple → internal slot via `flow_peer_map`.
+- **Wire UDP receiver (`--udp-recv`)**: decoder / output selection uses **only**
+  `WireHeader.flow_id` (full `uint32_t`). UDP source/dest address and port are
+  **not** the demux key. This matters after `wire_relay`, which typically emits
+  every flow from one `send_sock` (same peer tuple).
+
 `--flow` spec formats:
 
 - Explicit id (iperf-like): `<flow_id>:<receiver_ip>:<port>:<input_path>[:rate_mbps]`
-- Fake upstream 5-tuple → `flow_id` via `flow_peer_map`, then wire to receiver:
+- Fake upstream 5-tuple → internal `flow_id` via `flow_peer_map` on the **sender
+  pipeline**, then the chosen id is written into the wire header:
 
 ```text
 tuple:<src_ip>:<src_port>:<dst_ip>:<dst_port>:<wire_host>:<wire_port>:<input>[:rate]
@@ -201,13 +211,14 @@ Node1 (sender, file + fake 5-tuple → flow_id, then same wire path):
 ```
 
 Stderr prints `tuple … => flow_id=N`. File chunks use `ingress_push_tuple` (same API as `--udp`).
-The tuple is only the simulated ingress key; `wire_host:wire_port` is the real next hop.
-Output file naming (receiver writes one file per flow):
+The tuple is only the simulated ingress key on the sender; `wire_host:wire_port` is the real next hop.
+Receiver output naming (one file per **wire** `flow_id`; peer tag is cosmetic):
 
-`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<mapped_id>.<suffix>`
+`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<wire_flow_id>.<suffix>`
 
-Default suffix is `.ts`. Override per sender `--flow` id with
+Default suffix is `.ts`. Override per wire flow id with
 `--out-suffix <flow_id>:<ext>` on `--udp-recv` (e.g. `--out-suffix 0:.txt --out-suffix 1:.ts`).
+Note: `--out-suffix` table currently indexes ids `0..7` only.
 
 Because the UDP sender source port may vary, use wildcard when validating:
 

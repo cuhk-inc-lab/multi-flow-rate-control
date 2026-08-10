@@ -1,7 +1,6 @@
 #include "wire_udp.h"
 
 #include "codec.h"
-#include "flow_peer_map.h"
 #include "stream_config.h"
 #include "wire_flow_decoder.h"
 #include "wire_header.h"
@@ -614,22 +613,22 @@ static int wire_udp_file_output(uint32_t flow_id, const uint8_t *data, size_t le
 
 #define WIRE_MAX_FLOWS MF_MAX_FLOWS
 
-typedef struct WireFlowKey {
-    struct sockaddr_storage addr;
-    socklen_t               addr_len;
-    uint32_t                flow_id;
-} WireFlowKey;
-
+/*
+ * Wire UDP receive demux key is WireHeader.flow_id only (full uint32_t).
+ * Peer sockaddr is stored for output naming / logs and never used for lookup.
+ */
 typedef struct WireFlowCtx {
     bool              active;
-    WireFlowKey       key;
+    uint32_t          flow_id;
+    struct sockaddr_storage peer_addr;
+    socklen_t         peer_addr_len;
     WireFlowDecoder  *dec;
     FILE             *output;
     char              output_path[512];
     int               decode_mark;
     int               decode_mark_written;
     const char       *codec_name;
-    /* Cached decode config for late decoder init (single-flow key assign). */
+    /* Cached decode config for late decoder init (single-flow bind). */
     const Codec      *codec;
     uint16_t          expected_shards;
     size_t            input_size;
@@ -647,7 +646,7 @@ static int wire_flow_ensure_decoder(WireFlowCtx *flow)
         return 0;
     }
     memset(&cfg, 0, sizeof(cfg));
-    cfg.flow_id = flow->key.flow_id;
+    cfg.flow_id = flow->flow_id;
     cfg.codec = flow->codec;
     cfg.expected_shards = flow->expected_shards;
     cfg.best_effort = flow->best_effort;
@@ -695,7 +694,7 @@ static int wire_append_decode_mark(WireFlowCtx *flow)
                  timebuf,
                  flow->codec_name != NULL ? flow->codec_name : "unknown",
                  (unsigned long long)st->decoded_blocks,
-                 flow->key.flow_id);
+                 flow->flow_id);
     if (n < 0 || (size_t)n >= sizeof(line)) {
         return -1;
     }
@@ -709,51 +708,27 @@ static int wire_append_decode_mark(WireFlowCtx *flow)
     return 0;
 }
 
-static int wire_flow_key_equal(const WireFlowKey *left, const WireFlowKey *right)
-{
-    if (left == NULL || right == NULL) {
-        return 0;
-    }
-    if (left->flow_id != right->flow_id || left->addr_len != right->addr_len) {
-        return 0;
-    }
-    return memcmp(&left->addr, &right->addr, left->addr_len) == 0;
-}
-
-static void wire_flow_key_from_peer(WireFlowKey *key,
-                                    const struct sockaddr_storage *addr,
-                                    socklen_t addr_len, uint32_t flow_id)
-{
-    if (key == NULL || addr == NULL) {
-        return;
-    }
-    memset(key, 0, sizeof(*key));
-    if (addr_len > sizeof(key->addr)) {
-        addr_len = (socklen_t)sizeof(key->addr);
-    }
-    memcpy(&key->addr, addr, addr_len);
-    key->addr_len = addr_len;
-    key->flow_id = flow_id;
-}
-
-static int wire_flow_format_peer_tag(const WireFlowKey *key, char *out, size_t out_len)
+static int wire_flow_format_output_tag(const struct sockaddr_storage *addr,
+                                       socklen_t addr_len, uint32_t flow_id,
+                                       char *out, size_t out_len)
 {
     char host[INET6_ADDRSTRLEN];
     unsigned port = 0;
 
-    if (key == NULL || out == NULL || out_len == 0) {
+    (void)addr_len;
+    if (out == NULL || out_len == 0) {
         return -1;
     }
 
-    if (key->addr.ss_family == AF_INET) {
-        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)&key->addr;
+    if (addr != NULL && addr->ss_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)addr;
 
         if (inet_ntop(AF_INET, &ipv4->sin_addr, host, sizeof(host)) == NULL) {
             return -1;
         }
         port = ntohs(ipv4->sin_port);
-    } else if (key->addr.ss_family == AF_INET6) {
-        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)&key->addr;
+    } else if (addr != NULL && addr->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)addr;
 
         if (inet_ntop(AF_INET6, &ipv6->sin6_addr, host, sizeof(host)) == NULL) {
             return -1;
@@ -763,25 +738,29 @@ static int wire_flow_format_peer_tag(const WireFlowKey *key, char *out, size_t o
         snprintf(host, sizeof(host), "unknown");
     }
 
-    if (snprintf(out, out_len, "src_%s_p%u_flow_%u", host, port, key->flow_id) < 0 ||
+    /* Peer tag is cosmetic; demux key is wire flow_id only. */
+    if (snprintf(out, out_len, "src_%s_p%u_flow_%u", host, port, flow_id) < 0 ||
         strlen(out) >= out_len) {
         return -1;
     }
     return 0;
 }
 
-static int wire_flow_output_path(const char *prefix, const WireFlowKey *key,
+static int wire_flow_output_path(const char *prefix,
+                                 const struct sockaddr_storage *peer,
+                                 socklen_t peer_len, uint32_t flow_id,
                                  const char *suffix, char *out, size_t out_len)
 {
-    char tag[128];
+    char tag[160];
 
-    if (prefix == NULL || key == NULL || out == NULL) {
+    if (prefix == NULL || out == NULL) {
         return -1;
     }
     if (suffix == NULL) {
         suffix = ".ts";
     }
-    if (wire_flow_format_peer_tag(key, tag, sizeof(tag)) != 0) {
+    if (wire_flow_format_output_tag(peer, peer_len, flow_id, tag,
+                                    sizeof(tag)) != 0) {
         return -1;
     }
     if (snprintf(out, out_len, "%s%s%s", prefix, tag, suffix) < 0 ||
@@ -804,21 +783,35 @@ static const char *wire_recv_suffix_for_flow(const WireUdpRecvConfig *config,
 }
 
 static WireFlowCtx *wire_flow_find(WireFlowCtx flows[], size_t max_flows,
-                                   const WireFlowKey *key)
+                                   uint32_t flow_id)
 {
     size_t index;
 
     for (index = 0; index < max_flows; index++) {
-        if (flows[index].active &&
-            wire_flow_key_equal(&flows[index].key, key)) {
+        if (flows[index].active && flows[index].flow_id == flow_id) {
             return &flows[index];
         }
     }
     return NULL;
 }
 
+static size_t wire_flow_active_count(const WireFlowCtx flows[], size_t max_flows)
+{
+    size_t index;
+    size_t n = 0;
+
+    for (index = 0; index < max_flows; index++) {
+        if (flows[index].active) {
+            n++;
+        }
+    }
+    return n;
+}
+
 static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
-                                    const WireFlowKey *key,
+                                    uint32_t flow_id,
+                                    const struct sockaddr_storage *peer,
+                                    socklen_t peer_len,
                                     const char *output_path,
                                     int decode_mark, const char *codec_name,
                                     const Codec *codec, uint16_t expected_shards,
@@ -830,7 +823,14 @@ static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
         if (!flows[index].active) {
             memset(&flows[index], 0, sizeof(flows[index]));
             flows[index].active = true;
-            flows[index].key = *key;
+            flows[index].flow_id = flow_id;
+            if (peer != NULL && peer_len > 0) {
+                if (peer_len > sizeof(flows[index].peer_addr)) {
+                    peer_len = (socklen_t)sizeof(flows[index].peer_addr);
+                }
+                memcpy(&flows[index].peer_addr, peer, peer_len);
+                flows[index].peer_addr_len = peer_len;
+            }
             flows[index].decode_mark = decode_mark;
             flows[index].codec_name = codec_name;
             flows[index].codec = codec;
@@ -897,20 +897,20 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
 {
     const Codec *codec;
     WireFlowCtx *flows = NULL;
-    FlowPeerMap *flow_map = NULL;
     unsigned char datagram[WIRE_HEADER_SIZE + PKG_SIZE];
     size_t        input_size;
     size_t        output_size;
     uint16_t      expected_shards;
     size_t        max_flows;
     int           multi_mode;
-    struct sockaddr_storage local_addr;
-    socklen_t     local_len = (socklen_t)sizeof(local_addr);
     double        last_receive;
     int           sock = -1;
     int           result = -1;
     size_t        fi;
     uint64_t      drop_wrong_dst = 0;
+    uint64_t      malformed_headers = 0;
+    uint64_t      flow_capacity_rejects = 0;
+    uint64_t      flows_created = 0;
 
     if (config == NULL || config->output_path == NULL || config->port == 0 ||
         config->idle_sec == 0) {
@@ -957,18 +957,12 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     if (sock < 0) {
         goto cleanup;
     }
-    if (getsockname(sock, (struct sockaddr *)&local_addr, &local_len) != 0) {
-        goto cleanup;
-    }
-    if (flow_peer_map_init(&flow_map, (uint32_t)max_flows) != FPM_OK) {
-        goto cleanup;
-    }
 
     if (!multi_mode) {
-        WireFlowKey  key = {0};
         WireFlowCtx *flow;
 
-        flow = wire_flow_alloc(flows, 1, &key, config->output_path,
+        /* Single-file mode: bind path now; wire flow_id set on first packet. */
+        flow = wire_flow_alloc(flows, 1, 0, NULL, 0, config->output_path,
                                config->decode_mark,
                                wire_codec_kind_name(config->codec_kind),
                                codec, expected_shards, input_size,
@@ -979,7 +973,8 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
 
     fprintf(stderr,
-            "udp-recv: listening on UDP port %u (max_flows=%zu local_node_id=%u%s%s)\n",
+            "udp-recv: listening on UDP port %u (max_flows=%zu local_node_id=%u"
+            ", demux=wire_flow_id%s%s)\n",
             (unsigned)config->port, max_flows,
             (unsigned)config->local_node_id,
             multi_mode ? ", prefix mode" : "",
@@ -1046,10 +1041,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             ssize_t                 received;
             struct sockaddr_storage peer_addr;
             socklen_t               peer_len = (socklen_t)sizeof(peer_addr);
-            FlowTuple               tuple;
-            uint32_t                mapped_flow_id;
             WireHeader              header;
-            WireFlowKey             key;
             WireFlowCtx            *flow;
 
             do {
@@ -1062,10 +1054,11 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             last_receive = monotonic_seconds();
 
             /*
-             * Validate the wire header before peer-map allocation / opening
-             * output files so junk UDP cannot exhaust max_flows.
+             * Parse wire header before allocating a receiver flow so junk UDP
+             * cannot exhaust max_flows. Demux uses header.flow_id only.
              */
             if (wire_header_decode(&header, datagram, (size_t)received) != 0) {
+                malformed_headers++;
                 continue;
             }
             if (config->local_node_id != 0 &&
@@ -1080,6 +1073,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                                                  expected_shards) ||
                     header.shard_index >= header.shard_count ||
                     header.valid_len == 0 || header.valid_len > input_size) {
+                    malformed_headers++;
                     continue;
                 }
             } else if (header.type == WIRE_TYPE_END) {
@@ -1087,51 +1081,56 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     header.payload_len != 0 ||
                     !wire_flow_decoder_shard_count_ok(codec, header.shard_count,
                                                  expected_shards)) {
+                    malformed_headers++;
                     continue;
                 }
             } else {
+                malformed_headers++;
                 continue;
             }
 
-            if (flow_tuple_set(&tuple,
-                               (struct sockaddr *)&peer_addr, peer_len,
-                               (struct sockaddr *)&local_addr, local_len,
-                               IPPROTO_UDP) != 0) {
-                continue;
-            }
-            mapped_flow_id = flow_peer_map_lookup(flow_map, &tuple);
-            if (mapped_flow_id == (uint32_t)-1) {
-                continue;
-            }
-
-            wire_flow_key_from_peer(&key, &peer_addr, peer_len, mapped_flow_id);
-            flow = wire_flow_find(flows, max_flows, &key);
+            flow = wire_flow_find(flows, max_flows, header.flow_id);
             if (flow == NULL) {
                 if (multi_mode) {
                     char        path[512];
                     const char *suffix =
                         wire_recv_suffix_for_flow(config, header.flow_id);
 
-                    if (wire_flow_output_path(config->output_path, &key, suffix,
+                    if (wire_flow_output_path(config->output_path, &peer_addr,
+                                              peer_len, header.flow_id, suffix,
                                               path, sizeof(path)) != 0) {
                         continue;
                     }
-                    flow = wire_flow_alloc(flows, max_flows, &key, path,
+                    flow = wire_flow_alloc(flows, max_flows, header.flow_id,
+                                           &peer_addr, peer_len, path,
                                            config->decode_mark,
                                            wire_codec_kind_name(config->codec_kind),
                                            codec, expected_shards, input_size,
                                            config->best_effort);
                     if (flow == NULL) {
+                        flow_capacity_rejects++;
                         fprintf(stderr,
-                                "udp-recv: flow table full, dropping mapped_flow=%u wire_flow=%u\n",
-                                mapped_flow_id, header.flow_id);
+                                "udp-recv: flow_capacity_reject wire_flow_id=%u "
+                                "active=%zu max_flows=%zu\n",
+                                header.flow_id, wire_flow_active_count(flows,
+                                                                       max_flows),
+                                max_flows);
                         continue;
                     }
-                    fprintf(stderr, "udp-recv: opened flow %u (wire flow %u) -> %s\n",
-                            mapped_flow_id, header.flow_id, path);
+                    flows_created++;
+                    fprintf(stderr,
+                            "udp-recv: opened wire_flow_id=%u -> %s "
+                            "(active=%zu)\n",
+                            header.flow_id, path,
+                            wire_flow_active_count(flows, max_flows));
                 } else {
                     flow = &flows[0];
-                    flow->key = key;
+                    flow->flow_id = header.flow_id;
+                    if (peer_len > sizeof(flow->peer_addr)) {
+                        peer_len = (socklen_t)sizeof(flow->peer_addr);
+                    }
+                    memcpy(&flow->peer_addr, &peer_addr, peer_len);
+                    flow->peer_addr_len = peer_len;
                     if (wire_flow_ensure_decoder(flow) != 0) {
                         goto cleanup;
                     }
@@ -1179,7 +1178,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                 fprintf(stderr,
                         "udp-recv: flow %u incomplete: received_blocks=%llu "
                         "expected_blocks=%llu missing_groups=%llu\n",
-                        flow->key.flow_id, (unsigned long long)next_block,
+                        flow->flow_id, (unsigned long long)next_block,
                         (unsigned long long)(end_seen ? end_count : 0),
                         (unsigned long long)missing_groups);
                 result = -1;
@@ -1207,7 +1206,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     "duplicates=%llu late=%llu malformed=%llu recovered_groups=%llu "
                     "dropped_groups=%llu missing_data_shards=%llu decoded_blocks=%llu "
                     "decode_mark=%s\n",
-                    flow->key.flow_id, flow->output_path,
+                    flow->flow_id, flow->output_path,
                     (unsigned long long)st->output_bytes,
                     (unsigned long long)st->received_datagrams,
                     (unsigned long long)st->seen_datagrams,
@@ -1226,6 +1225,15 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     if (!multi_mode && !flows[0].active) {
         result = -1;
     }
+    fprintf(stderr,
+            "udp-recv: summary active_flows=%zu flows_created=%llu "
+            "flow_capacity_rejects=%llu malformed_headers=%llu "
+            "drop_wrong_dst=%llu\n",
+            wire_flow_active_count(flows, max_flows),
+            (unsigned long long)flows_created,
+            (unsigned long long)flow_capacity_rejects,
+            (unsigned long long)malformed_headers,
+            (unsigned long long)drop_wrong_dst);
     if (drop_wrong_dst > 0) {
         fprintf(stderr,
                 "udp-recv: drop_wrong_dst=%llu (final_dst != local_node_id)\n",
@@ -1233,9 +1241,6 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     }
 
 cleanup:
-    if (flow_map != NULL) {
-        flow_peer_map_destroy(flow_map);
-    }
     if (flows != NULL) {
         for (fi = 0; fi < WIRE_MAX_FLOWS; fi++) {
             wire_flow_close(&flows[fi]);

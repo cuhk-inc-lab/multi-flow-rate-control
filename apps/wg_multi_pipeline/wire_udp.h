@@ -31,9 +31,10 @@ typedef struct WireUdpRecvConfig {
     /* Drop datagrams whose header.final_dst does not match (0 disables check). */
     uint8_t     local_node_id;
     /*
-     * Optional per sender wire-flow_id output suffix (includes leading '.').
+     * Optional per wire-flow_id output suffix (includes leading '.').
      * When out_suffix_set[id] is set, use out_suffix_by_flow[id] (may be empty).
      * Otherwise default to ".ts" for prefix-mode multi-flow outputs.
+     * Indexed by wire flow_id for ids in 0..7 only.
      */
     char        out_suffix_by_flow[8][16];
     unsigned char out_suffix_set[8];

@@ -128,11 +128,14 @@ Each `--flow` spec format is:
 
 `<flow_id>:<receiver_ip>:<port>:<input_path>[:rate_mbps]`
 
-`flow_id` must match the slot index you expect on the receiver side (the
-receiver output includes `flow_id`). The receiver writes one output file per
-flow keyed by the sender peer (IP+port) and `flow_id`, for example:
+`flow_id` in each `--flow` spec is written into `WireHeader.flow_id`. The
+receiver (`--udp-recv`) demuxes **only** by that wire `flow_id` (not UDP peer /
+5-tuple). Output files look like:
 
-`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<mapped_id>.<suffix>`
+`{out_prefix}src_<sender_ip>_p<sender_port>_flow_<wire_flow_id>.<suffix>`
+
+The peer tag in the filename is cosmetic (logging); two wire flows from the
+same UDP source port still get separate files / decoders.
 
 Use `--out-suffix <flow_id>:<ext>` on the receiver to match each sender input
 (e.g. `.txt` / `.ts`). Default remains `.ts`.
