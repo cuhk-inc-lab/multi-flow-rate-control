@@ -1,7 +1,5 @@
 #include "wire_flow_decoder.h"
 
-#include "rs_codec.h"
-
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -182,11 +180,11 @@ static int recover_group(WireGroup *group, const Codec *codec,
         return 0;
     }
 
-    if (codec == RsCodec_get() &&
-        RsCodec_set_profile_from_shard_count(group->shard_count) != 0) {
-        return -1;
-    }
-
+    /*
+     * Use the process RS geometry fixed at startup / decoder create.
+     * Do not call RsCodec_set_profile_from_shard_count here: wire
+     * shard_count is validation input, not a remote profile command.
+     */
     data_shards = Codec_data_shards(codec);
     if (data_shards == 0 || group_received_count(group) < data_shards) {
         return 0;
@@ -483,9 +481,8 @@ int wire_flow_decoder_flush_best_effort(WireFlowDecoder *dec)
 int wire_flow_decoder_shard_count_ok(const Codec *codec, uint16_t shard_count,
                                      uint16_t expected_shards)
 {
-    if (codec == RsCodec_get()) {
-        return RsCodec_profile_is_wire_shard_count(shard_count);
-    }
+    (void)codec;
+    /* All codecs, including RS: wire shard_count must match fixed geometry. */
     return shard_count == expected_shards;
 }
 

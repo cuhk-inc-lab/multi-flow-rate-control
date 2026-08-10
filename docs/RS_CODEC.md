@@ -39,14 +39,14 @@ with `--rs-k=16 --rs-parity=2`.
 | `rs_codec.c` / `rs_codec.h` | Params, encode, recover |
 | `codec.h` | `CodecVTable`, `present_bits` bit array helpers |
 | `third_party/rscode/` | Used for default 4+2 encode |
-| `wire_udp.c` | Sharding; applies params from `shard_count` |
+| `wire_udp.c` | Wire UDP send/recv; receiver demux by `flow_id`; validates `shard_count` |
 
 ## 3. API syntax
 
 ### Set any (k, r)
 
 ```c
-/* Primary API — next encode block uses these params */
+/* Primary API — set once before encode/decode for this process */
 int RsCodec_set_params(size_t data_shards, size_t parity_shards);
 void RsCodec_get_params(size_t *data_shards, size_t *parity_shards);
 
@@ -54,15 +54,27 @@ void RsCodec_get_params(size_t *data_shards, size_t *parity_shards);
 int RsCodec_set_profile(RsProfile profile);
 ```
 
-### Receiver (k fixed, r from wire)
+### Receiver / wire decode geometry (fixed per process)
 
-Both ends must agree on **k** (`--rs-k`). Parity may change per group:
+Sender and receiver must use the **same** fixed `(k, r)` (CLI `--rs-k` /
+`--rs-parity` / `--rs-profile`, or defaults). At WireFlowDecoder create time:
 
-```c
-/* Before Codec_recover for a group: */
-RsCodec_set_params_from_shard_count(header.shard_count);
-/* sets r = shard_count - k */
+```text
+expected_shards = Codec_output_block_size(codec) / PKG_SIZE   /* == k + r */
 ```
+
+Every DATA/END `WireHeader.shard_count` must equal `expected_shards`. Mismatch
+packets are dropped as malformed / metadata mismatch. The wire decoder **must
+not** call `RsCodec_set_profile_from_shard_count` — header `shard_count` is
+validation only, not a remote profile command.
+
+`RsCodec_set_params_from_shard_count` / `RsCodec_set_profile_from_shard_count`
+remain available for explicit init/bench helpers; they are not used on the
+wire ingest/recover path.
+
+One process supports one RS geometry for all concurrent wire flows. Different
+`(k, r)` requires separate receiver/relay processes (or a future wire-protocol
+codec-profile id).
 
 ### Recover
 
@@ -71,7 +83,7 @@ RsCodec_set_params_from_shard_count(header.shard_count);
 Codec_recover(codec, shards, present_bits, shard_count);
 ```
 
-Recover always uses the **matrix** erasure path (supports all configured (k, r)).
+Recover uses the process-fixed matrix for the configured `(k, r)`.
 
 ### CLI
 
@@ -87,8 +99,9 @@ Recover always uses the **matrix** erasure path (supports all configured (k, r))
 ./build/wg_multi_pipeline --codec rs --rs-profile=16+2 \
   --udp-send HOST PORT in.bin
 
-# Receiver: same k (parity follows shard_count)
-./build/wg_multi_pipeline --codec rs --rs-k=16 --udp-recv PORT out.bin
+# Receiver: same fixed (k, parity) as sender
+./build/wg_multi_pipeline --codec rs --rs-k=16 --rs-parity=2 \
+  --udp-recv PORT out.bin
 ```
 
 | Flag | Meaning |

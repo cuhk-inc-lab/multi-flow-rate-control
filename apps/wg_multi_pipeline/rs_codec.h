@@ -37,6 +37,7 @@ RsProfile RsCodec_get_profile(void);
 int RsCodec_set_params_from_shard_count(uint16_t shard_count);
 int RsCodec_params_is_wire_shard_count(uint16_t shard_count);
 
+/* Explicit init/bench helpers only — wire_flow_decoder must not call these. */
 int RsCodec_set_profile_from_shard_count(uint16_t shard_count);
 int RsCodec_profile_is_wire_shard_count(uint16_t shard_count);
 

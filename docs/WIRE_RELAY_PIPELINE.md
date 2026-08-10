@@ -48,8 +48,10 @@ UDP RX / inject
 - **L2** (`--output-dir DIR`): up to `RELAY_MAX_FLOWS` concurrent local flows;
   each binds a slot until hub destroy (no slot reuse after END); overflow
   rejects with `local_decode_flow_rejected` (capacity). `DIR` must already exist.
-- All flows share one process-wide codec / FEC geometry; mismatched shard
-  metadata → metadata mismatch + drop.
+- All flows share one process-wide codec / FEC geometry; mismatched
+  `shard_count` (must equal fixed `expected_shards`) → metadata mismatch +
+  drop. RS geometry is process startup config (`--rs-k` / `--rs-parity`);
+  wire `shard_count` does not retune the global RS profile.
 - With `--local-decode`, `reject_local_encoder_loopback` is cleared so
   `LOCAL_ENCODER` packets with `final_dst==local` can sink-decode.
 - Without `--local-decode`, delivery stays count-only (default).

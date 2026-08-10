@@ -39,6 +39,7 @@ typedef struct WireFlowDecoder WireFlowDecoder;
 typedef struct WireFlowDecoderConfig {
     uint32_t           flow_id;
     const Codec       *codec;
+    /* Fixed at create: Codec_output_block_size(codec)/PKG_SIZE (== k+r for RS). */
     uint16_t           expected_shards;
     int                best_effort;
     size_t             input_size; /* Codec_input_block_size */
@@ -68,7 +69,11 @@ const WireFlowDecoderStats *wire_flow_decoder_stats(const WireFlowDecoder *dec);
 
 void wire_flow_decoder_print_latency(const WireFlowDecoder *dec);
 
-/* Same rules as the former wire_shard_count_acceptable(). */
+/*
+ * True iff wire_shard_count equals the decoder's fixed expected_shards.
+ * Applies to every codec kind, including CODEC_KIND_RS: header.shard_count
+ * is validation only and must not retune process RS geometry.
+ */
 int wire_flow_decoder_shard_count_ok(const Codec *codec, uint16_t shard_count,
                                      uint16_t expected_shards);
 

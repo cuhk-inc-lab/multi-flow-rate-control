@@ -86,11 +86,14 @@ Default is **RS(6,4)** (`k=4`, `parity=2`). Set your own numbers:
   --udp-send 10.10.34.2 9000 input.bin
 # or: --rs-profile=16+2
 
-./build/wg_multi_pipeline --codec rs --rs-k=16 --udp-recv 9000 out.bin
+./build/wg_multi_pipeline --codec rs --rs-k=16 --rs-parity=2 \
+  --udp-recv 9000 out.bin
 ```
 
-Receiver must use the same `--rs-k`. Parity can follow each group's
-`shard_count`. Working size follows your `(k,r)`; the GF(256) ceiling is
+Sender and receiver must use the **same fixed** `(k, parity)`. Wire
+`shard_count` must equal `k+parity`; it is validation only and does **not**
+retune the process RS profile. Concurrent wire flows in one process share that
+geometry. Working size follows your `(k,r)`; the GF(256) ceiling is
 `k+r ≤ 255` (presence uses a bit array, not a 32-bit mask).
 
 ## Per-block latency and jitter
