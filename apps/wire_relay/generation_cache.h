@@ -79,7 +79,11 @@ typedef struct GenerationCacheStats {
     uint64_t gen_duplicate;
     uint64_t gen_cached_bytes_current;
     uint64_t gen_cached_bytes_peak;
-    uint64_t per_flow_created[8]; /* RELAY_MAX_FLOWS-sized; clipped */
+    /*
+     * Clipped telemetry only (ids 0..6 exact; id>=7 share bucket 7).
+     * Not used for admission, eviction, or exact per-flow counts.
+     */
+    uint64_t per_flow_created[8];
 } GenerationCacheStats;
 
 typedef struct GenerationCacheConfig {
@@ -88,6 +92,16 @@ typedef struct GenerationCacheConfig {
     size_t   max_gens_per_flow;
     uint64_t max_cache_bytes;
 } GenerationCacheConfig;
+
+/*
+ * Exact live per-flow accounting (full uint32_t flow_id; flow_id 0 is valid).
+ * Table capacity == max_gens_global.
+ */
+typedef struct GenerationCacheFlowAccount {
+    int      active;
+    uint32_t flow_id;
+    size_t   generation_count;
+} GenerationCacheFlowAccount;
 
 typedef struct GenerationCache GenerationCache;
 
@@ -132,6 +146,8 @@ int generation_cache_poll_timeout_ms(const GenerationCache *cache,
                                      uint64_t now_ns, int empty_poll_ms);
 
 size_t generation_cache_count(const GenerationCache *cache);
+
+/* Exact live generation count for one full uint32_t wire flow_id. */
 size_t generation_cache_count_flow(const GenerationCache *cache,
                                    uint32_t flow_id);
 const GenerationCacheStats *generation_cache_stats(
@@ -145,12 +161,13 @@ int generation_cache_slot_present(const GenerationEntry *entry,
 
 /* Opaque storage size for stack/embedded allocation in RelayCtx. */
 struct GenerationCache {
-    GenerationCacheConfig cfg;
-    GenerationEntry      *lru_head; /* MRU */
-    GenerationEntry      *lru_tail; /* LRU */
-    size_t                count;
-    size_t                flow_counts[8];
-    GenerationCacheStats  stats;
+    GenerationCacheConfig       cfg;
+    GenerationEntry            *lru_head; /* MRU */
+    GenerationEntry            *lru_tail; /* LRU */
+    size_t                      count;
+    GenerationCacheFlowAccount *flow_accounts;
+    size_t                      flow_account_cap;
+    GenerationCacheStats        stats;
 };
 
 #endif /* WIRE_RELAY_GENERATION_CACHE_H */

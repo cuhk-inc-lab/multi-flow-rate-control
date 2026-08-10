@@ -154,6 +154,11 @@ Per `(flow_id, block_id)` entry:
 - Eviction: LRU / oldest `last_update_ns` to satisfy per-flow, global count, or
   byte limits → `gen_evicted++`. Prefer same-flow victims when the per-flow
   limit is the binding constraint.
+- Per-flow quota (`max_gens_per_flow`) uses the full `uint32_t` wire `flow_id`
+  (including 0). High ids are not clamped into a shared stats bucket for
+  admission/eviction. `per_flow_created[8]` remains clipped telemetry only.
+- Local-destination packets (`final_dst == local_node_id`) never enter the
+  GenerationCache.
 
 ### Test harness lifecycle
 

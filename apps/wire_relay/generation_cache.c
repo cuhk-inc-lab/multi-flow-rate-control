@@ -18,12 +18,118 @@ void generation_cache_config_defaults(GenerationCacheConfig *cfg)
     cfg->max_cache_bytes = GEN_CACHE_DEFAULT_MAX_BYTES;
 }
 
-static size_t flow_stat_index(uint32_t flow_id)
+/*
+ * Clipped telemetry bucket only — never used for admission/eviction/counts.
+ */
+static size_t telemetry_stat_index(uint32_t flow_id)
 {
     if (flow_id >= GEN_CACHE_STAT_FLOWS) {
         return GEN_CACHE_STAT_FLOWS - 1u;
     }
     return (size_t)flow_id;
+}
+
+static GenerationCacheFlowAccount *find_flow_account(GenerationCache *cache,
+                                                     uint32_t flow_id)
+{
+    size_t i;
+
+    if (cache == NULL || cache->flow_accounts == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < cache->flow_account_cap; i++) {
+        if (cache->flow_accounts[i].active &&
+            cache->flow_accounts[i].flow_id == flow_id) {
+            return &cache->flow_accounts[i];
+        }
+    }
+    return NULL;
+}
+
+static GenerationCacheFlowAccount *find_free_flow_account(GenerationCache *cache)
+{
+    size_t i;
+
+    if (cache == NULL || cache->flow_accounts == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < cache->flow_account_cap; i++) {
+        if (!cache->flow_accounts[i].active) {
+            return &cache->flow_accounts[i];
+        }
+    }
+    return NULL;
+}
+
+static GenerationCacheFlowAccount *get_or_create_flow_account(
+    GenerationCache *cache, uint32_t flow_id)
+{
+    GenerationCacheFlowAccount *acct;
+
+    acct = find_flow_account(cache, flow_id);
+    if (acct != NULL) {
+        return acct;
+    }
+    acct = find_free_flow_account(cache);
+    if (acct == NULL) {
+        return NULL;
+    }
+    acct->active = 1;
+    acct->flow_id = flow_id;
+    acct->generation_count = 0;
+    return acct;
+}
+
+static void release_empty_flow_account(GenerationCacheFlowAccount *acct)
+{
+    if (acct == NULL) {
+        return;
+    }
+    if (acct->generation_count == 0) {
+        acct->active = 0;
+        acct->flow_id = 0;
+    }
+}
+
+static int account_add_generation(GenerationCache *cache, uint32_t flow_id)
+{
+    GenerationCacheFlowAccount *acct = get_or_create_flow_account(cache, flow_id);
+
+    if (acct == NULL) {
+        return -1;
+    }
+    acct->generation_count++;
+    return 0;
+}
+
+static void account_remove_generation(GenerationCache *cache, uint32_t flow_id)
+{
+    GenerationCacheFlowAccount *acct = find_flow_account(cache, flow_id);
+
+    if (acct == NULL) {
+        return;
+    }
+    if (acct->generation_count > 0) {
+        acct->generation_count--;
+    }
+    release_empty_flow_account(acct);
+}
+
+static size_t flow_generation_count(const GenerationCache *cache,
+                                    uint32_t flow_id)
+{
+    size_t i;
+
+    if (cache == NULL || cache->flow_accounts == NULL) {
+        return 0;
+    }
+    for (i = 0; i < cache->flow_account_cap; i++) {
+        if (cache->flow_accounts[i].active &&
+            cache->flow_accounts[i].flow_id == flow_id) {
+            return cache->flow_accounts[i].generation_count;
+        }
+    }
+    return 0;
 }
 
 static void entry_free(GenerationEntry *entry)
@@ -90,8 +196,6 @@ enum {
 static void cache_remove_entry(GenerationCache *cache, GenerationEntry *entry,
                                int reason)
 {
-    size_t fi;
-
     if (cache == NULL || entry == NULL) {
         return;
     }
@@ -101,10 +205,7 @@ static void cache_remove_entry(GenerationCache *cache, GenerationEntry *entry,
     } else {
         cache->stats.gen_cached_bytes_current = 0;
     }
-    fi = flow_stat_index(entry->key.flow_id);
-    if (cache->flow_counts[fi] > 0) {
-        cache->flow_counts[fi]--;
-    }
+    account_remove_generation(cache, entry->key.flow_id);
     if (cache->count > 0) {
         cache->count--;
     }
@@ -257,9 +358,7 @@ static int meta_matches(const GenerationEntry *entry, const WireHeader *hdr)
 static int needs_eviction(const GenerationCache *cache, uint32_t flow_id,
                           size_t add_bytes)
 {
-    size_t fi = flow_stat_index(flow_id);
-
-    if (cache->flow_counts[fi] >= cache->cfg.max_gens_per_flow) {
+    if (flow_generation_count(cache, flow_id) >= cache->cfg.max_gens_per_flow) {
         return 1;
     }
     if (cache->count >= cache->cfg.max_gens_global) {
@@ -280,18 +379,22 @@ static int needs_eviction(const GenerationCache *cache, uint32_t flow_id,
 static int make_room(GenerationCache *cache, uint32_t flow_id,
                      size_t add_bytes, uint64_t now_ns)
 {
-    size_t fi = flow_stat_index(flow_id);
     size_t guard = 0;
 
     (void)expire_one_pass(cache, now_ns, -1);
 
     while (needs_eviction(cache, flow_id, add_bytes) &&
            cache->count > 0 && guard < cache->cfg.max_gens_global + 8u) {
+        /*
+         * Reset every iteration: previous victim was freed by
+         * cache_remove_entry → entry_free; never reuse that pointer.
+         */
         GenerationEntry *victim = NULL;
         GenerationEntry *cur;
 
         guard++;
-        if (cache->flow_counts[fi] >= cache->cfg.max_gens_per_flow) {
+        if (flow_generation_count(cache, flow_id) >=
+            cache->cfg.max_gens_per_flow) {
             for (cur = cache->lru_tail; cur != NULL; cur = cur->lru_prev) {
                 if (cur->key.flow_id == flow_id) {
                     victim = cur;
@@ -491,13 +594,18 @@ GenerationInsertStatus generation_cache_insert(
 
     {
         GenerationInsertStatus st;
-        size_t fi = flow_stat_index(hdr->flow_id);
+        size_t ti = telemetry_stat_index(hdr->flow_id);
+
+        if (account_add_generation(cache, hdr->flow_id) != 0) {
+            entry_free(entry);
+            cache->stats.gen_admission_failed++;
+            return GEN_INSERT_ADMISSION_FAILED;
+        }
 
         lru_push_mru(cache, entry);
         cache->count++;
-        cache->flow_counts[fi]++;
         cache->stats.gen_created++;
-        cache->stats.per_flow_created[fi]++;
+        cache->stats.per_flow_created[ti]++;
 
         st = store_slot(cache, entry, hdr, datagram, len, now_ns);
         if (st != GEN_INSERT_OK) {
@@ -505,8 +613,8 @@ GenerationInsertStatus generation_cache_insert(
             if (cache->stats.gen_created > 0) {
                 cache->stats.gen_created--;
             }
-            if (cache->stats.per_flow_created[fi] > 0) {
-                cache->stats.per_flow_created[fi]--;
+            if (cache->stats.per_flow_created[ti] > 0) {
+                cache->stats.per_flow_created[ti]--;
             }
             cache_remove_entry(cache, entry, CACHE_REMOVE_SILENT);
             return st;
@@ -544,6 +652,13 @@ int generation_cache_init(GenerationCache *cache,
     if (cache->cfg.max_cache_bytes == 0) {
         cache->cfg.max_cache_bytes = GEN_CACHE_DEFAULT_MAX_BYTES;
     }
+    cache->flow_account_cap = cache->cfg.max_gens_global;
+    cache->flow_accounts =
+        calloc(cache->flow_account_cap, sizeof(*cache->flow_accounts));
+    if (cache->flow_accounts == NULL) {
+        memset(cache, 0, sizeof(*cache));
+        return -1;
+    }
     return 0;
 }
 
@@ -561,6 +676,8 @@ void generation_cache_destroy(GenerationCache *cache)
         entry_free(cur);
         cur = next;
     }
+    free(cache->flow_accounts);
+    cache->flow_accounts = NULL;
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -572,10 +689,7 @@ size_t generation_cache_count(const GenerationCache *cache)
 size_t generation_cache_count_flow(const GenerationCache *cache,
                                    uint32_t flow_id)
 {
-    if (cache == NULL) {
-        return 0;
-    }
-    return cache->flow_counts[flow_stat_index(flow_id)];
+    return flow_generation_count(cache, flow_id);
 }
 
 const GenerationCacheStats *generation_cache_stats(

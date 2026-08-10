@@ -702,6 +702,286 @@ static void test_harness_close_inject_safety(void)
     pthread_cond_destroy(&cap.cv);
 }
 
+static int insert_one(GenerationCache *cache, uint32_t flow_id, uint64_t block_id,
+                      uint64_t now)
+{
+    uint8_t buf[WIRE_HEADER_SIZE + 8];
+    size_t len;
+    WireHeader hdr;
+
+    len = make_data_datagram(buf, sizeof(buf), flow_id, block_id, 0, 1, 4, 7, 8,
+                             8, 0x11);
+    if (wire_header_decode(&hdr, buf, len) != 0) {
+        return -1;
+    }
+    return (int)generation_cache_insert(cache, &hdr, buf, len, now, NULL);
+}
+
+static void test_cache_high_flow_ids_have_independent_per_flow_limits(void)
+{
+    GenerationCache cache;
+    GenerationCacheConfig cfg;
+    uint64_t now = 1000000000ull;
+
+    generation_cache_config_defaults(&cfg);
+    cfg.max_gens_per_flow = 2;
+    cfg.max_gens_global = 64;
+    cfg.max_cache_bytes = 1024 * 1024;
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+
+    EXPECT(insert_one(&cache, 8, 0, now) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 8, 1, now) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 0, now) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 1, now) == GEN_INSERT_OK);
+
+    EXPECT(generation_cache_count_flow(&cache, 8) == 2);
+    EXPECT(generation_cache_count_flow(&cache, 9) == 2);
+    EXPECT(generation_cache_count(&cache) == 4);
+    EXPECT(generation_cache_find(&cache, 8, 0) != NULL);
+    EXPECT(generation_cache_find(&cache, 8, 1) != NULL);
+    EXPECT(generation_cache_find(&cache, 9, 0) != NULL);
+    EXPECT(generation_cache_find(&cache, 9, 1) != NULL);
+    EXPECT(generation_cache_stats(&cache)->gen_evicted == 0);
+    EXPECT(generation_cache_stats(&cache)->gen_admission_failed == 0);
+
+    generation_cache_destroy(&cache);
+}
+
+static void test_cache_high_flow_id_evicts_only_own_generation(void)
+{
+    GenerationCache cache;
+    GenerationCacheConfig cfg;
+    uint64_t now = 2000000000ull;
+
+    generation_cache_config_defaults(&cfg);
+    cfg.max_gens_per_flow = 2;
+    cfg.max_gens_global = 64;
+    cfg.max_cache_bytes = 1024 * 1024;
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+
+    EXPECT(insert_one(&cache, 8, 0, now) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 8, 1, now + 1) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 0, now + 2) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 1, now + 3) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 8, 2, now + 4) == GEN_INSERT_OK);
+
+    EXPECT(generation_cache_count_flow(&cache, 8) == 2);
+    EXPECT(generation_cache_count_flow(&cache, 9) == 2);
+    EXPECT(generation_cache_find(&cache, 8, 0) == NULL); /* same-flow LRU */
+    EXPECT(generation_cache_find(&cache, 8, 1) != NULL);
+    EXPECT(generation_cache_find(&cache, 8, 2) != NULL);
+    EXPECT(generation_cache_find(&cache, 9, 0) != NULL);
+    EXPECT(generation_cache_find(&cache, 9, 1) != NULL);
+    EXPECT(generation_cache_stats(&cache)->gen_evicted >= 1);
+
+    generation_cache_destroy(&cache);
+}
+
+static void test_cache_global_eviction_updates_exact_flow_account(void)
+{
+    GenerationCache cache;
+    GenerationCacheConfig cfg;
+    uint64_t now = 3000000000ull;
+
+    generation_cache_config_defaults(&cfg);
+    cfg.max_gens_global = 2;
+    cfg.max_gens_per_flow = 32;
+    cfg.max_cache_bytes = 1024 * 1024;
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+
+    EXPECT(insert_one(&cache, 8, 0, now) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 0, now + 1) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 10, 0, now + 2) == GEN_INSERT_OK);
+
+    EXPECT(generation_cache_count(&cache) == 2);
+    EXPECT(generation_cache_count_flow(&cache, 8) == 0);
+    EXPECT(generation_cache_find(&cache, 8, 0) == NULL);
+    EXPECT(generation_cache_count_flow(&cache, 9) == 1);
+    EXPECT(generation_cache_count_flow(&cache, 10) == 1);
+
+    /* Freed account for flow 8 can be reused by a new flow. */
+    EXPECT(insert_one(&cache, 11, 0, now + 3) == GEN_INSERT_OK);
+    EXPECT(generation_cache_count_flow(&cache, 11) == 1);
+    EXPECT(generation_cache_count(&cache) == 2);
+
+    generation_cache_destroy(&cache);
+}
+
+static void test_cache_flow_id_zero_and_uint32_max_are_distinct(void)
+{
+    GenerationCache cache;
+    GenerationCacheConfig cfg;
+    uint64_t now = 4000000000ull;
+
+    generation_cache_config_defaults(&cfg);
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+
+    EXPECT(insert_one(&cache, 0, 0, now) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, UINT32_MAX, 0, now + 1) == GEN_INSERT_OK);
+
+    EXPECT(generation_cache_count_flow(&cache, 0) == 1);
+    EXPECT(generation_cache_count_flow(&cache, UINT32_MAX) == 1);
+    EXPECT(generation_cache_count(&cache) == 2);
+    EXPECT(generation_cache_find(&cache, 0, 0) != NULL);
+    EXPECT(generation_cache_find(&cache, UINT32_MAX, 0) != NULL);
+
+    generation_cache_destroy(&cache);
+}
+
+static int insert_payload(GenerationCache *cache, uint32_t flow_id,
+                          uint64_t block_id, uint16_t payload_len, uint64_t now)
+{
+    uint8_t buf[WIRE_HEADER_SIZE + 512];
+    size_t len;
+    WireHeader hdr;
+
+    if (payload_len > 512) {
+        return -1;
+    }
+    len = make_data_datagram(buf, sizeof(buf), flow_id, block_id, 0, 1, 4, 7,
+                             payload_len, payload_len, 0x5A);
+    if (len == 0 || wire_header_decode(&hdr, buf, len) != 0) {
+        return -1;
+    }
+    return (int)generation_cache_insert(cache, &hdr, buf, len, now, NULL);
+}
+
+static size_t live_flow_entries(GenerationCache *cache, uint32_t flow_id,
+                                uint64_t max_block_inclusive)
+{
+    size_t n = 0;
+    uint64_t b;
+
+    for (b = 0; b <= max_block_inclusive; b++) {
+        if (generation_cache_find(cache, flow_id, b) != NULL) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/*
+ * Multi-round make_room: consecutive admissions that each evict, plus one
+ * admission that requires multiple byte-limit victims in a single make_room.
+ * Asserts exact flow accounts stay aligned with live entries (flows 8/9/10).
+ */
+static void test_cache_repeated_evictions_keep_accounts_consistent(void)
+{
+    GenerationCache cache;
+    GenerationCacheConfig cfg;
+    uint64_t now = 5000000000ull;
+    uint64_t evicted_before;
+    uint64_t i;
+
+    generation_cache_config_defaults(&cfg);
+    cfg.max_gens_global = 4;
+    cfg.max_gens_per_flow = 2;
+    cfg.max_cache_bytes = 1024 * 1024;
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+
+    EXPECT(insert_one(&cache, 8, 0, now++) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 8, 1, now++) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 0, now++) == GEN_INSERT_OK);
+    EXPECT(insert_one(&cache, 9, 1, now++) == GEN_INSERT_OK);
+    EXPECT(generation_cache_count(&cache) == 4);
+    EXPECT(generation_cache_count_flow(&cache, 8) == 2);
+    EXPECT(generation_cache_count_flow(&cache, 9) == 2);
+    EXPECT(generation_cache_count_flow(&cache, 10) == 0);
+
+    evicted_before = generation_cache_stats(&cache)->gen_evicted;
+
+    for (i = 0; i < 6; i++) {
+        EXPECT(insert_one(&cache, 10, i, now++) == GEN_INSERT_OK);
+        EXPECT(generation_cache_count(&cache) == 4);
+        EXPECT(generation_cache_count_flow(&cache, 8) +
+                   generation_cache_count_flow(&cache, 9) +
+                   generation_cache_count_flow(&cache, 10) ==
+               4);
+        EXPECT(generation_cache_count_flow(&cache, 10) <= 2);
+        EXPECT(generation_cache_count_flow(&cache, 10) ==
+               live_flow_entries(&cache, 10, i));
+        EXPECT(generation_cache_count_flow(&cache, 8) ==
+               live_flow_entries(&cache, 8, 1));
+        EXPECT(generation_cache_count_flow(&cache, 9) ==
+               live_flow_entries(&cache, 9, 1));
+    }
+    EXPECT(generation_cache_stats(&cache)->gen_evicted >= evicted_before + 6);
+    EXPECT(generation_cache_count_flow(&cache, 10) == 2);
+
+    generation_cache_destroy(&cache);
+
+    /* One insert → multiple make_room iterations (byte budget). */
+    generation_cache_config_defaults(&cfg);
+    cfg.max_gens_global = 16;
+    cfg.max_gens_per_flow = 16;
+    cfg.max_cache_bytes = 200;
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+
+    /* len = 44+36 = 80 each → two gens use 160. */
+    EXPECT(insert_payload(&cache, 8, 0, 36, now++) == GEN_INSERT_OK);
+    EXPECT(insert_payload(&cache, 9, 0, 36, now++) == GEN_INSERT_OK);
+    EXPECT(generation_cache_count(&cache) == 2);
+    EXPECT(generation_cache_count_flow(&cache, 8) == 1);
+    EXPECT(generation_cache_count_flow(&cache, 9) == 1);
+
+    evicted_before = generation_cache_stats(&cache)->gen_evicted;
+    /* len = 44+106 = 150; 160+150 > 200 → need two 80-byte victims. */
+    EXPECT(insert_payload(&cache, 10, 0, 106, now++) == GEN_INSERT_OK);
+    EXPECT(generation_cache_stats(&cache)->gen_evicted >= evicted_before + 2);
+    EXPECT(generation_cache_count(&cache) == 1);
+    EXPECT(generation_cache_count_flow(&cache, 8) == 0);
+    EXPECT(generation_cache_count_flow(&cache, 9) == 0);
+    EXPECT(generation_cache_count_flow(&cache, 10) == 1);
+    EXPECT(generation_cache_find(&cache, 10, 0) != NULL);
+    EXPECT(generation_cache_count_flow(&cache, 8) +
+               generation_cache_count_flow(&cache, 9) +
+               generation_cache_count_flow(&cache, 10) ==
+           generation_cache_count(&cache));
+
+    generation_cache_destroy(&cache);
+}
+
+static int noop_local_delivery(const uint8_t *datagram, size_t len,
+                               const WireHeader *hdr, void *arg)
+{
+    (void)datagram;
+    (void)len;
+    (void)hdr;
+    (void)arg;
+    return 0;
+}
+
+static void test_local_packets_still_bypass_generation_cache(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg = harness_cfg(RELAY_PROCESS_CACHE, 64);
+    uint8_t buf[WIRE_HEADER_SIZE + 8];
+    size_t len;
+
+    /* reject_local_encoder_loopback=0 requires delivery_fn, else init forces 1. */
+    cfg.local_node_id = 4;
+    cfg.delivery_fn = noop_local_delivery;
+    cfg.delivery_ctx = NULL;
+    cfg.reject_local_encoder_loopback = 0;
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+    pthread_cond_init(&cap.cv, NULL);
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    len = make_data_datagram(buf, sizeof(buf), 8, 1, 0, 1, 4, 8, 8, 8, 0x42);
+    EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
+    EXPECT(relay_total_stats(ctx)->local_deliver >= 1);
+    EXPECT(relay_total_stats(ctx)->forward == 0);
+    EXPECT(cap.count == 0);
+    EXPECT(generation_cache_count(relay_generation_cache(ctx)) == 0);
+    EXPECT(relay_total_stats(ctx)->gen_created == 0);
+
+    relay_harness_close(ctx);
+    pthread_mutex_destroy(&cap.mu);
+    pthread_cond_destroy(&cap.cv);
+}
+
 int main(void)
 {
     test_key_isolation_flow();
@@ -717,6 +997,13 @@ int main(void)
     test_queue_full_cache_survives();
     test_admission_still_forwards();
     test_harness_close_inject_safety();
+
+    test_cache_high_flow_ids_have_independent_per_flow_limits();
+    test_cache_high_flow_id_evicts_only_own_generation();
+    test_cache_global_eviction_updates_exact_flow_account();
+    test_cache_flow_id_zero_and_uint32_max_are_distinct();
+    test_cache_repeated_evictions_keep_accounts_consistent();
+    test_local_packets_still_bypass_generation_cache();
 
     if (g_failures != 0) {
         fprintf(stderr, "relay_gen_cache_tests: %d failure(s)\n", g_failures);
