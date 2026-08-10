@@ -136,7 +136,7 @@ static WireGroup *allocate_group(WireGroup groups[WIRE_FLOW_GROUP_WINDOW],
     return NULL;
 }
 
-static bool group_complete(const WireGroup *group)
+static bool group_all_shards_present(const WireGroup *group)
 {
     size_t shard;
 
@@ -170,13 +170,48 @@ static unsigned group_received_count(const WireGroup *group)
     return count;
 }
 
+/*
+ * Systematic codecs lay out original data in shards [0, Codec_data_shards()).
+ * All of those must be present — not merely received_count >= data_shards.
+ */
+static bool group_systematic_data_ready(const WireGroup *group,
+                                        const Codec *codec)
+{
+    size_t data_shards;
+    size_t parity_shards;
+    size_t shard;
+
+    if (group == NULL || codec == NULL || group->received_bits == NULL ||
+        !Codec_is_systematic(codec)) {
+        return false;
+    }
+    data_shards = Codec_data_shards(codec);
+    parity_shards = Codec_parity_shards(codec);
+    if (data_shards == 0 ||
+        group->shard_count != data_shards + parity_shards) {
+        return false;
+    }
+    for (shard = 0; shard < data_shards; shard++) {
+        if (!codec_present_get(group->received_bits, shard)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool group_ready_to_emit(const WireGroup *group, const Codec *codec)
+{
+    return group_all_shards_present(group) ||
+           group_systematic_data_ready(group, codec);
+}
+
 static int recover_group(WireGroup *group, const Codec *codec,
                          uint64_t *recovered_groups)
 {
     size_t data_shards;
     CodecRecoverStatus status;
 
-    if (group == NULL || codec == NULL || group_complete(group)) {
+    if (group == NULL || codec == NULL || group_all_shards_present(group)) {
         return 0;
     }
 
@@ -392,11 +427,19 @@ static int flush_recoverable_groups(WireFlowDecoder *dec)
         if (group == NULL) {
             return 0;
         }
-        if (recover_group(group, dec->codec, &dec->stats.recovered_groups) != 0) {
-            return -1;
-        }
-        if (!group_complete(group)) {
-            return 0;
+        /*
+         * Emit when all original data shards are present (systematic) or the
+         * full group is present. Otherwise try FEC recover, then require a
+         * full group. Always emit only for next_block (ordered).
+         */
+        if (!group_ready_to_emit(group, dec->codec)) {
+            if (recover_group(group, dec->codec,
+                              &dec->stats.recovered_groups) != 0) {
+                return -1;
+            }
+            if (!group_all_shards_present(group)) {
+                return 0;
+            }
         }
         if (write_decoded_group(dec, group) != 0) {
             return -1;
@@ -462,7 +505,7 @@ int wire_flow_decoder_flush_best_effort(WireFlowDecoder *dec)
         if (recover_group(group, dec->codec, &dec->stats.recovered_groups) != 0) {
             return -1;
         }
-        if (group_complete(group)) {
+        if (group_ready_to_emit(group, dec->codec)) {
             if (write_decoded_group(dec, group) != 0) {
                 return -1;
             }

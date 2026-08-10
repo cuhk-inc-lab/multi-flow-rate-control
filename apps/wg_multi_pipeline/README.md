@@ -35,11 +35,19 @@ cmp c.ts  out_c.ts
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
-The local demo transfer does not drop packets. The wire UDP receiver recovers
-one missing XOR FEC shard automatically when it receives 4 of 5 shards. With
-`rs-fec` or `rs`, it recovers up to two missing shards when any 4 of 6 shards
-arrive. `rs` and `rs-fec` share geometry but are not wire-compatible (different
-parity); send and receive must use the same `--codec`.
+The local demo transfer does not drop packets. On the wire UDP receiver / shared
+`WireFlowDecoder`:
+
+- **Systematic codecs** (`copy`, `xor-fec`, `rs-fec`, `rs`): a block may decode
+  once every original data shard in `[0, Codec_data_shards())` is present.
+  Missing pad/parity shards do **not** block that block. Receiving `k` arbitrary
+  shards (with a data shard still missing) is **not** enough.
+- **Non-systematic** (`block`): still requires a full group (or unchanged
+  recover path); no data-only fast path.
+- **FEC recover** (`xor-fec` / `rs-fec` / `rs`): if any required data shard is
+  missing, keep the existing recover threshold (e.g. XOR one erasure; RS any
+  `k` of `n`). `rs` and `rs-fec` share geometry but are not wire-compatible;
+  send and receive must use the same `--codec`.
 
 ```bash
 ./build/wg_multi_pipeline --no-pace --codec xor-fec input.ts output.ts

@@ -52,6 +52,10 @@ UDP RX / inject
   `shard_count` (must equal fixed `expected_shards`) → metadata mismatch +
   drop. RS geometry is process startup config (`--rs-k` / `--rs-parity`);
   wire `shard_count` does not retune the global RS profile.
+- Local decode uses `WireFlowDecoder`: systematic codecs may finish a block
+  when all original data shards are present even if pad/parity shards are
+  lost; missing any data shard still requires FEC recover or else strict
+  incomplete.
 - With `--local-decode`, `reject_local_encoder_loopback` is cleared so
   `LOCAL_ENCODER` packets with `final_dst==local` can sink-decode.
 - Without `--local-decode`, delivery stays count-only (default).

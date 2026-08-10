@@ -291,8 +291,8 @@ static void test_rs_valid_fixed_geometry_still_recovers(void)
     dec = wire_flow_decoder_create(&cfg);
     EXPECT(dec != NULL);
 
-    /* Drop one parity shard; recover must still succeed under fixed geometry. */
-    EXPECT(ingest_rs_block(dec, 3, 0, encoded, expected, valid_len, 5u) == 0);
+    /* Drop data shard 1; recover from remaining data + parity (not fast-path). */
+    EXPECT(ingest_rs_block(dec, 3, 0, encoded, expected, valid_len, 1u) == 0);
     fill_header_end(&end, 3, 1, expected);
     EXPECT(wire_flow_decoder_ingest(dec, &end, NULL, 0) == 0);
 

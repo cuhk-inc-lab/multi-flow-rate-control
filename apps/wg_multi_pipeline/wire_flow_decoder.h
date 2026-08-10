@@ -5,6 +5,13 @@
  * Per-flow wire shard reassembly + Codec_recover/Codec_decode.
  * Extracted from the former static receiver path in wire_udp.c (L0).
  * Output is always via WireDecodeOutputFn (no FILE* inside the decoder).
+ *
+ * Emit conditions (ordered by next_block):
+ * - all shards present, or
+ * - systematic: every original data shard in [0, Codec_data_shards()) present
+ *   (parity/pad may be missing), or
+ * - FEC recover restores a full group.
+ * received_count >= data_shards alone is never sufficient.
  */
 
 #include "codec.h"

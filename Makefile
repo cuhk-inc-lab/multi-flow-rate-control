@@ -121,6 +121,7 @@ RELAY_GEN_CACHE_TEST_BIN = $(OBJ_DIR)/relay_gen_cache_tests
 RELAY_LOCAL_DECODE_TEST_BIN = $(OBJ_DIR)/relay_local_decode_tests
 WIRE_UDP_RECV_DEMUX_TEST_BIN = $(OBJ_DIR)/wire_udp_recv_demux_tests
 WIRE_FLOW_DECODER_RS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_rs_tests
+WIRE_FLOW_DECODER_SYS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_systematic_tests
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
@@ -139,20 +140,24 @@ rs-recovery-bench: $(RS_RECOVERY_BENCH_BIN)
 	./$(RS_RECOVERY_BENCH_BIN)
 
 test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN) \
-	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN)
+	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN) \
+	$(WIRE_FLOW_DECODER_SYS_TEST_BIN)
 	./$(TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
 	./$(RELAY_LOCAL_DECODE_TEST_BIN)
 	./$(WIRE_UDP_RECV_DEMUX_TEST_BIN)
 	./$(WIRE_FLOW_DECODER_RS_TEST_BIN)
+	./$(WIRE_FLOW_DECODER_SYS_TEST_BIN)
 
 integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN) \
-	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN)
+	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN) \
+	$(WIRE_FLOW_DECODER_SYS_TEST_BIN)
 	./$(WG_CODEC_TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
 	./$(RELAY_LOCAL_DECODE_TEST_BIN)
 	./$(WIRE_UDP_RECV_DEMUX_TEST_BIN)
 	./$(WIRE_FLOW_DECODER_RS_TEST_BIN)
+	./$(WIRE_FLOW_DECODER_SYS_TEST_BIN)
 	dd if=/dev/urandom of=$(WG_TEST_IN0) bs=1400 count=20 status=none
 	dd if=/dev/urandom of=$(WG_TEST_IN1) bs=5600 count=5 status=none
 	dd if=/dev/urandom of=$(WG_TEST_IN2) bs=1400 count=40 status=none
@@ -249,6 +254,19 @@ $(WIRE_FLOW_DECODER_RS_TEST_BIN): $(TEST_DIR)/wire_flow_decoder_rs_tests.c \
 	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) $(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) \
 		$(TEST_DIR)/wire_flow_decoder_rs_tests.c \
+		$(OBJ_DIR)/wg_wire_flow_decoder.o $(OBJ_DIR)/wg_codec.o \
+		$(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
+		$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
+		$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) $(OBJ_DIR)/wire_header.o \
+		-o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
+$(WIRE_FLOW_DECODER_SYS_TEST_BIN): $(TEST_DIR)/wire_flow_decoder_systematic_tests.c \
+	$(OBJ_DIR)/wg_wire_flow_decoder.o $(OBJ_DIR)/wg_codec.o \
+	$(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
+	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) $(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) \
+		$(TEST_DIR)/wire_flow_decoder_systematic_tests.c \
 		$(OBJ_DIR)/wg_wire_flow_decoder.o $(OBJ_DIR)/wg_codec.o \
 		$(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
 		$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
