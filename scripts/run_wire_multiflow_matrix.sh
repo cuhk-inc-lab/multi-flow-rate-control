@@ -54,6 +54,10 @@ node2_ssh=${NODE2_SSH:-"fyp1@10.10.10.162"}
 node3_ssh=${NODE3_SSH:-"fyp1@10.10.10.163"}
 node2_ifaces=${NODE2_IFACES:-"ap0 station1"}
 node3_ifaces=${NODE3_IFACES:-"ap1 station2"}
+# Optional RS geometry for --codec rs (process-fixed on sender+receiver).
+rs_k=${RS_K:-}
+rs_parity=${RS_PARITY:-}
+rs_profile=${RS_PROFILE:-}
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_dir=${RESULT_DIR:-"build/wire-multiflow-$timestamp"}
 ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
@@ -61,6 +65,30 @@ bin_rel="./build/wg_multi_pipeline"
 input_count=$#
 user_files=0
 flows=
+rs_codec_args=
+
+# Build shared --rs-* args once (empty unless codec=rs needs them).
+if [ -n "$rs_profile" ]; then
+    rs_codec_args="--rs-profile=$rs_profile"
+elif [ -n "$rs_k" ] && [ -n "$rs_parity" ]; then
+    rs_codec_args="--rs-k=$rs_k --rs-parity=$rs_parity"
+elif [ -n "$rs_k" ] || [ -n "$rs_parity" ]; then
+    echo "error: set both RS_K and RS_PARITY, or RS_PROFILE=K+R" >&2
+    exit 2
+fi
+
+# Derive k/r for loss_stats when profile string is used.
+if [ -n "$rs_profile" ] && { [ -z "$rs_k" ] || [ -z "$rs_parity" ]; }; then
+    rs_k=${rs_profile%%+*}
+    rs_parity=${rs_profile##*+}
+fi
+# Defaults match codec rs process default when unset.
+if [ -z "$rs_k" ]; then
+    rs_k=4
+fi
+if [ -z "$rs_parity" ]; then
+    rs_parity=2
+fi
 
 if [ "$input_count" -gt 1 ]; then
     user_files=1
@@ -101,6 +129,8 @@ Env:
                           use 0 = no wire source_rate pacing (omit :rate on --flow)
   FLOWS=N                 seed mode only; with multiple FILEs, count is automatic
   DURATION_S=10           seed mode only (payload ≈ rate × duration)
+  RS_K / RS_PARITY        for --codec rs (e.g. RS_K=16 RS_PARITY=2)
+  RS_PROFILE=K+R          alternate to RS_K/RS_PARITY (e.g. 16+2)
   IDLE_SEC=10
   PORT_BASE=9100
   KEEP_REMOTE_OUTPUT=1   keep remote out_* (set 0 to delete after hash check)
@@ -294,9 +324,11 @@ loss_stats() {
     recovered=$7
     recv_blocks=$8
     expect_blocks=$9
+    data_k=${10:-4}
+    parity_r=${11:-2}
 
     python3 - "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" "$dropped" "$recovered" \
-        "$recv_blocks" "$expect_blocks" <<'PY'
+        "$recv_blocks" "$expect_blocks" "$data_k" "$parity_r" <<'PY'
 import math, sys
 
 codec = sys.argv[1].strip().lower()
@@ -313,7 +345,36 @@ def as_int(v):
     except ValueError:
         return None
 
-shards = {"copy": 8, "block": 8, "xor-fec": 5, "rs-fec": 6, "rs": 6}.get(codec, 8)
+try:
+    data_k = max(1, int(sys.argv[10]))
+except ValueError:
+    data_k = 4
+try:
+    parity_r = max(0, int(sys.argv[11]))
+except ValueError:
+    parity_r = 2
+
+pkg = 1400
+# Match apps/wg_multi_pipeline stream_config / codec geometry.
+if codec == "none":
+    shards = 1
+    input_block = pkg
+elif codec == "xor-fec":
+    shards = 5
+    input_block = 4 * pkg
+elif codec == "rs-fec":
+    shards = 6
+    input_block = 4 * pkg
+elif codec in ("rs",):
+    shards = data_k + parity_r
+    input_block = data_k * pkg
+elif codec in ("copy", "block"):
+    shards = 8
+    input_block = 4 * pkg
+else:
+    shards = 8
+    input_block = 4 * pkg
+
 datagrams = as_int(sys.argv[3])
 seen = as_int(sys.argv[4])
 late = as_int(sys.argv[5])
@@ -321,9 +382,6 @@ dropped = as_int(sys.argv[6])
 recovered = as_int(sys.argv[7])
 recv_blocks = as_int(sys.argv[8])
 expect_blocks = as_int(sys.argv[9])
-# Prefer receiver expected_blocks. Fallback matches stream_config.h
-# DECODE_BLOCK = PKG_SIZE * 4 (PKG_SIZE currently 1400).
-input_block = 4 * 1400
 if expect_blocks is not None and expect_blocks > 0:
     blocks = expect_blocks
 elif payload > 0:
@@ -654,6 +712,9 @@ fi
     echo "- **When:** $run_started_at | sender \`$local_rev\` / recv \`$remote_rev\`"
     echo "- **Path:** $sender_host → $receiver_ssh ($receiver_ip)"
     echo "- **Flows:** $flows concurrent | codecs: $codecs | source rates: $rates Mbps/flow"
+    if [ -n "$rs_codec_args" ]; then
+        echo "- **RS geometry:** $rs_codec_args (k=$rs_k, r=$rs_parity, n=$((rs_k + rs_parity)))"
+    fi
     if [ "$user_files" -eq 1 ]; then
         echo "- **Inputs:**"
         fid=0
@@ -790,9 +851,14 @@ for codec in $codecs; do
             "cd '$remote_repo' && rm -rf '$remote_base' && mkdir -p '$remote_base'" \
             || die "cannot create remote dir"
 
+        case_rs_args=
+        if [ "$codec" = "rs" ] && [ -n "$rs_codec_args" ]; then
+            case_rs_args=$rs_codec_args
+        fi
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
             "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
+              $case_rs_args \
               --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle' \
               $out_suffix_args $decode_mark_opt" \
             > "$receiver_log" 2>&1 &
@@ -819,7 +885,8 @@ for codec in $codecs; do
             echo "  receiver exited early; see $receiver_log" >&2
         else
             # shellcheck disable=SC2086
-            if ./build/wg_multi_pipeline $pace_opt --codec "$codec" --udp-send-multi \
+            if ./build/wg_multi_pipeline $pace_opt --codec "$codec" $case_rs_args \
+                --udp-send-multi \
                 $flow_args > "$sender_log" 2>&1; then
                 sender_rc=0
                 echo "  sender done (rc=0)"
@@ -985,7 +1052,8 @@ for codec in $codecs; do
 
             # shellcheck disable=SC2086
             set -- $(loss_stats "$codec" "$payload_bytes" "$datagrams" "$seen" "$late" \
-                "$dropped" "$recovered" "$recv_blocks" "$expect_blocks")
+                "$dropped" "$recovered" "$recv_blocks" "$expect_blocks" \
+                "$rs_k" "$rs_parity")
             est_loss=${1:-NA}
 
             echo "$codec,$rate,$fid,$flow_status,$est_loss,$payload_bytes,$out_bytes,$e2e_p95,$mark_found,$fail_reason" \
