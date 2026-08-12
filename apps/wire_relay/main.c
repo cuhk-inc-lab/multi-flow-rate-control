@@ -20,6 +20,7 @@ static void print_usage(const char *prog)
             "     [--max-gens-per-flow N] [--max-cache-bytes N]\n"
             "     [--local-decode --codec copy|xor-fec|rs-fec|rs\n"
             "         (--output FILE | --output-dir DIR)]\n"
+            "     [--test-tx-hold-us N]   (TEST ONLY; default 0)\n"
             "\n"
             "Explicit-hop opaque UDP relay (wire header v3).\n"
             "RX -> per-flow deferred packet queue -> processing worker ->\n"
@@ -121,6 +122,7 @@ int main(int argc, char **argv)
     size_t deferred_per_flow = RELAY_DEFAULT_DEFERRED_PER_FLOW;
     size_t deferred_total = RELAY_DEFAULT_DEFERRED_TOTAL;
     uint32_t max_active_flows = RELAY_DEFAULT_MAX_ACTIVE_FLOWS;
+    uint32_t test_tx_hold_us = 0;
     RelayProcessMode process_mode = RELAY_PROCESS_FORWARD;
     uint32_t gen_timeout_ms = GEN_CACHE_DEFAULT_TIMEOUT_MS;
     size_t max_gens_global = GEN_CACHE_DEFAULT_MAX_GENS_GLOBAL;
@@ -295,6 +297,17 @@ int main(int argc, char **argv)
             }
             max_cache_bytes = (uint64_t)parsed;
             argi += 2;
+        } else if (strcmp(argv[argi], "--test-tx-hold-us") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed > UINT32_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            test_tx_hold_us = (uint32_t)parsed;
+            argi += 2;
         } else if (strcmp(argv[argi], "--local-decode") == 0) {
             local_decode = 1;
             argi += 1;
@@ -366,6 +379,7 @@ int main(int argc, char **argv)
     cfg.deferred_per_flow = deferred_per_flow;
     cfg.deferred_total = deferred_total;
     cfg.max_active_flows = max_active_flows;
+    cfg.test_tx_hold_us = test_tx_hold_us;
     cfg.reject_local_encoder_loopback = 1;
     cfg.gen_timeout_ms = gen_timeout_ms;
     cfg.max_gens_global = max_gens_global;

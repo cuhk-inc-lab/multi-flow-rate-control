@@ -19,6 +19,15 @@
 
 #define RELAY_UDP_SOCKBUF (8 * 1024 * 1024)
 
+/*
+ * TEST ONLY build switch for HOL baseline (Phase 0 single-RX behavior):
+ *   make wire-relay-hol-baseline  → -DRELAY_TEST_INLINE_RX=1
+ * Production wire_relay keeps deferred RX (default 0).
+ */
+#ifndef RELAY_TEST_INLINE_RX
+#define RELAY_TEST_INLINE_RX 0
+#endif
+
 struct RelayCtx {
     RelayConfig                 config;
     EgressQueue                 egress;
@@ -630,6 +639,20 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
 
 static void *tx_worker_main(void *arg);
 
+static void sync_deferred_drops_to_total(RelayCtx *ctx)
+{
+    RelayDeferredHubStats ds;
+
+    if (ctx == NULL || !ctx->deferred_inited) {
+        return;
+    }
+    relay_deferred_hub_stats_snapshot(&ctx->deferred, &ds);
+    ctx->total.drop_deferred_overflow_flow = ds.drop_overflow_flow;
+    ctx->total.drop_deferred_overflow_total = ds.drop_overflow_total;
+    ctx->total.drop_deferred_table_full = ds.drop_table_full;
+}
+
+#if !RELAY_TEST_INLINE_RX
 /*
  * Minimal RX parse via wire_header_decode (length / magic / version / endian).
  * Does not perform destination, TTL, cache, or recode work.
@@ -654,19 +677,6 @@ static void account_deferred_push_fail(RelayCtx *ctx, RelayDeferredStatus st)
     /* Hub already counted the matching drop_* under deferred.mu. */
     (void)ctx;
     (void)st;
-}
-
-static void sync_deferred_drops_to_total(RelayCtx *ctx)
-{
-    RelayDeferredHubStats ds;
-
-    if (ctx == NULL || !ctx->deferred_inited) {
-        return;
-    }
-    relay_deferred_hub_stats_snapshot(&ctx->deferred, &ds);
-    ctx->total.drop_deferred_overflow_flow = ds.drop_overflow_flow;
-    ctx->total.drop_deferred_overflow_total = ds.drop_overflow_total;
-    ctx->total.drop_deferred_table_full = ds.drop_table_full;
 }
 
 /*
@@ -709,6 +719,7 @@ static void rx_enqueue_datagram(RelayCtx *ctx, uint8_t **datagram_owned,
         pkt.datagram = NULL;
     }
 }
+#endif /* !RELAY_TEST_INLINE_RX */
 
 static void process_one_deferred_packet(RelayCtx *ctx, RelayDeferredPacket *pkt)
 {
@@ -787,6 +798,21 @@ static void *processing_worker_main(void *arg)
     return NULL;
 }
 
+static void tx_test_hold(const RelayCtx *ctx)
+{
+    uint32_t hold_us;
+
+    if (ctx == NULL) {
+        return;
+    }
+    hold_us = ctx->config.test_tx_hold_us;
+    if (hold_us == 0) {
+        return;
+    }
+    /* TEST ONLY: artificial TX delay to build egress backlog. */
+    usleep(hold_us);
+}
+
 static void *tx_worker_main(void *arg)
 {
     RelayCtx *ctx = arg;
@@ -804,6 +830,9 @@ static void *tx_worker_main(void *arg)
         if (st != EGRESS_OK || pkt.datagram == NULL) {
             continue;
         }
+
+        /* After ownership leaves the queue, before send/capture. */
+        tx_test_hold(ctx);
 
         if (ctx->tx_capture_fn != NULL) {
             ctx->tx_capture_fn(pkt.datagram, pkt.len, ctx->tx_capture_ctx);
@@ -1150,7 +1179,7 @@ RelayStatus relay_run(const RelayConfig *config)
             "wire-relay: local_node_id=%u listen=%u next-hop=%s:%u "
             "egress_capacity=%zu egress_wait_ms=%u "
             "deferred_per_flow=%zu deferred_total=%zu max_active_flows=%u "
-            "process=%s recode=%s\n",
+            "test_tx_hold_us=%u inline_rx=%d process=%s recode=%s\n",
             (unsigned)ctx.config.local_node_id,
             (unsigned)ctx.config.listen_port,
             ctx.config.next_hop_host,
@@ -1160,8 +1189,16 @@ RelayStatus relay_run(const RelayConfig *config)
             ctx.config.deferred_per_flow,
             ctx.config.deferred_total,
             (unsigned)ctx.config.max_active_flows,
+            (unsigned)ctx.config.test_tx_hold_us,
+            RELAY_TEST_INLINE_RX,
             ctx.cache_enabled ? "cache" : "forward",
             ctx.config.recode_fn != NULL ? "enabled" : "disabled");
+    if (ctx.config.test_tx_hold_us != 0) {
+        fprintf(stderr,
+                "wire-relay: WARNING test-only TX hold enabled (%u us); "
+                "not for production\n",
+                (unsigned)ctx.config.test_tx_hold_us);
+    }
 
     last_rx_ns = relay_mono_ns();
     while (!ctx.stop) {
@@ -1232,8 +1269,29 @@ RelayStatus relay_run(const RelayConfig *config)
             continue;
         }
         memcpy(owned, rxbuf, (size_t)received);
+#if RELAY_TEST_INLINE_RX
+        /*
+         * TEST ONLY HOL baseline: process on the RX thread (may timed-wait
+         * on egress). Production builds use deferred enqueue instead.
+         */
+        {
+            DeferredLocalDelivery deferred;
+            ForwardPending forward_pending;
+
+            memset(&deferred, 0, sizeof(deferred));
+            memset(&forward_pending, 0, sizeof(forward_pending));
+            pthread_mutex_lock(&ctx.ingress_mu);
+            (void)ingress_submit_owned(&ctx, &owned, (size_t)received,
+                                       RELAY_SRC_PREVIOUS_NODE, &deferred,
+                                       &forward_pending);
+            pthread_mutex_unlock(&ctx.ingress_mu);
+            run_deferred_local_delivery(&deferred);
+            relay_apply_forward_pending(&ctx, &forward_pending);
+        }
+#else
         /* RX never waits on egress; processing owns ingress/egress work. */
         rx_enqueue_datagram(&ctx, &owned, (size_t)received);
+#endif
     }
 
     ctx.stop = 1;

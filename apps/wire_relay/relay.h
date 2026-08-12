@@ -105,6 +105,12 @@ typedef struct RelayConfig {
     size_t              deferred_total;
     uint32_t            max_active_flows;
     /*
+     * TEST ONLY: microseconds to sleep in the TX worker after dequeue and
+     * before sendto/capture. Default 0 (no delay). Used to force egress
+     * backlog in HOL experiments; must not be used in production.
+     */
+    uint32_t            test_tx_hold_us;
+    /*
      * Wire-level local injection: if final_dst == local_node_id, reject by
      * default (1). Set 0 to deliver via delivery_fn instead.
      */

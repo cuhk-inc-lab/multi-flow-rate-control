@@ -132,13 +132,25 @@ WIRE_FLOW_DECODER_SYS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_systematic_tests
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
-.PHONY: all test check wg-demo wire-relay integration-test fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
+.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline integration-test fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
 
 all: $(LIB)
 
 wg-demo: $(WG_BIN)
 
 wire-relay: $(RELAY_BIN)
+
+# TEST ONLY: Phase-0 HOL baseline (inline RX on the recv thread).
+wire-relay-hol-baseline: $(OBJ_DIR)/wire_relay_hol_baseline
+
+$(OBJ_DIR)/relay_relay_inline.o: $(RELAY_DIR)/relay.c $(INCLUDE_HDRS) $(RELAY_HDRS) $(WG_HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -DRELAY_TEST_INLINE_RX=1 -I$(RELAY_DIR) -I$(WG_DIR) -c $< -o $@
+
+$(OBJ_DIR)/wire_relay_hol_baseline: $(OBJ_DIR)/relay_main.o $(OBJ_DIR)/relay_relay_inline.o \
+	$(OBJ_DIR)/relay_recode.o $(OBJ_DIR)/relay_egress_queue.o $(OBJ_DIR)/relay_deferred.o \
+	$(OBJ_DIR)/relay_generation_cache.o $(OBJ_DIR)/relay_local_decode.o \
+	$(OBJ_DIR)/wire_header.o $(RELAY_DECODE_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 fec-trace: $(FEC_TRACE_BIN)
 	./$(FEC_TRACE_BIN)
