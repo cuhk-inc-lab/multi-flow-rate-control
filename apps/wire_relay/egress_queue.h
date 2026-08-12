@@ -19,18 +19,29 @@ typedef enum {
     EGRESS_ERR_ALLOC = -2,
     EGRESS_ERR_FULL = -3,
     EGRESS_ERR_EMPTY = -4,
-    EGRESS_ERR_SHUTDOWN = -5
+    EGRESS_ERR_SHUTDOWN = -5,
+    EGRESS_ERR_TIMEOUT = -6
 } EgressStatus;
 
+typedef struct EgressQueueStats {
+    uint64_t enqueue_immediate;
+    uint64_t enqueue_waited;
+    uint64_t wait_ns_total;
+    uint64_t wait_ns_max;
+    uint64_t high_watermark;
+} EgressQueueStats;
+
 typedef struct EgressQueue {
-    EgressPacket   *slots;
-    size_t          capacity;
-    size_t          head;
-    size_t          tail;
-    size_t          count;
-    pthread_mutex_t mutex;
-    pthread_cond_t  not_empty;
-    int             shutdown;
+    EgressPacket      *slots;
+    size_t             capacity;
+    size_t             head;
+    size_t             tail;
+    size_t             count;
+    pthread_mutex_t    mutex;
+    pthread_cond_t     not_empty;
+    pthread_cond_t     not_full;
+    int                shutdown;
+    EgressQueueStats   stats;
 } EgressQueue;
 
 EgressStatus egress_queue_init(EgressQueue *q, size_t capacity);
@@ -39,9 +50,24 @@ void         egress_queue_shutdown(EgressQueue *q);
 
 /*
  * Non-blocking enqueue. On success, ownership of pkt->datagram moves into the
- * queue; caller must not free it. On failure, ownership remains with caller.
+ * queue and pkt->datagram is set to NULL. On failure, ownership remains with
+ * caller and pkt->datagram is unchanged.
  */
 EgressStatus egress_queue_try_enqueue(EgressQueue *q, EgressPacket *pkt);
+
+/*
+ * Timed blocking enqueue when the queue is full.
+ *
+ * Ownership contract (same as try_enqueue):
+ *   EGRESS_OK:        pkt->datagram moves into the queue; set to NULL.
+ *   EGRESS_ERR_TIMEOUT / EGRESS_ERR_SHUTDOWN / EGRESS_ERR_INVALID:
+ *                     ownership stays with caller; pkt->datagram unchanged.
+ *
+ * timeout_ms must be > 0. Waits at most timeout_ms (CLOCK_MONOTONIC) for
+ * space; does not drop or replace existing queue entries.
+ */
+EgressStatus egress_queue_timed_enqueue(EgressQueue *q, EgressPacket *pkt,
+                                        uint32_t timeout_ms);
 
 /*
  * Blocking dequeue until a packet is available or shutdown with empty queue.
@@ -50,5 +76,8 @@ EgressStatus egress_queue_try_enqueue(EgressQueue *q, EgressPacket *pkt);
 EgressStatus egress_queue_dequeue(EgressQueue *q, EgressPacket *out);
 
 size_t egress_queue_count(const EgressQueue *q);
+
+/* Thread-safe snapshot of queue-global enqueue/wait metrics. */
+void egress_queue_stats_snapshot(const EgressQueue *q, EgressQueueStats *out);
 
 #endif /* WIRE_RELAY_EGRESS_QUEUE_H */

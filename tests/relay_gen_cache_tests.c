@@ -247,6 +247,23 @@ typedef struct {
     int             count;
 } TxCapture;
 
+typedef struct {
+    TxCapture *cap;
+    int delay_ms;
+} CaptureReleaseArgs;
+
+static void *release_capture_after_delay(void *arg)
+{
+    CaptureReleaseArgs *ra = arg;
+
+    usleep((useconds_t)ra->delay_ms * 1000u);
+    pthread_mutex_lock(&ra->cap->mu);
+    ra->cap->released = 1;
+    pthread_cond_broadcast(&ra->cap->cv);
+    pthread_mutex_unlock(&ra->cap->mu);
+    return NULL;
+}
+
 static void tx_capture_cb(const uint8_t *datagram, size_t len, void *arg)
 {
     TxCapture *cap = arg;
@@ -275,6 +292,7 @@ static RelayConfig harness_cfg(RelayProcessMode mode, size_t egress_cap)
     cfg.local_node_id = 2;
     cfg.process_mode = mode;
     cfg.egress_capacity = egress_cap;
+    cfg.egress_wait_ms = 2;
     cfg.reject_local_encoder_loopback = 1;
     cfg.gen_timeout_ms = 500;
     cfg.max_gens_global = 32;
@@ -390,6 +408,8 @@ static void test_queue_full_cache_survives(void)
     const RelayFlowStats *st;
     GenerationEntry *entry;
 
+    cfg.egress_wait_ms = 0; /* try-drop baseline */
+
     memset(&cap, 0, sizeof(cap));
     cap.hold = 1;
     pthread_mutex_init(&cap.mu, NULL);
@@ -422,6 +442,108 @@ static void test_queue_full_cache_survives(void)
     relay_harness_close(ctx);
     pthread_mutex_destroy(&cap.mu);
     pthread_cond_destroy(&cap.cv);
+}
+
+static void run_queue_pressure(uint32_t egress_wait_ms, int release_after_ms,
+                               int packets, uint64_t *forward,
+                               uint64_t *drop_full, uint64_t *drop_timeout)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg = harness_cfg(RELAY_PROCESS_CACHE, 2);
+    uint8_t buf[WIRE_HEADER_SIZE + 8];
+    size_t len;
+    int i;
+    const RelayFlowStats *st;
+    pthread_t release_thread;
+    CaptureReleaseArgs release_args;
+    int release_thread_started = 0;
+
+    cfg.egress_wait_ms = egress_wait_ms;
+    memset(&cap, 0, sizeof(cap));
+    cap.hold = 1;
+    pthread_mutex_init(&cap.mu, NULL);
+    pthread_cond_init(&cap.cv, NULL);
+
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    if (release_after_ms > 0) {
+        release_args.cap = &cap;
+        release_args.delay_ms = release_after_ms;
+        EXPECT(pthread_create(&release_thread, NULL, release_capture_after_delay,
+                              &release_args) == 0);
+        if (ctx != NULL) {
+            release_thread_started = 1;
+        }
+    }
+
+    for (i = 0; i < packets; i++) {
+        len = make_data_datagram(buf, sizeof(buf), 1, (uint64_t)(200 + i), 0, 1,
+                                 4, 8, 8, 8, (uint8_t)i);
+        (void)relay_inject_wire_datagram(ctx, buf, len);
+        usleep(2000);
+    }
+
+    st = relay_total_stats(ctx);
+    *forward = st->forward;
+    *drop_full = st->drop_egress_full;
+    *drop_timeout = st->drop_egress_timeout;
+    if (!cap.released) {
+        pthread_mutex_lock(&cap.mu);
+        cap.released = 1;
+        pthread_cond_broadcast(&cap.cv);
+        pthread_mutex_unlock(&cap.mu);
+    }
+    if (release_thread_started) {
+        EXPECT(pthread_join(release_thread, NULL) == 0);
+    }
+    wait_forwarded(ctx, st->forward, 500);
+    relay_harness_close(ctx);
+    pthread_mutex_destroy(&cap.mu);
+    pthread_cond_destroy(&cap.cv);
+}
+
+static void test_timed_backpressure_vs_try_drop(void)
+{
+    uint64_t try_forward = 0;
+    uint64_t try_full = 0;
+    uint64_t try_timeout = 0;
+    uint64_t timed_forward = 0;
+    uint64_t timed_full = 0;
+    uint64_t timed_timeout = 0;
+    uint64_t try_forward_recover = 0;
+    uint64_t try_full_recover = 0;
+    uint64_t try_timeout_recover = 0;
+    uint64_t timed_forward_recover = 0;
+    uint64_t timed_full_recover = 0;
+    uint64_t timed_timeout_recover = 0;
+
+    /*
+     * Scenario A: hold TX longer than timed wait. Validates timeout drop path.
+     */
+    run_queue_pressure(0, 30, 4, &try_forward, &try_full, &try_timeout);
+    run_queue_pressure(20, 30, 4, &timed_forward, &timed_full, &timed_timeout);
+
+    EXPECT(try_full >= 1);
+    EXPECT(try_timeout == 0);
+    EXPECT(timed_full == 0);
+    EXPECT(timed_timeout >= 1);
+    EXPECT(try_forward >= timed_forward);
+
+    /*
+     * Scenario B: release TX before timeout. Timed path should forward more
+     * packets than try-drop baseline, with fewer drops.
+     */
+    run_queue_pressure(0, 10, 6, &try_forward_recover, &try_full_recover,
+                       &try_timeout_recover);
+    run_queue_pressure(20, 10, 6, &timed_forward_recover, &timed_full_recover,
+                       &timed_timeout_recover);
+
+    EXPECT(try_timeout_recover == 0);
+    EXPECT(timed_timeout_recover == 0);
+    EXPECT(timed_full_recover == 0);
+    EXPECT(timed_forward_recover > try_forward_recover);
+    EXPECT(timed_full_recover < try_full_recover);
 }
 
 static void test_admission_still_forwards(void)
@@ -995,6 +1117,7 @@ int main(void)
     test_opaque_forward_duplicate_mismatch();
     test_end_ordering();
     test_queue_full_cache_survives();
+    test_timed_backpressure_vs_try_drop();
     test_admission_still_forwards();
     test_harness_close_inject_safety();
 

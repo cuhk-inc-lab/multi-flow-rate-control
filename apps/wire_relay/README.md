@@ -15,19 +15,25 @@ Binary: `build/wire_relay`.
 ## Role (Phase 1 + Phase 2 + L1/L2)
 
 ```text
-recvfrom(listen)  [or relay_inject_wire_datagram — wire-level only]
+recvfrom(listen)  [UDP RX only]
   → copy into owned datagram
-  → parse WireHeader
+  → minimal wire_header_decode → flow_id
+  → per-flow RelayDeferredHub (packet-level; never waits on egress)
+processing worker (single thread):
+  → round-robin pop (quota=8) → ingress_mu
   → if final_dst == local_node_id:
        [--local-decode] LocalDecodeHub / per-flow WireFlowDecoder
-         --output FILE      → single flow (L1)
-         --output-dir DIR   → DIR/flow_<id>.bin per flow (L2)
        else count-only local delivery
        (no TTL--, no GenerationCache, no EgressQueue, no sendto)
-  → else ttl-- (wire_header_encode back into datagram bytes)
-  → [--process cache] DATA only: copy into GenerationCache (observe)
-  → move current datagram into global EgressQueue (ownership move)
-  → TX worker: sendto(next-hop) using datagram bytes only; free
+  → else ttl-- → [--process cache] → ForwardPending
+  → release ingress_mu → timed/try EgressQueue enqueue
+TX worker:
+  → sendto(next-hop) / test capture; free
+
+relay_inject_wire_datagram (harness):
+  → synchronous path (does NOT enter deferred)
+  → inject-only tests keep existing order; mixing inject+RX
+    does not preserve per-flow relative order
 ```
 
 - Default path does **not** encode/decode / recode.
@@ -62,6 +68,10 @@ Requires `--codec` and **exactly one** of `--output` / `--output-dir`.
   --next-hop 10.10.23.2:9000 \
   [--idle-exit-sec N] \
   [--egress-capacity N] \
+  [--egress-wait-ms N] \
+  [--deferred-per-flow N] \
+  [--deferred-total N] \
+  [--max-active-flows N] \
   [--process forward|cache] \
   [--gen-timeout-ms N] \
   [--max-gens N] \
@@ -78,6 +88,10 @@ Requires `--codec` and **exactly one** of `--output` / `--output-dir`.
 | `--next-hop` | `HOST:PORT` for non-local forward |
 | `--idle-exit-sec` | Optional; exit after N seconds with no RX (tests) |
 | `--egress-capacity` | Global EgressQueue slots (default 4096) |
+| `--egress-wait-ms` | Max wait when egress full (default **0** = try-drop); `>0` blocks processing worker only, never UDP RX |
+| `--deferred-per-flow` | Per-flow RX deferred datagram cap (default 128) |
+| `--deferred-total` | Global RX deferred datagram cap (default 1024) |
+| `--max-active-flows` | Max concurrent wire flow_id slots in deferred hub (1..64, default 64) |
 | `--process` | `forward` (default) or `cache` |
 | `--gen-timeout-ms` | Cache idle timeout (default 500) |
 | `--max-gens` | Global generation limit (default 256) |
@@ -114,5 +128,7 @@ sendto(VM2)         next=VM3            next=VM4            --local-decode
 make wire-relay wg-demo
 sh tests/wire_relay_loopback.sh ./build/wg_multi_pipeline ./build/wire_relay build
 ./build/relay_gen_cache_tests
+./build/relay_egress_queue_tests
+./build/relay_deferred_tests
 ./build/relay_local_decode_tests
 ```

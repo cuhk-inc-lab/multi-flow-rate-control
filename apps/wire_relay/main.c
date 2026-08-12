@@ -1,6 +1,8 @@
 #include "local_decode.h"
 #include "relay.h"
+#include "relay_deferred.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +12,9 @@ static void print_usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s --local-node-id N --listen PORT --next-hop HOST:PORT\n"
-            "     [--idle-exit-sec N] [--egress-capacity N]\n"
+            "     [--idle-exit-sec N] [--egress-capacity N] [--egress-wait-ms N]\n"
+            "     [--deferred-per-flow N] [--deferred-total N]\n"
+            "     [--max-active-flows N]\n"
             "     [--process forward|cache]\n"
             "     [--gen-timeout-ms N] [--max-gens N]\n"
             "     [--max-gens-per-flow N] [--max-cache-bytes N]\n"
@@ -18,9 +22,12 @@ static void print_usage(const char *prog)
             "         (--output FILE | --output-dir DIR)]\n"
             "\n"
             "Explicit-hop opaque UDP relay (wire header v3).\n"
-            "RX -> destination check(final_dst) -> TTL-- ->\n"
+            "RX -> per-flow deferred packet queue -> processing worker ->\n"
+            "  destination check(final_dst) -> TTL-- ->\n"
             "  [--process cache: GenerationCache observe] ->\n"
             "  global EgressQueue -> TX sendto(next-hop).\n"
+            "inject (harness) stays synchronous and does not enter deferred;\n"
+            "mixing inject with UDP RX does not preserve per-flow order.\n"
             "With --local-decode: final_dst==local_node_id packets decode via\n"
             "LocalDecodeHub / WireFlowDecoder. Local packets skip TTL--,\n"
             "GenerationCache, EgressQueue, and next-hop send.\n"
@@ -110,6 +117,10 @@ int main(int argc, char **argv)
     uint16_t next_hop_port = 0;
     unsigned idle_exit_sec = 0;
     size_t egress_capacity = RELAY_DEFAULT_EGRESS_CAPACITY;
+    uint32_t egress_wait_ms = 0;
+    size_t deferred_per_flow = RELAY_DEFAULT_DEFERRED_PER_FLOW;
+    size_t deferred_total = RELAY_DEFAULT_DEFERRED_TOTAL;
+    uint32_t max_active_flows = RELAY_DEFAULT_MAX_ACTIVE_FLOWS;
     RelayProcessMode process_mode = RELAY_PROCESS_FORWARD;
     uint32_t gen_timeout_ms = GEN_CACHE_DEFAULT_TIMEOUT_MS;
     size_t max_gens_global = GEN_CACHE_DEFAULT_MAX_GENS_GLOBAL;
@@ -185,6 +196,50 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             egress_capacity = (size_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--egress-wait-ms") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed > UINT32_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            egress_wait_ms = (uint32_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--deferred-per-flow") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed == 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            deferred_per_flow = (size_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--deferred-total") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed == 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            deferred_total = (size_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--max-active-flows") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed < 1ul || parsed > (unsigned long)RELAY_MAX_ACTIVE_FLOWS_LIMIT) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            max_active_flows = (uint32_t)parsed;
             argi += 2;
         } else if (strcmp(argv[argi], "--process") == 0) {
             if (argi + 1 >= argc) {
@@ -307,6 +362,10 @@ int main(int argc, char **argv)
     cfg.process_fn = NULL;
     cfg.idle_exit_sec = idle_exit_sec;
     cfg.egress_capacity = egress_capacity;
+    cfg.egress_wait_ms = egress_wait_ms;
+    cfg.deferred_per_flow = deferred_per_flow;
+    cfg.deferred_total = deferred_total;
+    cfg.max_active_flows = max_active_flows;
     cfg.reject_local_encoder_loopback = 1;
     cfg.gen_timeout_ms = gen_timeout_ms;
     cfg.max_gens_global = max_gens_global;

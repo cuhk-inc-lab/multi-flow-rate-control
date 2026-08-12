@@ -1,6 +1,7 @@
 #include "relay.h"
 
 #include "egress_queue.h"
+#include "relay_deferred.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -21,6 +22,8 @@
 struct RelayCtx {
     RelayConfig                 config;
     EgressQueue                 egress;
+    RelayDeferredHub            deferred;
+    int                         deferred_inited;
     GenerationCache             gen_cache;
     int                         cache_enabled;
     pthread_mutex_t             ingress_mu;
@@ -29,6 +32,8 @@ struct RelayCtx {
     int                         ingress_idle_inited;
     pthread_t                   tx_thread;
     int                         tx_started;
+    pthread_t                   processing_thread;
+    int                         processing_started;
     int                         listen_sock;
     int                         send_sock;
     struct sockaddr_storage     next_hop;
@@ -162,16 +167,36 @@ static void print_stats(const RelayCtx *ctx)
 {
     uint32_t i;
     const GenerationCacheStats *gs = NULL;
+    EgressQueueStats eq;
+    RelayDeferredHubStats ds;
 
     if (ctx->cache_enabled) {
         gs = generation_cache_stats(&ctx->gen_cache);
     }
+    egress_queue_stats_snapshot(&ctx->egress, &eq);
+    memset(&ds, 0, sizeof(ds));
+    if (ctx->deferred_inited) {
+        relay_deferred_hub_stats_snapshot(&ctx->deferred, &ds);
+    }
 
     fprintf(stderr,
-            "wire-relay: local_node_id=%u summary rx=%llu forward=%llu "
+            "wire-relay: local_node_id=%u summary egress_capacity=%zu "
+            "egress_wait_ms=%u deferred_per_flow=%zu deferred_total=%zu "
+            "max_active_flows=%u rx=%llu forward=%llu "
             "local=%llu drop_ttl=%llu drop_malformed=%llu drop_send=%llu "
-            "drop_egress_full=%llu inject_ok=%llu inject_reject_loopback=%llu\n",
+            "drop_egress_full=%llu drop_egress_timeout=%llu "
+            "drop_deferred_flow=%llu drop_deferred_total=%llu "
+            "drop_deferred_table=%llu "
+            "inject_ok=%llu inject_reject_loopback=%llu "
+            "egress_immediate=%llu egress_waited=%llu egress_wait_ns_total=%llu "
+            "egress_wait_ns_max=%llu egress_high_watermark=%llu "
+            "deferred_hwm=%llu\n",
             (unsigned)ctx->config.local_node_id,
+            ctx->config.egress_capacity,
+            (unsigned)ctx->config.egress_wait_ms,
+            ctx->config.deferred_per_flow,
+            ctx->config.deferred_total,
+            (unsigned)ctx->config.max_active_flows,
             (unsigned long long)ctx->total.rx,
             (unsigned long long)ctx->total.forward,
             (unsigned long long)ctx->total.local_deliver,
@@ -179,8 +204,18 @@ static void print_stats(const RelayCtx *ctx)
             (unsigned long long)ctx->total.drop_malformed,
             (unsigned long long)ctx->total.drop_send,
             (unsigned long long)ctx->total.drop_egress_full,
+            (unsigned long long)ctx->total.drop_egress_timeout,
+            (unsigned long long)ds.drop_overflow_flow,
+            (unsigned long long)ds.drop_overflow_total,
+            (unsigned long long)ds.drop_table_full,
             (unsigned long long)ctx->total.inject_ok,
-            (unsigned long long)ctx->total.inject_reject_loopback);
+            (unsigned long long)ctx->total.inject_reject_loopback,
+            (unsigned long long)eq.enqueue_immediate,
+            (unsigned long long)eq.enqueue_waited,
+            (unsigned long long)eq.wait_ns_total,
+            (unsigned long long)eq.wait_ns_max,
+            (unsigned long long)eq.high_watermark,
+            (unsigned long long)ds.high_watermark);
     if (gs != NULL) {
         fprintf(stderr,
                 "wire-relay: gen_cache created=%llu ready=%llu timeout=%llu "
@@ -202,14 +237,15 @@ static void print_stats(const RelayCtx *ctx)
 
         if (s->rx == 0 && s->forward == 0 && s->local_deliver == 0 &&
             s->drop_ttl == 0 && s->drop_malformed == 0 && s->drop_send == 0 &&
-            s->drop_egress_full == 0 && s->inject_ok == 0 &&
+            s->drop_egress_full == 0 && s->drop_egress_timeout == 0 &&
+            s->inject_ok == 0 &&
             s->inject_reject_loopback == 0) {
             continue;
         }
         fprintf(stderr,
                 "wire-relay: flow_id=%u rx=%llu forward=%llu local=%llu "
                 "drop_ttl=%llu drop_malformed=%llu drop_send=%llu "
-                "drop_egress_full=%llu\n",
+                "drop_egress_full=%llu drop_egress_timeout=%llu\n",
                 i,
                 (unsigned long long)s->rx,
                 (unsigned long long)s->forward,
@@ -217,7 +253,8 @@ static void print_stats(const RelayCtx *ctx)
                 (unsigned long long)s->drop_ttl,
                 (unsigned long long)s->drop_malformed,
                 (unsigned long long)s->drop_send,
-                (unsigned long long)s->drop_egress_full);
+                (unsigned long long)s->drop_egress_full,
+                (unsigned long long)s->drop_egress_timeout);
         if (gs != NULL && i < 8u && gs->per_flow_created[i] != 0) {
             fprintf(stderr, "wire-relay: flow_id=%u gen_created=%llu\n", i,
                     (unsigned long long)gs->per_flow_created[i]);
@@ -243,29 +280,89 @@ static void apply_cache_config(GenerationCacheConfig *out,
     }
 }
 
-static int enqueue_forward(RelayCtx *ctx, RelayFlowStats *slot,
-                           uint8_t **datagram_owned, size_t len,
-                           const WireHeader *header)
+/*
+ * Phase B forward: built under ingress_mu; enqueued outside ingress_mu.
+ * relay_apply_forward_pending() owns freeing pkt.datagram on all paths.
+ */
+typedef struct ForwardPending {
+    int               active;
+    EgressPacket      pkt;
+    RelayFlowStats   *slot;
+    RelayPacketSource source;
+} ForwardPending;
+
+static void prepare_forward_pending(ForwardPending *pending,
+                                    RelayFlowStats *slot,
+                                    uint8_t **datagram_owned, size_t len,
+                                    const WireHeader *header,
+                                    RelayPacketSource source)
 {
-    EgressPacket eg;
+    memset(pending, 0, sizeof(*pending));
+    pending->active = 1;
+    pending->slot = slot;
+    pending->source = source;
+    pending->pkt.datagram = *datagram_owned;
+    pending->pkt.len = len;
+    pending->pkt.flow_id = header->flow_id;
+    pending->pkt.generation_id = header->block_id;
+    pending->pkt.enqueue_ns = relay_mono_ns();
+    *datagram_owned = NULL;
+}
+
+/*
+ * Timed/try egress enqueue outside ingress_mu.
+ *
+ * Ownership: on success pkt.datagram moves into EgressQueue (NULLed).
+ * On drop/timeout/shutdown/error, relay_apply_forward_pending frees
+ * pending->pkt.datagram and always clears pending->pkt.datagram before return.
+ */
+static void relay_apply_forward_pending(RelayCtx *ctx, ForwardPending *pending)
+{
     EgressStatus est;
 
-    memset(&eg, 0, sizeof(eg));
-    eg.datagram = *datagram_owned;
-    eg.len = len;
-    eg.flow_id = header->flow_id;
-    eg.generation_id = header->block_id;
-    eg.enqueue_ns = relay_mono_ns();
-    *datagram_owned = NULL;
-
-    est = egress_queue_try_enqueue(&ctx->egress, &eg);
-    if (est != EGRESS_OK) {
-        slot->drop_egress_full++;
-        ctx->total.drop_egress_full++;
-        free(eg.datagram);
-        return -1;
+    if (ctx == NULL || pending == NULL || !pending->active) {
+        return;
     }
-    return 0;
+
+    if (ctx->config.egress_wait_ms == 0) {
+        est = egress_queue_try_enqueue(&ctx->egress, &pending->pkt);
+        if (est == EGRESS_OK) {
+            if (pending->source == RELAY_SRC_LOCAL_ENCODER) {
+                pending->slot->inject_ok++;
+                ctx->total.inject_ok++;
+            }
+        } else {
+            pending->slot->drop_egress_full++;
+            ctx->total.drop_egress_full++;
+            free(pending->pkt.datagram);
+            pending->pkt.datagram = NULL;
+        }
+    } else {
+        est = egress_queue_timed_enqueue(&ctx->egress, &pending->pkt,
+                                         ctx->config.egress_wait_ms);
+        if (est == EGRESS_OK) {
+            if (pending->source == RELAY_SRC_LOCAL_ENCODER) {
+                pending->slot->inject_ok++;
+                ctx->total.inject_ok++;
+            }
+        } else if (est == EGRESS_ERR_TIMEOUT) {
+            pending->slot->drop_egress_timeout++;
+            ctx->total.drop_egress_timeout++;
+            free(pending->pkt.datagram);
+            pending->pkt.datagram = NULL;
+        } else {
+            if (est == EGRESS_ERR_SHUTDOWN || est == EGRESS_ERR_INVALID ||
+                est == EGRESS_ERR_FULL) {
+                /* FULL should not occur; shutdown during teardown. */
+            }
+            free(pending->pkt.datagram);
+            pending->pkt.datagram = NULL;
+        }
+    }
+
+    pending->active = 0;
+    pending->pkt.datagram = NULL;
+    pending->pkt.len = 0;
 }
 
 /*
@@ -305,12 +402,15 @@ static void run_deferred_local_delivery(DeferredLocalDelivery *deferred)
  * callback (outside ingress_mu).
  *
  * Caller must hold ingress_mu. Must NOT invoke delivery_fn here.
+ * Does not enqueue to EgressQueue; sets *forward_pending when a packet should
+ * be forwarded after ingress_mu is released.
  */
 static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
                                                uint8_t **datagram_owned,
                                                size_t len,
                                                RelayPacketSource source,
-                                               DeferredLocalDelivery *deferred)
+                                               DeferredLocalDelivery *deferred,
+                                               ForwardPending *forward_pending)
 {
     WireHeader header;
     RelayFlowStats *slot;
@@ -324,6 +424,9 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
 
     if (deferred != NULL) {
         memset(deferred, 0, sizeof(*deferred));
+    }
+    if (forward_pending != NULL) {
+        memset(forward_pending, 0, sizeof(*forward_pending));
     }
 
     if (ctx == NULL || datagram_owned == NULL || *datagram_owned == NULL ||
@@ -431,10 +534,11 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
                                           (int32_t)header.flow_id);
             sync_cache_stats_to_total(ctx);
         }
-        if (enqueue_forward(ctx, slot, &datagram, out_len, &header) == 0 &&
-            source == RELAY_SRC_LOCAL_ENCODER) {
-            slot->inject_ok++;
-            ctx->total.inject_ok++;
+        if (forward_pending != NULL) {
+            prepare_forward_pending(forward_pending, slot, &datagram, out_len,
+                                    &header, source);
+        } else {
+            free(datagram);
         }
         return RELAY_INGRESS_OK;
     }
@@ -461,10 +565,11 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
         return RELAY_INGRESS_OK;
     }
 
-    if (enqueue_forward(ctx, slot, &datagram, out_len, &header) == 0 &&
-        source == RELAY_SRC_LOCAL_ENCODER) {
-        slot->inject_ok++;
-        ctx->total.inject_ok++;
+    if (forward_pending != NULL) {
+        prepare_forward_pending(forward_pending, slot, &datagram, out_len,
+                                &header, source);
+    } else {
+        free(datagram);
     }
     return RELAY_INGRESS_OK;
 }
@@ -476,6 +581,7 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
     uint8_t *owned;
     RelayIngressStatus st;
     DeferredLocalDelivery deferred;
+    ForwardPending forward_pending;
 
     if (ctx == NULL || datagram == NULL || len < WIRE_HEADER_SIZE ||
         len > RELAY_MAX_DATAGRAM) {
@@ -488,6 +594,7 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
     }
     memcpy(owned, datagram, len);
     memset(&deferred, 0, sizeof(deferred));
+    memset(&forward_pending, 0, sizeof(forward_pending));
 
     pthread_mutex_lock(&ctx->ingress_mu);
     if (ctx->stop) {
@@ -497,7 +604,7 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
     }
     ctx->inject_in_flight++;
     st = ingress_submit_owned(ctx, &owned, len, RELAY_SRC_LOCAL_ENCODER,
-                              &deferred);
+                              &deferred, &forward_pending);
     /*
      * P0A: release ingress_mu before local delivery (decode/I/O). Keep
      * inject_in_flight elevated so harness close still waits for callback.
@@ -508,12 +615,176 @@ RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
         run_deferred_local_delivery(&deferred);
         pthread_mutex_lock(&ctx->ingress_mu);
     }
+    if (forward_pending.active) {
+        pthread_mutex_unlock(&ctx->ingress_mu);
+        relay_apply_forward_pending(ctx, &forward_pending);
+        pthread_mutex_lock(&ctx->ingress_mu);
+    }
     ctx->inject_in_flight--;
     if (ctx->inject_in_flight == 0) {
         pthread_cond_broadcast(&ctx->ingress_idle);
     }
     pthread_mutex_unlock(&ctx->ingress_mu);
     return st;
+}
+
+static void *tx_worker_main(void *arg);
+
+/*
+ * Minimal RX parse via wire_header_decode (length / magic / version / endian).
+ * Does not perform destination, TTL, cache, or recode work.
+ */
+static int relay_parse_flow_id_min(const uint8_t *datagram, size_t len,
+                                   uint32_t *flow_id_out)
+{
+    WireHeader header;
+
+    if (flow_id_out == NULL || datagram == NULL) {
+        return -1;
+    }
+    if (wire_header_decode(&header, datagram, len) != 0) {
+        return -1;
+    }
+    *flow_id_out = header.flow_id;
+    return 0;
+}
+
+static void account_deferred_push_fail(RelayCtx *ctx, RelayDeferredStatus st)
+{
+    /* Hub already counted the matching drop_* under deferred.mu. */
+    (void)ctx;
+    (void)st;
+}
+
+static void sync_deferred_drops_to_total(RelayCtx *ctx)
+{
+    RelayDeferredHubStats ds;
+
+    if (ctx == NULL || !ctx->deferred_inited) {
+        return;
+    }
+    relay_deferred_hub_stats_snapshot(&ctx->deferred, &ds);
+    ctx->total.drop_deferred_overflow_flow = ds.drop_overflow_flow;
+    ctx->total.drop_deferred_overflow_total = ds.drop_overflow_total;
+    ctx->total.drop_deferred_table_full = ds.drop_table_full;
+}
+
+/*
+ * RX fast path: enqueue owned datagram into deferred hub. Never waits on
+ * egress. On any failure, frees ownership. Brief ingress_mu only for
+ * malformed accounting (not for submit / egress).
+ */
+static void rx_enqueue_datagram(RelayCtx *ctx, uint8_t **datagram_owned,
+                                size_t len)
+{
+    RelayDeferredPacket pkt;
+    RelayDeferredStatus st;
+    uint32_t flow_id = 0;
+
+    if (ctx == NULL || datagram_owned == NULL || *datagram_owned == NULL) {
+        return;
+    }
+
+    if (len < WIRE_HEADER_SIZE || len > RELAY_MAX_DATAGRAM ||
+        relay_parse_flow_id_min(*datagram_owned, len, &flow_id) != 0) {
+        pthread_mutex_lock(&ctx->ingress_mu);
+        ctx->total.drop_malformed++;
+        pthread_mutex_unlock(&ctx->ingress_mu);
+        free(*datagram_owned);
+        *datagram_owned = NULL;
+        return;
+    }
+
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.datagram = *datagram_owned;
+    pkt.len = len;
+    pkt.flow_id = flow_id;
+    pkt.enqueue_ns = relay_mono_ns();
+    *datagram_owned = NULL;
+
+    st = relay_deferred_hub_try_push(&ctx->deferred, &pkt);
+    if (st != RELAY_DEFERRED_OK) {
+        account_deferred_push_fail(ctx, st);
+        free(pkt.datagram);
+        pkt.datagram = NULL;
+    }
+}
+
+static void process_one_deferred_packet(RelayCtx *ctx, RelayDeferredPacket *pkt)
+{
+    DeferredLocalDelivery deferred;
+    ForwardPending forward_pending;
+    uint8_t *owned;
+
+    if (ctx == NULL || pkt == NULL || pkt->datagram == NULL) {
+        return;
+    }
+
+    owned = pkt->datagram;
+    pkt->datagram = NULL;
+    memset(&deferred, 0, sizeof(deferred));
+    memset(&forward_pending, 0, sizeof(forward_pending));
+
+    pthread_mutex_lock(&ctx->ingress_mu);
+    (void)ingress_submit_owned(ctx, &owned, pkt->len, RELAY_SRC_PREVIOUS_NODE,
+                               &deferred, &forward_pending);
+    pthread_mutex_unlock(&ctx->ingress_mu);
+
+    run_deferred_local_delivery(&deferred);
+    relay_apply_forward_pending(ctx, &forward_pending);
+    if (owned != NULL) {
+        free(owned);
+        owned = NULL;
+    }
+}
+
+static void *processing_worker_main(void *arg)
+{
+    RelayCtx *ctx = arg;
+
+    while (1) {
+        RelayDeferredStatus wst;
+
+        wst = relay_deferred_hub_wait(&ctx->deferred);
+        if (wst == RELAY_DEFERRED_ERR_SHUTDOWN) {
+            break;
+        }
+        if (wst != RELAY_DEFERRED_OK) {
+            break;
+        }
+
+        while (1) {
+            RelayDeferredPacket pkt;
+            RelayDeferredStatus pst;
+
+            pst = relay_deferred_hub_try_pop(&ctx->deferred, &pkt);
+            if (pst != RELAY_DEFERRED_OK) {
+                break;
+            }
+            process_one_deferred_packet(ctx, &pkt);
+            if (pkt.datagram != NULL) {
+                free(pkt.datagram);
+                pkt.datagram = NULL;
+            }
+        }
+    }
+
+    /* Final drain after shutdown raced with last push. */
+    while (1) {
+        RelayDeferredPacket pkt;
+        RelayDeferredStatus pst;
+
+        pst = relay_deferred_hub_try_pop(&ctx->deferred, &pkt);
+        if (pst != RELAY_DEFERRED_OK) {
+            break;
+        }
+        process_one_deferred_packet(ctx, &pkt);
+        if (pkt.datagram != NULL) {
+            free(pkt.datagram);
+            pkt.datagram = NULL;
+        }
+    }
+    return NULL;
 }
 
 static void *tx_worker_main(void *arg)
@@ -569,12 +840,28 @@ static void relay_ctx_cleanup(RelayCtx *ctx)
     }
 
     /*
-     * Stop ingress under ingress_mu so concurrent inject observes stop before
-     * touching cache. Wait until in-flight injects finish, then destroy cache
-     * before releasing the lock for queue/TX teardown.
+     * Shutdown order (Phase 1):
+     *  1) stop ingress / RX already exited
+     *  2) deferred hub shutdown + join processing
+     *  3) wait inject_in_flight; destroy generation cache
+     *  4) egress shutdown + join TX
+     *  5) destroy egress
+     *  6) destroy deferred (free residual datagrams once)
+     *  7) destroy mutexes / sockets
      */
     pthread_mutex_lock(&ctx->ingress_mu);
     ctx->stop = 1;
+    pthread_mutex_unlock(&ctx->ingress_mu);
+
+    if (ctx->deferred_inited) {
+        relay_deferred_hub_shutdown(&ctx->deferred);
+    }
+    if (ctx->processing_started) {
+        (void)pthread_join(ctx->processing_thread, NULL);
+        ctx->processing_started = 0;
+    }
+
+    pthread_mutex_lock(&ctx->ingress_mu);
     while (ctx->inject_in_flight > 0) {
         pthread_cond_wait(&ctx->ingress_idle, &ctx->ingress_mu);
     }
@@ -590,6 +877,11 @@ static void relay_ctx_cleanup(RelayCtx *ctx)
         ctx->tx_started = 0;
     }
     egress_queue_destroy(&ctx->egress);
+
+    if (ctx->deferred_inited) {
+        relay_deferred_hub_destroy(&ctx->deferred);
+        ctx->deferred_inited = 0;
+    }
 
     /* Quiesce any inject that raced into lock after cache destroy (stop-only). */
     pthread_mutex_lock(&ctx->ingress_mu);
@@ -617,6 +909,7 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
                                  int need_sockets)
 {
     GenerationCacheConfig gcfg;
+    RelayDeferredHubConfig dcfg;
     size_t egress_cap;
 
     memset(ctx, 0, sizeof(*ctx));
@@ -626,6 +919,22 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
 
     if (ctx->config.egress_capacity == 0) {
         ctx->config.egress_capacity = RELAY_DEFAULT_EGRESS_CAPACITY;
+    }
+    if (ctx->config.deferred_per_flow == 0) {
+        ctx->config.deferred_per_flow = RELAY_DEFAULT_DEFERRED_PER_FLOW;
+    }
+    if (ctx->config.deferred_total == 0) {
+        ctx->config.deferred_total = RELAY_DEFAULT_DEFERRED_TOTAL;
+    }
+    if (ctx->config.max_active_flows == 0) {
+        ctx->config.max_active_flows = RELAY_DEFAULT_MAX_ACTIVE_FLOWS;
+    }
+    if (ctx->config.max_active_flows < 1u ||
+        ctx->config.max_active_flows > RELAY_MAX_ACTIVE_FLOWS_LIMIT) {
+        return -1;
+    }
+    if (ctx->config.deferred_per_flow == 0 || ctx->config.deferred_total == 0) {
+        return -1;
     }
     if (config->reject_local_encoder_loopback == 0 &&
         config->delivery_fn == NULL) {
@@ -648,11 +957,26 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         return -1;
     }
 
+    memset(&dcfg, 0, sizeof(dcfg));
+    dcfg.max_active_flows = ctx->config.max_active_flows;
+    dcfg.per_flow_capacity = ctx->config.deferred_per_flow;
+    dcfg.total_capacity = ctx->config.deferred_total;
+    if (relay_deferred_hub_init(&ctx->deferred, &dcfg) != RELAY_DEFERRED_OK) {
+        egress_queue_destroy(&ctx->egress);
+        pthread_cond_destroy(&ctx->ingress_idle);
+        ctx->ingress_idle_inited = 0;
+        pthread_mutex_destroy(&ctx->ingress_mu);
+        return -1;
+    }
+    ctx->deferred_inited = 1;
+
     ctx->cache_enabled =
         (ctx->config.process_mode == RELAY_PROCESS_CACHE) ? 1 : 0;
     if (ctx->cache_enabled) {
         apply_cache_config(&gcfg, &ctx->config);
         if (generation_cache_init(&ctx->gen_cache, &gcfg) != 0) {
+            relay_deferred_hub_destroy(&ctx->deferred);
+            ctx->deferred_inited = 0;
             egress_queue_destroy(&ctx->egress);
             pthread_cond_destroy(&ctx->ingress_idle);
             ctx->ingress_idle_inited = 0;
@@ -687,6 +1011,14 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         return -1;
     }
     ctx->tx_started = 1;
+
+    if (pthread_create(&ctx->processing_thread, NULL, processing_worker_main,
+                       ctx) != 0) {
+        perror("wire-relay: processing thread");
+        relay_ctx_cleanup(ctx);
+        return -1;
+    }
+    ctx->processing_started = 1;
     return 0;
 }
 
@@ -747,7 +1079,12 @@ void relay_harness_close(RelayCtx *ctx)
 
 const RelayFlowStats *relay_total_stats(const RelayCtx *ctx)
 {
-    return ctx != NULL ? &ctx->total : NULL;
+    if (ctx == NULL) {
+        return NULL;
+    }
+    /* Publish hub deferred drops into total for inject/RX test readers. */
+    sync_deferred_drops_to_total((RelayCtx *)ctx);
+    return &ctx->total;
 }
 
 const GenerationCacheStats *relay_cache_stats(const RelayCtx *ctx)
@@ -764,6 +1101,27 @@ GenerationCache *relay_generation_cache(RelayCtx *ctx)
         return NULL;
     }
     return &ctx->gen_cache;
+}
+
+void relay_egress_stats_snapshot(const RelayCtx *ctx, EgressQueueStats *out)
+{
+    if (ctx == NULL || out == NULL) {
+        return;
+    }
+    egress_queue_stats_snapshot(&ctx->egress, out);
+}
+
+void relay_deferred_stats_snapshot(const RelayCtx *ctx,
+                                   RelayDeferredHubStats *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (ctx == NULL || !ctx->deferred_inited) {
+        return;
+    }
+    relay_deferred_hub_stats_snapshot(&ctx->deferred, out);
 }
 
 RelayStatus relay_run(const RelayConfig *config)
@@ -790,12 +1148,18 @@ RelayStatus relay_run(const RelayConfig *config)
 
     fprintf(stderr,
             "wire-relay: local_node_id=%u listen=%u next-hop=%s:%u "
-            "egress_capacity=%zu process=%s recode=%s\n",
+            "egress_capacity=%zu egress_wait_ms=%u "
+            "deferred_per_flow=%zu deferred_total=%zu max_active_flows=%u "
+            "process=%s recode=%s\n",
             (unsigned)ctx.config.local_node_id,
             (unsigned)ctx.config.listen_port,
             ctx.config.next_hop_host,
             (unsigned)ctx.config.next_hop_port,
             ctx.config.egress_capacity,
+            (unsigned)ctx.config.egress_wait_ms,
+            ctx.config.deferred_per_flow,
+            ctx.config.deferred_total,
+            (unsigned)ctx.config.max_active_flows,
             ctx.cache_enabled ? "cache" : "forward",
             ctx.config.recode_fn != NULL ? "enabled" : "disabled");
 
@@ -862,22 +1226,14 @@ RelayStatus relay_run(const RelayConfig *config)
 
         owned = malloc((size_t)received);
         if (owned == NULL) {
+            pthread_mutex_lock(&ctx.ingress_mu);
             ctx.total.drop_malformed++;
+            pthread_mutex_unlock(&ctx.ingress_mu);
             continue;
         }
         memcpy(owned, rxbuf, (size_t)received);
-
-        {
-            DeferredLocalDelivery deferred;
-
-            memset(&deferred, 0, sizeof(deferred));
-            pthread_mutex_lock(&ctx.ingress_mu);
-            (void)ingress_submit_owned(&ctx, &owned, (size_t)received,
-                                       RELAY_SRC_PREVIOUS_NODE, &deferred);
-            pthread_mutex_unlock(&ctx.ingress_mu);
-            /* P0A: local decode/I/O outside ingress_mu (RX still waits). */
-            run_deferred_local_delivery(&deferred);
-        }
+        /* RX never waits on egress; processing owns ingress/egress work. */
+        rx_enqueue_datagram(&ctx, &owned, (size_t)received);
     }
 
     ctx.stop = 1;

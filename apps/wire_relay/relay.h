@@ -1,9 +1,11 @@
 #ifndef WIRE_RELAY_RELAY_H
 #define WIRE_RELAY_RELAY_H
 
+#include "egress_queue.h"
 #include "generation_cache.h"
 #include "process.h"
 #include "recode.h"
+#include "relay_deferred.h"
 #include "wire_header.h"
 
 #include <stddef.h>
@@ -52,6 +54,10 @@ typedef struct RelayFlowStats {
     uint64_t drop_malformed;
     uint64_t drop_send;
     uint64_t drop_egress_full;
+    uint64_t drop_egress_timeout;
+    uint64_t drop_deferred_overflow_flow;
+    uint64_t drop_deferred_overflow_total;
+    uint64_t drop_deferred_table_full;
     uint64_t inject_ok;
     uint64_t inject_reject_loopback;
     uint64_t gen_created;
@@ -86,6 +92,19 @@ typedef struct RelayConfig {
     /* Packet slots in the global EgressQueue (default 4096). */
     size_t              egress_capacity;
     /*
+     * Max wait when EgressQueue is full (milliseconds). 0 = try-drop only
+     * (egress_queue_try_enqueue); >0 = timed backpressure on the processing
+     * worker only (never on the UDP RX thread).
+     */
+    uint32_t            egress_wait_ms;
+    /*
+     * RX deferred hub (packet-level). 0 => library defaults:
+     *   per_flow=128, total=1024, max_active_flows=64 (must be 1..64).
+     */
+    size_t              deferred_per_flow;
+    size_t              deferred_total;
+    uint32_t            max_active_flows;
+    /*
      * Wire-level local injection: if final_dst == local_node_id, reject by
      * default (1). Set 0 to deliver via delivery_fn instead.
      */
@@ -117,7 +136,12 @@ RelayStatus relay_run(const RelayConfig *config);
 /*
  * Wire-level local injection: datagram must already be a valid wire v3 UDP
  * payload (header + optional shard). This is NOT raw-bytes -> encoder.
- * Thread-safe vs RX via ingress mutex.
+ * Thread-safe vs concurrent injects via ingress mutex.
+ *
+ * Phase 1: inject remains synchronous (does not enter RelayDeferredHub).
+ * Inject-only harness tests keep existing ordering semantics. Mixing inject
+ * with the real UDP RX path does NOT preserve per-flow relative order
+ * between the two sources.
  *
  * On success, copies datagram into an owned buffer then submits.
  */
@@ -148,5 +172,8 @@ void relay_harness_close(RelayCtx *ctx);
 const RelayFlowStats *relay_total_stats(const RelayCtx *ctx);
 const GenerationCacheStats *relay_cache_stats(const RelayCtx *ctx);
 GenerationCache *relay_generation_cache(RelayCtx *ctx);
+void relay_egress_stats_snapshot(const RelayCtx *ctx, EgressQueueStats *out);
+void relay_deferred_stats_snapshot(const RelayCtx *ctx,
+                                   RelayDeferredHubStats *out);
 
 #endif /* WIRE_RELAY_RELAY_H */

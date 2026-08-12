@@ -41,8 +41,8 @@ UDP RX / inject
 - Exactly one sink: `--output` **or** `--output-dir` (not both); `--codec` required.
 - **P0A:** `delivery_fn` / LocalDecodeHub decode+I/O run **outside**
   `RelayCtx.ingress_mu`. Hub serializes ingest via its own `hub->mu`.
-  This is not an async decode worker: the RX/inject caller still waits for
-  the callback to return.
+  This is not an async decode worker: the inject caller still waits for
+  the callback to return. UDP RX local delivery runs on the processing worker.
 - **L1** (`--output FILE`): single `flow_id`; a second id is rejected
   (`local_decode_flow_rejected`).
 - **L2** (`--output-dir DIR`): up to `RELAY_MAX_FLOWS` concurrent local flows;
@@ -68,26 +68,59 @@ GenerationCache for decoder state.
 ### Phase 1
 
 ```text
-UDP RX / inject → ingress_mu → dest check / TTL rewrite → EgressQueue → TX
+UDP RX
+  → minimal wire_header_decode (flow_id)
+  → per-flow RelayDeferredHub (packet-level; drop-new on overflow)
+  → processing worker (single; RR + quota=8)
+      → ingress_mu: dest / TTL / optional cache / ForwardPending
+      → outside lock: egress try/timed enqueue
+  → TX worker → sendto
+
+inject (harness): synchronous; does not enter deferred
 ```
 
 ### Phase 2
 
 ```text
-UDP RX / inject
+UDP RX → deferred → processing worker
   → ingress_mu
   → dest check / TTL-- (encode into datagram)
   → DATA + --process cache: copy into GenerationCache; process hook
   → END/control: expire stale gens for flow; never cache; enqueue
-  → move current datagram → EgressQueue → TX
+  → build ForwardPending under ingress_mu; enqueue outside ingress_mu
+  → global FIFO EgressQueue → TX
 ```
 
 Defaults:
 
 - `--process forward` — no cache (Phase 1 behavior).
 - `--process cache` — observe/store only; **still opaque-forward** every packet.
+- `--egress-wait-ms 0` — try-drop baseline; `>0` timed wait on **processing worker only**.
+- `--deferred-per-flow 128`, `--deferred-total 1024`, `--max-active-flows 64`.
 - Limits: `gen_timeout_ms=500`, `max_gens=256`, `max_gens_per_flow=32`,
   `max_cache_bytes=32MiB`.
+
+### Egress backpressure (timed wait)
+
+Global **FIFO** EgressQueue between **processing worker** and TX worker.
+UDP RX never waits on this queue.
+| `--egress-wait-ms` | Behavior on full queue |
+|--------------------|-------------------------|
+| `0` | Non-blocking `try_enqueue`; drop new packet → `drop_egress_full` |
+| `>0` | Wait up to N ms for space via `pthread_cond_timedwait`; timeout drops new packet → `drop_egress_timeout` |
+
+- Never drop-oldest; never overwrite queued packets.
+- Processing builds `ForwardPending` under `ingress_mu`, then enqueues **outside**
+  `ingress_mu` so timed wait does not block cache work on the mutex.
+  UDP RX only enqueues into `RelayDeferredHub` and never waits on egress.
+- Queue-global metrics: `egress_enqueue_immediate`, `egress_enqueue_waited`,
+  `egress_wait_ns_total/max`, `egress_high_watermark`.
+- Per-flow drop counters: `drop_egress_full` (try path), `drop_egress_timeout` (timed path).
+- Deferred hub drops (new packet only): `drop_deferred_overflow_flow`,
+  `drop_deferred_overflow_total`, `drop_deferred_table_full`.
+- If timed wait / deferred overflow drops DATA but END later enqueues, downstream
+  may still report incomplete / missing groups — a fundamental UDP + bounded-queue
+  limitation, not masked as success.
 
 Cache copy and EgressPacket ownership are **independent**. On admission failure,
 default policy is **still forward** the current packet without caching
@@ -125,8 +158,9 @@ separate `malloc` copy per shard.
 
 ### 5. Ingress thread safety
 
-`ingress_mu` serializes dest check, TTL rewrite, GenerationCache, process hook,
-and EgressQueue enqueue. TX worker never touches the cache.
+`ingress_mu` serializes dest check, TTL rewrite, GenerationCache, and process
+hook. EgressQueue enqueue runs **outside** `ingress_mu` via `ForwardPending`
+(timed or try). TX worker never touches the cache.
 
 ### 6. END / control
 
