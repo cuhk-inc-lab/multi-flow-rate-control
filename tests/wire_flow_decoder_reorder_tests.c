@@ -1,6 +1,8 @@
 /*
- * Phase A/C: out-of-order receive + per-group recovery + ordered emit,
- * reorder-window counters, and best-effort skip of unrecoverable heads.
+ * Phase A/C plus best-effort mid-stream make_room: out-of-order receive +
+ * per-group recovery + ordered emit, reorder-window counters, skip of
+ * unrecoverable heads after END, and skip of stuck heads when a new block
+ * cannot enter the window.
  */
 #include "codec.h"
 #include "rs_codec.h"
@@ -581,6 +583,139 @@ static void test_best_effort_skips_missing_head_and_emits_later(void)
     wire_flow_decoder_destroy(dec);
 }
 
+static void test_best_effort_in_window_does_not_skip_early(void)
+{
+    uint16_t expected = 0;
+    size_t input_size = 0;
+    OutBuf ob;
+    uint8_t out[8192];
+    WireFlowDecoder *dec;
+    unsigned char enc1[CODEC_MAX_ENCODE_BLOCK];
+    uint8_t pt1[128];
+    uint16_t v1 = 0;
+    const WireFlowDecoderStats *st;
+
+    EXPECT(init_rs_geometry(4u, 2u, &expected, &input_size) == 0);
+    memset(pt1, 0x44, sizeof(pt1));
+    EXPECT(encode_rs_block(enc1, sizeof(enc1), pt1, sizeof(pt1), &v1) == 0);
+
+    memset(&ob, 0, sizeof(ob));
+    ob.data = out;
+    ob.cap = sizeof(out);
+    dec = make_dec_mode(11, expected, input_size, &ob, 1);
+    EXPECT(dec != NULL);
+
+    EXPECT(ingest_rs_block(dec, 11, 1, enc1, expected, v1, (unsigned)-1) == 0);
+    st = wire_flow_decoder_stats(dec);
+    EXPECT(st->skipped_groups == 0);
+    EXPECT(st->window_overflow == 0);
+    EXPECT(st->decoded_blocks == 0);
+    EXPECT(wire_flow_decoder_next_block(dec) == 0);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
+
+    wire_flow_decoder_destroy(dec);
+}
+
+static void test_best_effort_make_room_missing_head_accepts_block_w(void)
+{
+    uint16_t expected = 0;
+    size_t input_size = 0;
+    OutBuf ob;
+    uint8_t out[8192];
+    WireFlowDecoder *dec;
+    unsigned char enc[CODEC_MAX_ENCODE_BLOCK];
+    uint8_t plaintext[128];
+    uint16_t valid_len = 0;
+    const WireFlowDecoderStats *st;
+    uint64_t block_w = (uint64_t)WIRE_FLOW_GROUP_WINDOW;
+
+    EXPECT(init_rs_geometry(4u, 2u, &expected, &input_size) == 0);
+    memset(plaintext, 0x55, sizeof(plaintext));
+    EXPECT(encode_rs_block(enc, sizeof(enc), plaintext, sizeof(plaintext),
+                           &valid_len) == 0);
+
+    memset(&ob, 0, sizeof(ob));
+    ob.data = out;
+    ob.cap = sizeof(out);
+    dec = make_dec_mode(12, expected, input_size, &ob, 1);
+    EXPECT(dec != NULL);
+
+    EXPECT(ingest_rs_block(dec, 12, block_w, enc, expected, valid_len,
+                           (unsigned)-1) == 0);
+    st = wire_flow_decoder_stats(dec);
+    EXPECT(st->window_overflow == 0);
+    EXPECT(st->skipped_groups >= 1);
+    EXPECT(st->groups_received >= 1);
+    EXPECT(st->decoded_blocks == 0);
+    EXPECT(st->dropped_groups == 0);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
+    EXPECT(wire_flow_decoder_next_block(dec) == 1);
+
+    send_end(dec, 12, block_w + 1, expected);
+    EXPECT(st->window_overflow == 0);
+    EXPECT(st->decoded_blocks == 1);
+    EXPECT(wire_flow_decoder_next_block(dec) == block_w + 1);
+    EXPECT(ob.len == sizeof(plaintext));
+    EXPECT(memcmp(out, plaintext, sizeof(plaintext)) == 0);
+
+    wire_flow_decoder_destroy(dec);
+}
+
+static void test_best_effort_make_room_failed_head_accepts_block_w(void)
+{
+    uint16_t expected = 0;
+    size_t input_size = 0;
+    OutBuf ob;
+    uint8_t out[8192];
+    WireFlowDecoder *dec;
+    unsigned char enc0[CODEC_MAX_ENCODE_BLOCK];
+    unsigned char enc_w[CODEC_MAX_ENCODE_BLOCK];
+    uint8_t pt0[2000];
+    uint8_t ptw[128];
+    uint16_t v0 = 0;
+    uint16_t vw = 0;
+    unsigned drop[3] = {0, 1, 2};
+    const WireFlowDecoderStats *st;
+    uint64_t block_w = (uint64_t)WIRE_FLOW_GROUP_WINDOW;
+
+    EXPECT(init_rs_geometry(4u, 2u, &expected, &input_size) == 0);
+    memset(pt0, 0x61, sizeof(pt0));
+    memset(ptw, 0x62, sizeof(ptw));
+    EXPECT(encode_rs_block(enc0, sizeof(enc0), pt0, sizeof(pt0), &v0) == 0);
+    EXPECT(encode_rs_block(enc_w, sizeof(enc_w), ptw, sizeof(ptw), &vw) == 0);
+
+    memset(&ob, 0, sizeof(ob));
+    ob.data = out;
+    ob.cap = sizeof(out);
+    dec = make_dec_mode(13, expected, input_size, &ob, 1);
+    EXPECT(dec != NULL);
+
+    EXPECT(ingest_rs_block_drop_many(dec, 13, 0, enc0, expected, v0, drop, 3) ==
+           0);
+    st = wire_flow_decoder_stats(dec);
+    EXPECT(st->skipped_groups == 0);
+    EXPECT(st->window_overflow == 0);
+    EXPECT(ingest_rs_block(dec, 13, block_w, enc_w, expected, vw,
+                           (unsigned)-1) == 0);
+
+    EXPECT(st->window_overflow == 0);
+    EXPECT(st->skipped_groups >= 1);
+    EXPECT(st->groups_failed >= 1);
+    EXPECT(st->decoded_blocks == 0);
+    EXPECT(st->dropped_groups == 0);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
+    EXPECT(wire_flow_decoder_next_block(dec) == 1);
+
+    send_end(dec, 13, block_w + 1, expected);
+    EXPECT(st->window_overflow == 0);
+    EXPECT(st->decoded_blocks == 1);
+    EXPECT(wire_flow_decoder_next_block(dec) == block_w + 1);
+    EXPECT(ob.len >= sizeof(ptw));
+    EXPECT(memcmp(out + (ob.len - sizeof(ptw)), ptw, sizeof(ptw)) == 0);
+
+    wire_flow_decoder_destroy(dec);
+}
+
 static void test_best_effort_skips_failed_head_and_emits_later(void)
 {
     uint16_t expected = 0;
@@ -639,6 +774,9 @@ int main(void)
     test_window_overflow_beyond_reorder_limit();
     test_best_effort_skips_missing_head_and_emits_later();
     test_best_effort_skips_failed_head_and_emits_later();
+    test_best_effort_in_window_does_not_skip_early();
+    test_best_effort_make_room_missing_head_accepts_block_w();
+    test_best_effort_make_room_failed_head_accepts_block_w();
 
     if (g_failures != 0) {
         fprintf(stderr, "wire_flow_decoder_reorder_tests: %d failure(s)\n",

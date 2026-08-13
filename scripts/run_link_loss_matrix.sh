@@ -19,6 +19,7 @@
 #   TC_SSH / TC_DEV        two-node default: station0 on sender (local tc)
 #   FINAL_DST / TTL / LOCAL_NODE_ID   two-node defaults: 2 / 2 / 2
 #   IDLE_SEC               receiver idle (default 60 for loss runs)
+#   BEST_EFFORT=1          receiver --best-effort (skip gaps; hash expected FAIL)
 #   APPLY_TC=1
 
 set -eu
@@ -37,6 +38,7 @@ rs_profiles=${RS_PROFILES:-"16+2 16+4"}
 rate=${RATE:-40}
 apply_tc=${APPLY_TC:-1}
 idle_sec=${IDLE_SEC:-60}
+best_effort=${BEST_EFFORT:-0}
 ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_root=${RESULT_DIR:-"build/link-loss-$timestamp"}
@@ -100,12 +102,12 @@ apply_netem() {
 
 summary_csv="$result_root/summary.csv"
 mkdir -p "$result_root"
-echo "loss_pct,codec,rs_profile,rate_mbps,status,flows_pass,wire_shard_loss_pct,block_completion_pct,missing_groups,recovered_groups,groups_failed,window_overflow,pending_recovered_groups,skipped_groups,e2e_p95_us,n2_avg_mbps,notes" \
+echo "loss_pct,codec,rs_profile,rate_mbps,status,flows_pass,wire_shard_loss_pct,block_completion_pct,missing_groups,recovered_groups,groups_failed,window_overflow,pending_recovered_groups,skipped_groups,output_bytes,payload_bytes,byte_completion_pct,e2e_p95_us,n2_avg_mbps,notes" \
     > "$summary_csv"
 
 echo "Link loss matrix: $path_label"
 echo "  receiver=$receiver_ssh ($receiver_ip) final_dst=$final_dst ttl=$ttl local_node_id=$local_node_id"
-echo "  loss_list=$loss_list codecs=$codecs rs_profiles=$rs_profiles rate=$rate idle=${idle_sec}s"
+echo "  loss_list=$loss_list codecs=$codecs rs_profiles=$rs_profiles rate=$rate idle=${idle_sec}s best_effort=$best_effort"
 
 for loss in $loss_list; do
     echo "=== link loss ${loss}% (tc on $tc_target) ==="
@@ -132,13 +134,14 @@ for loss in $loss_list; do
             env CODECS="$codec" RATES="$rate" FLOWS=1 DURATION_S=15 \
                 MONITOR_RELAYS="$monitor_relays" IDLE_SEC="$idle_sec" PORT_BASE=9200 \
                 FINAL_DST="$final_dst" TTL="$ttl" LOCAL_NODE_ID="$local_node_id" \
+                BEST_EFFORT="$best_effort" \
                 RESULT_DIR="$subdir" $rs_env \
                 "$script_dir/run_wire_multiflow_matrix.sh" \
                 "$receiver_ssh" "$receiver_ip" "$seed" \
                 || true
 
             if [ ! -f "$subdir/results.csv" ]; then
-                echo "$loss,$codec,${profile:-—},$rate,ERR,0,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,no_results" >> "$summary_csv"
+                echo "$loss,$codec,${profile:-—},$rate,ERR,0,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,no_results" >> "$summary_csv"
                 continue
             fi
             row=$(tail -n 1 "$subdir/results.csv")
@@ -152,6 +155,9 @@ EOF
             window_overflow=NA
             pending_recovered=NA
             skipped_groups=NA
+            output_bytes=NA
+            payload_bytes=NA
+            byte_completion_pct=NA
             if [ -f "$flow_csv" ]; then
                 eval "$(python3 - "$flow_csv" <<'PY'
 import csv, sys
@@ -163,6 +169,8 @@ keys = (
     "window_overflow",
     "pending_recovered_groups",
     "skipped_groups",
+    "output_bytes",
+    "payload_bytes",
 )
 try:
     with open(path, encoding="utf-8", newline="") as fh:
@@ -176,11 +184,20 @@ for key in keys:
         print(f"pending_recovered={val}")
     else:
         print(f"{key}={val}")
+out = row.get("output_bytes") or ""
+pay = row.get("payload_bytes") or ""
+try:
+    o = float(out)
+    p = float(pay)
+    pct = f"{100.0 * o / p:.4f}" if p > 0 else "NA"
+except (TypeError, ValueError):
+    pct = "NA"
+print(f"byte_completion_pct={pct}")
 PY
 )"
             fi
-            echo "$loss,$codec,${profile:-—},$rate,$st,$fp,$wire_loss,$block_pct,$missing_groups,$recovered_groups,$groups_failed,$window_overflow,$pending_recovered,$skipped_groups,$e2e,$n2a,${notes:-—}" >> "$summary_csv"
-            echo "  -> $st flows=$fp wire_loss=$wire_loss% block=$block_pct% recovered=$recovered_groups failed=$groups_failed overflow=$window_overflow pending=$pending_recovered skipped=$skipped_groups N2avg=$n2a"
+            echo "$loss,$codec,${profile:-—},$rate,$st,$fp,$wire_loss,$block_pct,$missing_groups,$recovered_groups,$groups_failed,$window_overflow,$pending_recovered,$skipped_groups,$output_bytes,$payload_bytes,$byte_completion_pct,$e2e,$n2a,${notes:-—}" >> "$summary_csv"
+            echo "  -> $st flows=$fp wire_loss=$wire_loss% block=$block_pct% bytes=$byte_completion_pct% recovered=$recovered_groups failed=$groups_failed overflow=$window_overflow pending=$pending_recovered skipped=$skipped_groups out=$output_bytes/$payload_bytes N2avg=$n2a"
         done
     done
 done

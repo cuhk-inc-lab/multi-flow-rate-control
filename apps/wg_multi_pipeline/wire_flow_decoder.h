@@ -7,24 +7,29 @@
  * Architecture (Phase A/C): Receive / Recover / Emit are separate.
  *
  * Receive:
- *   - block_id < next_emit_block  → truly late (already emitted)
+ *   - block_id < next_emit_block  → truly late (already emitted / skipped)
  *   - block_id == next_emit_block → current head
  *   - next_emit_block < block_id < next_emit_block + WIRE_FLOW_GROUP_WINDOW
  *     → future group, accepted if a slot exists
- *   - block_id >= next_emit_block + WIRE_FLOW_GROUP_WINDOW → window_overflow
+ *   - block_id >= next_emit_block + WIRE_FLOW_GROUP_WINDOW, or no free slot:
+ *       strict → window_overflow
+ *       best-effort → skip stuck heads until the block fits (make_room);
+ *         still window_overflow if it cannot
  *
  * Recover:
  *   - Each group independently; triggered only by a new non-duplicate shard
- *     (or once more at END finalize).
+ *     (or once more at END finalize / make_room last-chance).
  *   - Independent of next_emit_block.
  *
  * Emit:
  *   - Ordered: only the current next_emit_block is written next.
  *   - Strict: emit only RECOVERED; missing/FAILED head stalls (hash PASS iff
  *     next_emit_block == end_block_count with no gaps).
- *   - Best-effort (after END): skip missing/FAILED head (skipped_groups),
- *     optionally write systematic data shards that arrived, then emit later
- *     RECOVERED groups. Hash is expected to FAIL; use skip/byte gap metrics.
+ *   - Best-effort: after END, skip missing/FAILED head (skipped_groups).
+ *     Mid-stream, skip stuck heads only when a new block cannot enter the
+ *     reorder window. Optionally write systematic data shards that arrived,
+ *     then emit later RECOVERED groups in order. Hash is expected to FAIL;
+ *     use skip/byte gap metrics.
  */
 
 #include "codec.h"
@@ -57,7 +62,7 @@ typedef struct WireFlowDecoderStats {
     uint64_t groups_emitted;
     uint64_t groups_failed;
     uint64_t window_overflow;
-    uint64_t skipped_groups; /* best-effort: missing or FAILED head advanced */
+    uint64_t skipped_groups; /* best-effort: missing/FAILED/abandoned head */
     uint64_t pending_recovered_groups; /* snapshot; prefer helper below */
 } WireFlowDecoderStats;
 
@@ -85,7 +90,9 @@ void wire_flow_decoder_destroy(WireFlowDecoder *dec);
 int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
                              const uint8_t *payload, size_t payload_len);
 
-/* Best-effort: skip remaining holes after END and emit later recovered groups. */
+/* Best-effort: skip remaining holes after END and emit later recovered groups.
+ * Mid-stream skip of stuck heads is done in ingest via make_room, not here.
+ */
 int wire_flow_decoder_flush_best_effort(WireFlowDecoder *dec);
 
 bool wire_flow_decoder_is_complete(const WireFlowDecoder *dec);

@@ -105,6 +105,18 @@ static WireGroup *find_group(WireGroup groups[WIRE_FLOW_GROUP_WINDOW],
     return NULL;
 }
 
+static bool window_has_empty_slot(const WireGroup groups[WIRE_FLOW_GROUP_WINDOW])
+{
+    size_t index;
+
+    for (index = 0; index < WIRE_FLOW_GROUP_WINDOW; index++) {
+        if (groups[index].state == WIRE_GROUP_EMPTY) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static WireGroup *allocate_group(WireGroup groups[WIRE_FLOW_GROUP_WINDOW],
                                  uint64_t block_id, uint16_t shard_count,
                                  uint16_t valid_len, uint64_t encode_begin_ns,
@@ -566,7 +578,7 @@ static int write_best_effort_group(WireFlowDecoder *dec, WireGroup *group)
 }
 
 /*
- * Advance past a missing or FAILED head after END in best-effort.
+ * Advance past a missing, FAILED, or abandoned ACTIVE head in best-effort.
  * Does not allocate a slot for a missing block_id.
  */
 static int skip_unrecoverable_head(WireFlowDecoder *dec, WireGroup *group)
@@ -586,6 +598,64 @@ static int skip_unrecoverable_head(WireFlowDecoder *dec, WireGroup *group)
     }
     dec->stats.skipped_groups++;
     dec->next_emit_block++;
+    return 0;
+}
+
+static bool block_needs_room(WireFlowDecoder *dec, uint64_t block_id)
+{
+    if (!block_in_reorder_window(block_id, dec->next_emit_block)) {
+        return true;
+    }
+    if (find_group(dec->groups, block_id) != NULL) {
+        return false;
+    }
+    return !window_has_empty_slot(dec->groups);
+}
+
+/*
+ * Best-effort only: slide next_emit until block_id fits in the reorder window
+ * (or a slot exists). Never skip a RECOVERED head; last-chance recover ACTIVE
+ * heads first. At most WIRE_FLOW_GROUP_WINDOW skips per packet; never advance
+ * past block_id.
+ */
+static int make_room_for_block(WireFlowDecoder *dec, uint64_t block_id)
+{
+    size_t guard = 0;
+
+    if (dec == NULL || !dec->best_effort) {
+        return 0;
+    }
+
+    while (block_needs_room(dec, block_id) &&
+           guard < (size_t)WIRE_FLOW_GROUP_WINDOW) {
+        WireGroup *head;
+
+        if (dec->next_emit_block >= block_id) {
+            break;
+        }
+
+        head = find_group(dec->groups, dec->next_emit_block);
+        if (head != NULL && head->state == WIRE_GROUP_RECOVERED) {
+            if (write_decoded_group(dec, head) != 0) {
+                return -1;
+            }
+            dec->next_emit_block++;
+            continue;
+        }
+        if (head != NULL && head->state == WIRE_GROUP_ACTIVE) {
+            if (try_recover_group(dec, head, true) == WIRE_RECOVER_OK) {
+                if (write_decoded_group(dec, head) != 0) {
+                    return -1;
+                }
+                dec->next_emit_block++;
+                continue;
+            }
+        }
+        if (skip_unrecoverable_head(dec, head) != 0) {
+            return -1;
+        }
+        guard++;
+    }
     return 0;
 }
 
@@ -749,6 +819,15 @@ int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
     if (header->block_id < dec->next_emit_block) {
         dec->stats.late_datagrams++;
         return 0;
+    }
+    if (dec->best_effort) {
+        if (make_room_for_block(dec, header->block_id) != 0) {
+            return -1;
+        }
+        if (header->block_id < dec->next_emit_block) {
+            dec->stats.late_datagrams++;
+            return 0;
+        }
     }
     if (!block_in_reorder_window(header->block_id, dec->next_emit_block)) {
         dec->stats.window_overflow++;

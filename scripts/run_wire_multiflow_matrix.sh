@@ -54,6 +54,7 @@ send_port_base=${SEND_PORT:-}
 keep_remote=${KEEP_REMOTE_OUTPUT:-1}
 fetch_out=${FETCH_OUTPUT:-0}
 decode_mark=${DECODE_MARK:-0}
+best_effort=${BEST_EFFORT:-0}
 use_no_pace=${USE_NO_PACE:-0}
 monitor_relays=${MONITOR_RELAYS:-1}
 monitor_hz=${MONITOR_HZ:-1}
@@ -148,6 +149,9 @@ Env:
   FETCH_OUTPUT=0         scp outputs into result dir (default: off; large)
   DECODE_MARK=1          teaching mode: receiver --decode-mark; hash will not
                          match; look for [WG_DECODE_MARK] footer / status MARKED
+  BEST_EFFORT=1          receiver --best-effort: skip unrecoverable groups and
+                         emit later recovered ones; hash expected FAIL; use
+                         skipped_groups / output_bytes gap metrics instead
   USE_NO_PACE=0
   MONITOR_RELAYS=1       sample Node2/Node3 NIC bitrate during each case
   MONITOR_HZ=1
@@ -692,6 +696,10 @@ decode_mark_opt=
 if [ "$decode_mark" = "1" ]; then
     decode_mark_opt="--decode-mark"
 fi
+best_effort_opt=
+if [ "$best_effort" = "1" ]; then
+    best_effort_opt="--best-effort"
+fi
 
 {
     echo "# Wire multi-flow (Node1 → Node4)"
@@ -714,7 +722,12 @@ fi
     else
         echo "- **Mode:** seed synthesize FLOWS=$flows DURATION_S=${dur_s}s seed=\`$seed_path\`"
     fi
-    echo "- **PASS:** sha256 match on receiver for every flow"
+    if [ "$best_effort" = "1" ]; then
+        echo "- **PASS:** not used (BEST_EFFORT=1); look at skipped_groups / output_bytes / block %"
+        echo "- **Best-effort:** **ON** (skip unrecoverable heads; hash expected FAIL)"
+    else
+        echo "- **PASS:** sha256 match on receiver for every flow"
+    fi
     if [ "$decode_mark" = "1" ]; then
         echo "- **Decode-mark:** **ON** (receiver \`--decode-mark\`; hash will not match; look for \`[WG_DECODE_MARK]\` / status \`MARKED\`)"
     else
@@ -868,14 +881,14 @@ for codec in $codecs; do
             (cd "$remote_repo" && exec ./build/wg_multi_pipeline --codec "$codec" --lock-memory \
               $case_rs_args \
               --udp-recv "$port" "$remote_prefix" --max-flows "$flows" --idle-sec "$case_idle" \
-              $recv_local_args $out_suffix_args $decode_mark_opt) \
+              $recv_local_args $out_suffix_args $decode_mark_opt $best_effort_opt) \
               > "$receiver_log" 2>&1 &
         else
             ssh $ssh_opts "$receiver_ssh" \
                 "cd '$remote_repo' && exec $bin_rel --codec '$codec' --lock-memory \
                   $case_rs_args \
                   --udp-recv '$port' '$remote_prefix' --max-flows '$flows' --idle-sec '$case_idle' \
-                  $recv_local_args $out_suffix_args $decode_mark_opt" \
+                  $recv_local_args $out_suffix_args $decode_mark_opt $best_effort_opt" \
                 > "$receiver_log" 2>&1 &
         fi
         receiver_pid=$!
@@ -895,6 +908,7 @@ for codec in $codecs; do
         status=FAIL
         flows_pass=0
         flows_marked=0
+        flows_gap=0
 
         if ! kill -0 "$receiver_pid" 2>/dev/null; then
             wait "$receiver_pid" || true
@@ -1021,6 +1035,30 @@ for codec in $codecs; do
                 flows_pass=$((flows_pass + 1))
                 flows_marked=$((flows_marked + 1))
                 fail_reason=
+            elif [ "$best_effort" = "1" ]; then
+                # Gaps are expected; report remaining file size, not hash PASS.
+                out_bytes_guess=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
+                if [ "$out_bytes_guess" = "NA" ]; then
+                    out_bytes_guess=$(flow_csv_field "$fid" output_bytes "$receiver_log")
+                fi
+                skipped_guess=$(flow_csv_field "$log_fid" skipped_groups "$receiver_log")
+                if [ "$skipped_guess" = "NA" ]; then
+                    skipped_guess=$(flow_csv_field "$fid" skipped_groups "$receiver_log")
+                fi
+                byte_pct=NA
+                if [ "$out_bytes_guess" != "NA" ] && [ "$payload_bytes" -gt 0 ] 2>/dev/null; then
+                    byte_pct=$(awk -v o="$out_bytes_guess" -v p="$payload_bytes" \
+                        'BEGIN{printf "%.4f", 100.0*o/p}')
+                fi
+                if [ "$recv_blocks" != "NA" ]; then
+                    flow_status=FAIL
+                    fail_reason="best_effort_incomplete_recv=${recv_blocks}/${expect_blocks}_missing_groups=${missing_groups}_bytes=${out_bytes_guess}/${payload_bytes}_byte_pct=${byte_pct}_skipped=${skipped_guess}"
+                else
+                    flow_status=GAP
+                    flows_pass=$((flows_pass + 1))
+                    flows_gap=$((flows_gap + 1))
+                    fail_reason="best_effort_bytes=${out_bytes_guess}/${payload_bytes}_byte_pct=${byte_pct}_skipped=${skipped_guess}"
+                fi
             else
                 out_bytes_guess=$(flow_csv_field "$log_fid" output_bytes "$receiver_log")
                 if [ "$out_bytes_guess" = "NA" ]; then
@@ -1045,6 +1083,12 @@ for codec in $codecs; do
                 else
                     fail_reason="missing_or_incomplete"
                 fi
+                if [ -n "$case_notes" ]; then
+                    case_notes="$case_notes; "
+                fi
+                case_notes="${case_notes}f${fid}:${fail_reason}"
+            fi
+            if [ "$best_effort" = "1" ] && [ -n "$fail_reason" ]; then
                 if [ -n "$case_notes" ]; then
                     case_notes="$case_notes; "
                 fi
@@ -1133,8 +1177,12 @@ for codec in $codecs; do
                     ;;
             esac
 
-            if [ "$flow_status" = "PASS" ] || [ "$flow_status" = "MARKED" ]; then
-                echo "  flow $fid -> $flow_status  wire_loss=$wire_shard_loss_pct  block=$block_completion_pct  e2e_p95=$e2e_p95  mark=$mark_found"
+            if [ "$flow_status" = "PASS" ] || [ "$flow_status" = "MARKED" ] || \
+                [ "$flow_status" = "GAP" ]; then
+                echo "  flow $fid -> $flow_status  wire_loss=$wire_shard_loss_pct  block=$block_completion_pct  e2e_p95=$e2e_p95  mark=$mark_found${fail_reason:+  $fail_reason}"
+                if [ "$flow_status" = "GAP" ]; then
+                    echo "           shards=$received_shards/$sent_shards completed=$completed_blocks/$expected_blocks missing_groups=$missing_groups late=$late_datagrams dropped_groups=$dropped_groups recovered=$recovered_groups failed=$groups_failed overflow=$window_overflow pending=$pending_recovered_groups skipped=$skipped_groups out=$out_bytes/$payload_bytes"
+                fi
             else
                 echo "  flow $fid -> FAIL  wire_loss=$wire_shard_loss_pct  block=$block_completion_pct  e2e_p95=$e2e_p95  mark=$mark_found  reason=$fail_reason"
                 echo "           shards=$received_shards/$sent_shards completed=$completed_blocks/$expected_blocks missing_groups=$missing_groups late=$late_datagrams dropped_groups=$dropped_groups recovered=$recovered_groups failed=$groups_failed overflow=$window_overflow pending=$pending_recovered_groups skipped=$skipped_groups"
@@ -1153,6 +1201,8 @@ for codec in $codecs; do
             [ "$flows_pass" -eq "$flows" ]; then
             if [ "$flows_marked" -gt 0 ]; then
                 status=MARKED
+            elif [ "$flows_gap" -gt 0 ]; then
+                status=GAP
             else
                 status=PASS
             fi
@@ -1177,12 +1227,12 @@ for codec in $codecs; do
         echo "| $codec | $rate | $n2_peak | $n2_avg | $n3_peak | $n3_avg | $status | $wire_loss_display | $block_completion_display | $e2e_avg | $case_notes |" \
             >> "$markdown"
 
-        if [ "$status" != "PASS" ] && [ "$status" != "MARKED" ]; then
+        if [ "$status" != "PASS" ] && [ "$status" != "MARKED" ] && [ "$status" != "GAP" ]; then
             echo "- \`$label\`: $case_notes (snd=$sender_rc rcv=$receiver_rc)" >> "$fail_notes"
         fi
 
         case_total=$((case_total + 1))
-        if [ "$status" = "PASS" ] || [ "$status" = "MARKED" ]; then
+        if [ "$status" = "PASS" ] || [ "$status" = "MARKED" ] || [ "$status" = "GAP" ]; then
             case_pass=$((case_pass + 1))
         fi
         echo "  -> case $status ($flows_pass/$flows)  src=${rate}Mbps/flow  N2=${n2_peak}/${n2_avg}  N3=${n3_peak}/${n3_avg}  wire_loss=$wire_loss_display  block=$block_completion_display"
