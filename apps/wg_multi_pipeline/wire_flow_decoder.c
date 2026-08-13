@@ -1,5 +1,6 @@
 #include "wire_flow_decoder.h"
 
+#include <assert.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -7,17 +8,32 @@
 #include <string.h>
 #include <time.h>
 
+typedef enum WireGroupState {
+    WIRE_GROUP_EMPTY = 0,
+    WIRE_GROUP_ACTIVE,
+    WIRE_GROUP_RECOVERED,
+    WIRE_GROUP_EMITTED,
+    WIRE_GROUP_FAILED,
+} WireGroupState;
+
 typedef struct WireGroup {
-    bool          in_use;
-    uint64_t      block_id;
-    uint16_t      shard_count;
-    uint16_t      valid_len;
-    uint8_t      *received_bits;
-    uint64_t      encode_begin_ns;
-    uint64_t      encode_end_ns;
-    bool          timing_valid;
+    WireGroupState state;
+    uint64_t       block_id;
+    uint16_t       shard_count;
+    uint16_t       valid_len;
+    uint8_t       *received_bits;
+    uint64_t       encode_begin_ns;
+    uint64_t       encode_end_ns;
+    bool           timing_valid;
     unsigned char *data;
+    unsigned       last_recovery_count;
 } WireGroup;
+
+typedef enum WireRecoverResult {
+    WIRE_RECOVER_PENDING = 0,
+    WIRE_RECOVER_OK,
+    WIRE_RECOVER_FAILED,
+} WireRecoverResult;
 
 typedef struct LatencySample {
     uint64_t encode_ns;
@@ -48,7 +64,7 @@ struct WireFlowDecoder {
     WireDecodeOutputFn   output_fn;
     void                *output_ctx;
     WireGroup            groups[WIRE_FLOW_GROUP_WINDOW];
-    uint64_t             next_block;
+    uint64_t             next_emit_block;
     uint64_t             end_block_count;
     bool                 end_seen;
     WireFlowDecoderStats stats;
@@ -81,7 +97,8 @@ static WireGroup *find_group(WireGroup groups[WIRE_FLOW_GROUP_WINDOW],
     size_t index;
 
     for (index = 0; index < WIRE_FLOW_GROUP_WINDOW; index++) {
-        if (groups[index].in_use && groups[index].block_id == block_id) {
+        if (groups[index].state != WIRE_GROUP_EMPTY &&
+            groups[index].block_id == block_id) {
             return &groups[index];
         }
     }
@@ -114,10 +131,10 @@ static WireGroup *allocate_group(WireGroup groups[WIRE_FLOW_GROUP_WINDOW],
     }
 
     for (index = 0; index < WIRE_FLOW_GROUP_WINDOW; index++) {
-        if (!groups[index].in_use) {
+        if (groups[index].state == WIRE_GROUP_EMPTY) {
             release_group(&groups[index]);
             groups[index] = (WireGroup){
-                .in_use = true,
+                .state = WIRE_GROUP_ACTIVE,
                 .block_id = block_id,
                 .shard_count = shard_count,
                 .valid_len = valid_len,
@@ -127,6 +144,7 @@ static WireGroup *allocate_group(WireGroup groups[WIRE_FLOW_GROUP_WINDOW],
                                 encode_end_ns >= encode_begin_ns,
                 .received_bits = bits,
                 .data = data,
+                .last_recovery_count = 0,
             };
             return &groups[index];
         }
@@ -199,47 +217,97 @@ static bool group_systematic_data_ready(const WireGroup *group,
     return true;
 }
 
-static bool group_ready_to_emit(const WireGroup *group, const Codec *codec)
+/*
+ * Mark group RECOVERED when emit-ready. For RS FEC recovery, present bits are
+ * set to all shards after Codec_recover OK so Codec_decode sees a full group.
+ * Systematic fast-path only requires data shards present; parity slots may stay
+ * unset — same contract as before (Codec_decode reads encoded layout).
+ */
+static void mark_group_recovered(WireGroup *group, WireFlowDecoderStats *stats,
+                                 bool via_fec_recover)
 {
-    return group_all_shards_present(group) ||
-           group_systematic_data_ready(group, codec);
+    assert(group->state == WIRE_GROUP_ACTIVE);
+    if (via_fec_recover) {
+        codec_present_set_all(group->received_bits, group->shard_count);
+    }
+    group->state = WIRE_GROUP_RECOVERED;
+    if (stats != NULL) {
+        stats->recovered_groups++;
+        stats->groups_recovered++;
+    }
 }
 
-static int recover_group(WireGroup *group, const Codec *codec,
-                         uint64_t *recovered_groups)
+static WireRecoverResult try_recover_group(WireFlowDecoder *dec,
+                                           WireGroup *group,
+                                           bool finalize_at_end)
 {
     size_t data_shards;
+    unsigned count;
     CodecRecoverStatus status;
 
-    if (group == NULL || codec == NULL || group_all_shards_present(group)) {
-        return 0;
+    if (dec == NULL || group == NULL || dec->codec == NULL) {
+        return WIRE_RECOVER_PENDING;
     }
 
-    /*
-     * Use the process RS geometry fixed at startup / decoder create.
-     * Do not call RsCodec_set_profile_from_shard_count here: wire
-     * shard_count is validation input, not a remote profile command.
-     */
-    data_shards = Codec_data_shards(codec);
-    if (data_shards == 0 || group_received_count(group) < data_shards) {
-        return 0;
+    if (group->state == WIRE_GROUP_RECOVERED ||
+        group->state == WIRE_GROUP_EMITTED) {
+        return WIRE_RECOVER_OK;
+    }
+    if (group->state == WIRE_GROUP_FAILED) {
+        return WIRE_RECOVER_FAILED;
+    }
+    if (group->state != WIRE_GROUP_ACTIVE) {
+        return WIRE_RECOVER_PENDING;
     }
 
-    status = Codec_recover(codec, group->data, group->received_bits,
+    if (group_all_shards_present(group)) {
+        mark_group_recovered(group, &dec->stats, false);
+        return WIRE_RECOVER_OK;
+    }
+
+    if (group_systematic_data_ready(group, dec->codec)) {
+        mark_group_recovered(group, &dec->stats, false);
+        return WIRE_RECOVER_OK;
+    }
+
+    data_shards = Codec_data_shards(dec->codec);
+    count = group_received_count(group);
+    if (data_shards == 0 || count < data_shards) {
+        if (finalize_at_end) {
+            group->state = WIRE_GROUP_FAILED;
+            dec->stats.groups_failed++;
+            return WIRE_RECOVER_FAILED;
+        }
+        return WIRE_RECOVER_PENDING;
+    }
+
+    if (!finalize_at_end && count == group->last_recovery_count) {
+        return WIRE_RECOVER_PENDING;
+    }
+    group->last_recovery_count = count;
+
+    status = Codec_recover(dec->codec, group->data, group->received_bits,
                            group->shard_count);
+    if (status == CODEC_RECOVER_OK) {
+        mark_group_recovered(group, &dec->stats, true);
+        return WIRE_RECOVER_OK;
+    }
     if (status == CODEC_RECOVER_UNAVAILABLE) {
-        return 0;
-    }
-    if (status != CODEC_RECOVER_OK) {
-        return -1;
-    }
-
-    codec_present_set_all(group->received_bits, group->shard_count);
-    if (recovered_groups != NULL) {
-        (*recovered_groups)++;
+        if (finalize_at_end) {
+            group->state = WIRE_GROUP_FAILED;
+            dec->stats.groups_failed++;
+            return WIRE_RECOVER_FAILED;
+        }
+        return WIRE_RECOVER_PENDING;
     }
 
-    return 0;
+    /* CODEC_RECOVER_ERR: correlated shards — wait for more during ingest. */
+    if (finalize_at_end) {
+        group->state = WIRE_GROUP_FAILED;
+        dec->stats.groups_failed++;
+        return WIRE_RECOVER_FAILED;
+    }
+    return WIRE_RECOVER_PENDING;
 }
 
 static int compare_u64(const void *left, const void *right)
@@ -382,6 +450,38 @@ void wire_flow_decoder_print_latency(const WireFlowDecoder *dec)
     latency_stats_print_metric(stats, "end_to_end_jitter", 4);
 }
 
+static uint64_t count_pending_recovered(const WireFlowDecoder *dec)
+{
+    size_t index;
+    uint64_t pending = 0;
+
+    if (dec == NULL) {
+        return 0;
+    }
+    for (index = 0; index < WIRE_FLOW_GROUP_WINDOW; index++) {
+        const WireGroup *group = &dec->groups[index];
+
+        if (group->state == WIRE_GROUP_RECOVERED &&
+            group->block_id >= dec->next_emit_block) {
+            pending++;
+        }
+    }
+    return pending;
+}
+
+static void refresh_pending_snapshot(WireFlowDecoder *dec)
+{
+    if (dec != NULL) {
+        dec->stats.pending_recovered_groups = count_pending_recovered(dec);
+    }
+}
+
+static bool block_in_reorder_window(uint64_t block_id, uint64_t next_emit)
+{
+    return block_id >= next_emit &&
+           (block_id - next_emit) < (uint64_t)WIRE_FLOW_GROUP_WINDOW;
+}
+
 static int write_decoded_group(WireFlowDecoder *dec, WireGroup *group)
 {
     size_t input_size;
@@ -391,6 +491,10 @@ static int write_decoded_group(WireFlowDecoder *dec, WireGroup *group)
 
     if (dec == NULL || group == NULL || dec->codec == NULL ||
         dec->output_fn == NULL) {
+        return -1;
+    }
+
+    if (group->state != WIRE_GROUP_RECOVERED) {
         return -1;
     }
 
@@ -405,7 +509,9 @@ static int write_decoded_group(WireFlowDecoder *dec, WireGroup *group)
     decode_ready_ns = realtime_nanoseconds();
     Codec_decode(dec->codec, group->data, output_size);
     decode_done_ns = realtime_nanoseconds();
+    group->state = WIRE_GROUP_EMITTED;
     dec->stats.decoded_blocks++;
+    dec->stats.groups_emitted++;
     if (group->timing_valid) {
         latency_stats_add(&dec->latency_stats, group->encode_begin_ns,
                           group->encode_end_ns, decode_ready_ns, decode_done_ns);
@@ -417,35 +523,6 @@ static int write_decoded_group(WireFlowDecoder *dec, WireGroup *group)
     dec->stats.output_bytes += group->valid_len;
     release_group(group);
     return 0;
-}
-
-static int flush_recoverable_groups(WireFlowDecoder *dec)
-{
-    for (;;) {
-        WireGroup *group = find_group(dec->groups, dec->next_block);
-
-        if (group == NULL) {
-            return 0;
-        }
-        /*
-         * Emit when all original data shards are present (systematic) or the
-         * full group is present. Otherwise try FEC recover, then require a
-         * full group. Always emit only for next_block (ordered).
-         */
-        if (!group_ready_to_emit(group, dec->codec)) {
-            if (recover_group(group, dec->codec,
-                              &dec->stats.recovered_groups) != 0) {
-                return -1;
-            }
-            if (!group_all_shards_present(group)) {
-                return 0;
-            }
-        }
-        if (write_decoded_group(dec, group) != 0) {
-            return -1;
-        }
-        dec->next_block++;
-    }
 }
 
 static int write_best_effort_group(WireFlowDecoder *dec, WireGroup *group)
@@ -488,34 +565,87 @@ static int write_best_effort_group(WireFlowDecoder *dec, WireGroup *group)
     return 0;
 }
 
-int wire_flow_decoder_flush_best_effort(WireFlowDecoder *dec)
+/*
+ * Advance past a missing or FAILED head after END in best-effort.
+ * Does not allocate a slot for a missing block_id.
+ */
+static int skip_unrecoverable_head(WireFlowDecoder *dec, WireGroup *group)
 {
-    if (dec == NULL || !dec->inited) {
+    if (dec == NULL) {
         return -1;
     }
-
-    while (dec->next_block < dec->end_block_count) {
-        WireGroup *group = find_group(dec->groups, dec->next_block);
-
-        if (group == NULL) {
-            dec->stats.dropped_groups++;
-            dec->next_block++;
-            continue;
+    if (group != NULL) {
+        if (Codec_is_systematic(dec->codec) && group->valid_len > 0 &&
+            group->data != NULL && group->received_bits != NULL) {
+            if (write_best_effort_group(dec, group) != 0) {
+                return -1;
+            }
+        } else {
+            release_group(group);
         }
-        if (recover_group(group, dec->codec, &dec->stats.recovered_groups) != 0) {
-            return -1;
+    }
+    dec->stats.skipped_groups++;
+    dec->next_emit_block++;
+    return 0;
+}
+
+static int try_emit_from_head(WireFlowDecoder *dec)
+{
+    for (;;) {
+        WireGroup *group;
+
+        if (dec->end_seen && dec->next_emit_block >= dec->end_block_count) {
+            return 0;
         }
-        if (group_ready_to_emit(group, dec->codec)) {
+
+        group = find_group(dec->groups, dec->next_emit_block);
+        if (group != NULL && group->state == WIRE_GROUP_RECOVERED) {
             if (write_decoded_group(dec, group) != 0) {
                 return -1;
             }
-        } else if (write_best_effort_group(dec, group) != 0) {
-            return -1;
+            dec->next_emit_block++;
+            continue;
         }
-        dec->next_block++;
+        if (dec->best_effort && dec->end_seen &&
+            (group == NULL || group->state == WIRE_GROUP_FAILED)) {
+            if (skip_unrecoverable_head(dec, group) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        /* Strict, or ACTIVE head still waiting for shards. */
+        return 0;
+    }
+}
+
+static void finalize_active_groups(WireFlowDecoder *dec)
+{
+    size_t index;
+
+    for (index = 0; index < WIRE_FLOW_GROUP_WINDOW; index++) {
+        WireGroup *group = &dec->groups[index];
+
+        if (group->state == WIRE_GROUP_ACTIVE) {
+            try_recover_group(dec, group, true);
+        }
+    }
+}
+
+int wire_flow_decoder_flush_best_effort(WireFlowDecoder *dec)
+{
+    if (dec == NULL || !dec->inited || !dec->best_effort) {
+        return -1;
+    }
+    if (!dec->end_seen) {
+        return 0;
     }
 
-    if (dec->end_seen && dec->next_block >= dec->end_block_count) {
+    finalize_active_groups(dec);
+    if (try_emit_from_head(dec) != 0) {
+        return -1;
+    }
+    refresh_pending_snapshot(dec);
+    if (dec->next_emit_block >= dec->end_block_count) {
         dec->complete = true;
     }
     return 0;
@@ -587,7 +717,12 @@ int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
         }
         dec->end_seen = true;
         dec->end_block_count = header->block_id;
-        if (dec->next_block == dec->end_block_count) {
+        finalize_active_groups(dec);
+        if (try_emit_from_head(dec) != 0) {
+            return -1;
+        }
+        refresh_pending_snapshot(dec);
+        if (dec->next_emit_block == dec->end_block_count) {
             dec->complete = true;
         } else if (dec->best_effort) {
             if (wire_flow_decoder_flush_best_effort(dec) != 0) {
@@ -609,8 +744,14 @@ int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
         return 0;
     }
     dec->stats.seen_datagrams++;
-    if (header->block_id < dec->next_block) {
+
+    /* Truly late: block already emitted (next_emit_block advanced past it). */
+    if (header->block_id < dec->next_emit_block) {
         dec->stats.late_datagrams++;
+        return 0;
+    }
+    if (!block_in_reorder_window(header->block_id, dec->next_emit_block)) {
+        dec->stats.window_overflow++;
         return 0;
     }
 
@@ -620,10 +761,20 @@ int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
                                header->valid_len, header->encode_begin_ns,
                                header->encode_end_ns);
         if (group == NULL) {
-            dec->stats.dropped_groups++;
+            dec->stats.window_overflow++;
             return 0;
         }
+        dec->stats.groups_received++;
     }
+
+    if (group->state == WIRE_GROUP_RECOVERED ||
+        group->state == WIRE_GROUP_FAILED ||
+        group->state == WIRE_GROUP_EMITTED) {
+        dec->stats.duplicate_datagrams++;
+        return 0;
+    }
+    assert(group->state == WIRE_GROUP_ACTIVE);
+
     if (group->shard_count != header->shard_count ||
         group->valid_len != header->valid_len ||
         group->encode_begin_ns != header->encode_begin_ns ||
@@ -640,15 +791,19 @@ int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
         dec->stats.duplicate_datagrams++;
         return 0;
     }
+
     memcpy(group->data + (size_t)header->shard_index * PKG_SIZE, payload,
            PKG_SIZE);
     codec_present_set(group->received_bits, header->shard_index);
     dec->stats.received_datagrams++;
 
-    if (flush_recoverable_groups(dec) != 0) {
+    try_recover_group(dec, group, false);
+
+    if (try_emit_from_head(dec) != 0) {
         return -1;
     }
-    if (dec->end_seen && dec->next_block == dec->end_block_count) {
+    refresh_pending_snapshot(dec);
+    if (dec->end_seen && dec->next_emit_block == dec->end_block_count) {
         dec->complete = true;
     }
     return 0;
@@ -666,12 +821,17 @@ bool wire_flow_decoder_end_seen(const WireFlowDecoder *dec)
 
 uint64_t wire_flow_decoder_next_block(const WireFlowDecoder *dec)
 {
-    return dec != NULL ? dec->next_block : 0;
+    return dec != NULL ? dec->next_emit_block : 0;
 }
 
 uint64_t wire_flow_decoder_end_block_count(const WireFlowDecoder *dec)
 {
     return dec != NULL ? dec->end_block_count : 0;
+}
+
+uint64_t wire_flow_decoder_pending_recovered_groups(const WireFlowDecoder *dec)
+{
+    return count_pending_recovered(dec);
 }
 
 const WireFlowDecoderStats *wire_flow_decoder_stats(const WireFlowDecoder *dec)

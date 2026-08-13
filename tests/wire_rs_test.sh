@@ -9,10 +9,21 @@ one_loss_port=22006
 two_loss_port=22007
 partial_port=22008
 input="$base/wire_rscode_input.ts"
+ready_timeout_sec=${READY_TIMEOUT_SEC:-5}
+receiver_pid=
+proxy_pid=
 
 cleanup() {
-    [ -n "${receiver_pid:-}" ] && kill "$receiver_pid" 2>/dev/null || true
-    [ -n "${proxy_pid:-}" ] && kill "$proxy_pid" 2>/dev/null || true
+    if [ -n "${receiver_pid:-}" ]; then
+        kill "$receiver_pid" 2>/dev/null || true
+        wait "$receiver_pid" 2>/dev/null || true
+        receiver_pid=
+    fi
+    if [ -n "${proxy_pid:-}" ]; then
+        kill "$proxy_pid" 2>/dev/null || true
+        wait "$proxy_pid" 2>/dev/null || true
+        proxy_pid=
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -23,14 +34,47 @@ Path(sys.argv[1]).write_bytes(b"A" * 1400 + b"B" * 1400 +
                               b"C" * 1400 + b"D" * 1400)
 PY
 
+wait_receiver_ready() {
+    log=$1
+    deadline=$(($(date +%s) + ready_timeout_sec))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ -f "$log" ] && grep -q 'udp-recv: listening on UDP port' "$log" 2>/dev/null; then
+            return 0
+        fi
+        if [ -n "${receiver_pid:-}" ] && ! kill -0 "$receiver_pid" 2>/dev/null; then
+            echo "error: receiver exited before ready (log=$log)" >&2
+            [ -f "$log" ] && cat "$log" >&2
+            cleanup
+            return 1
+        fi
+        sleep 0.05
+    done
+    echo "error: timed out after ${ready_timeout_sec}s waiting for receiver ready (log=$log)" >&2
+    [ -f "$log" ] && cat "$log" >&2
+    cleanup
+    return 1
+}
+
 start_receiver() {
     port=$1
     output=$2
     shift 2
+    rlog="$output.log"
+
+    # Truncate this case's output/log so ready wait never matches a prior run.
+    : >"$output"
+    : >"$rlog"
+
+    # idle-sec=3: ready-log wait already guarantees bind; 3s only avoids false
+    # idle timeouts under test scheduling / sender startup. Does not change
+    # RS recover, strict incomplete, cmp, or best-effort success criteria.
     "$bin" --codec rs --udp-recv "$port" "$output" \
-        --idle-sec 1 "$@" >"$output.log" 2>&1 &
+        --idle-sec 3 "$@" >"$rlog" 2>&1 &
     receiver_pid=$!
-    sleep 1
+
+    wait_receiver_ready "$rlog" || return 1
+    # Brief post-ready buffer only; not the sync mechanism.
+    sleep 0.05
 }
 
 start_drop_proxy() {
@@ -141,6 +185,7 @@ PY
     receiver_pid=
     cmp "$expected" "$output"
     grep -q "missing_data_shards=2" "$output.log"
+    grep -q "skipped_groups=1" "$output.log"
 }
 
 run_full

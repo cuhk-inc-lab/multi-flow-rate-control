@@ -3,15 +3,28 @@
 
 /*
  * Per-flow wire shard reassembly + Codec_recover/Codec_decode.
- * Extracted from the former static receiver path in wire_udp.c (L0).
- * Output is always via WireDecodeOutputFn (no FILE* inside the decoder).
  *
- * Emit conditions (ordered by next_block):
- * - all shards present, or
- * - systematic: every original data shard in [0, Codec_data_shards()) present
- *   (parity/pad may be missing), or
- * - FEC recover restores a full group.
- * received_count >= data_shards alone is never sufficient.
+ * Architecture (Phase A/C): Receive / Recover / Emit are separate.
+ *
+ * Receive:
+ *   - block_id < next_emit_block  → truly late (already emitted)
+ *   - block_id == next_emit_block → current head
+ *   - next_emit_block < block_id < next_emit_block + WIRE_FLOW_GROUP_WINDOW
+ *     → future group, accepted if a slot exists
+ *   - block_id >= next_emit_block + WIRE_FLOW_GROUP_WINDOW → window_overflow
+ *
+ * Recover:
+ *   - Each group independently; triggered only by a new non-duplicate shard
+ *     (or once more at END finalize).
+ *   - Independent of next_emit_block.
+ *
+ * Emit:
+ *   - Ordered: only the current next_emit_block is written next.
+ *   - Strict: emit only RECOVERED; missing/FAILED head stalls (hash PASS iff
+ *     next_emit_block == end_block_count with no gaps).
+ *   - Best-effort (after END): skip missing/FAILED head (skipped_groups),
+ *     optionally write systematic data shards that arrived, then emit later
+ *     RECOVERED groups. Hash is expected to FAIL; use skip/byte gap metrics.
  */
 
 #include "codec.h"
@@ -35,10 +48,17 @@ typedef struct WireFlowDecoderStats {
     uint64_t duplicate_datagrams;
     uint64_t late_datagrams;
     uint64_t malformed_datagrams;
-    uint64_t dropped_groups;
-    uint64_t recovered_groups;
+    uint64_t dropped_groups; /* compat; best-effort holes use skipped_groups */
+    uint64_t recovered_groups; /* alias of groups_recovered (compat) */
     uint64_t missing_data_shards;
-    uint64_t decoded_blocks;
+    uint64_t decoded_blocks;   /* alias of groups_emitted (compat) */
+    uint64_t groups_received;
+    uint64_t groups_recovered;
+    uint64_t groups_emitted;
+    uint64_t groups_failed;
+    uint64_t window_overflow;
+    uint64_t skipped_groups; /* best-effort: missing or FAILED head advanced */
+    uint64_t pending_recovered_groups; /* snapshot; prefer helper below */
 } WireFlowDecoderStats;
 
 typedef struct WireFlowDecoder WireFlowDecoder;
@@ -65,7 +85,7 @@ void wire_flow_decoder_destroy(WireFlowDecoder *dec);
 int wire_flow_decoder_ingest(WireFlowDecoder *dec, const WireHeader *header,
                              const uint8_t *payload, size_t payload_len);
 
-/* Best-effort flush remaining groups after END (systematic codecs only). */
+/* Best-effort: skip remaining holes after END and emit later recovered groups. */
 int wire_flow_decoder_flush_best_effort(WireFlowDecoder *dec);
 
 bool wire_flow_decoder_is_complete(const WireFlowDecoder *dec);
@@ -73,6 +93,8 @@ bool wire_flow_decoder_end_seen(const WireFlowDecoder *dec);
 uint64_t wire_flow_decoder_next_block(const WireFlowDecoder *dec);
 uint64_t wire_flow_decoder_end_block_count(const WireFlowDecoder *dec);
 const WireFlowDecoderStats *wire_flow_decoder_stats(const WireFlowDecoder *dec);
+/* Recovered groups waiting for next_emit_block; not written to output yet. */
+uint64_t wire_flow_decoder_pending_recovered_groups(const WireFlowDecoder *dec);
 
 void wire_flow_decoder_print_latency(const WireFlowDecoder *dec);
 

@@ -1002,14 +1002,19 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             }
             if (saw_flow &&
                 monotonic_seconds() - last_receive >= (double)config->idle_sec) {
+                /*
+                 * After idle_sec with no packets, stop even if END was never seen
+                 * (path loss, sender crash). Report incomplete flows below.
+                 */
                 if (multi_mode) {
-                    /*
-                     * Multi-flow receives can stall forever if some peers never
-                     * send END (path loss, sender crash). After idle_sec with no
-                     * packets, stop and report incomplete flows below.
-                     */
                     fprintf(stderr,
                             "udp-recv: idle for %u s; ending multi-flow receive\n",
+                            config->idle_sec);
+                    break;
+                }
+                if (!wire_flow_decoder_end_seen(flows[0].dec)) {
+                    fprintf(stderr,
+                            "udp-recv: idle for %u s without END; ending receive\n",
                             config->idle_sec);
                     break;
                 }
@@ -1177,10 +1182,28 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                 }
                 fprintf(stderr,
                         "udp-recv: flow %u incomplete: received_blocks=%llu "
-                        "expected_blocks=%llu missing_groups=%llu\n",
+                        "expected_blocks=%llu missing_groups=%llu "
+                        "recovered_groups=%llu decoded_blocks=%llu "
+                        "groups_received=%llu groups_recovered=%llu "
+                        "groups_emitted=%llu groups_failed=%llu "
+                        "window_overflow=%llu pending_recovered_groups=%llu "
+                        "skipped_groups=%llu "
+                        "dropped_groups=%llu late=%llu seen_datagrams=%llu\n",
                         flow->flow_id, (unsigned long long)next_block,
                         (unsigned long long)(end_seen ? end_count : 0),
-                        (unsigned long long)missing_groups);
+                        (unsigned long long)missing_groups,
+                        (unsigned long long)(st ? st->recovered_groups : 0),
+                        (unsigned long long)(st ? st->decoded_blocks : 0),
+                        (unsigned long long)(st ? st->groups_received : 0),
+                        (unsigned long long)(st ? st->groups_recovered : 0),
+                        (unsigned long long)(st ? st->groups_emitted : 0),
+                        (unsigned long long)(st ? st->groups_failed : 0),
+                        (unsigned long long)(st ? st->window_overflow : 0),
+                        (unsigned long long)(st ? st->pending_recovered_groups : 0),
+                        (unsigned long long)(st ? st->skipped_groups : 0),
+                        (unsigned long long)(st ? st->dropped_groups : 0),
+                        (unsigned long long)(st ? st->late_datagrams : 0),
+                        (unsigned long long)(st ? st->seen_datagrams : 0));
                 result = -1;
                 continue;
             }
@@ -1205,7 +1228,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     "seen_datagrams=%llu "
                     "duplicates=%llu late=%llu malformed=%llu recovered_groups=%llu "
                     "dropped_groups=%llu missing_data_shards=%llu decoded_blocks=%llu "
-                    "decode_mark=%s\n",
+                    "groups_received=%llu groups_recovered=%llu groups_emitted=%llu "
+                    "groups_failed=%llu window_overflow=%llu pending_recovered_groups=%llu "
+                    "skipped_groups=%llu decode_mark=%s\n",
                     flow->flow_id, flow->output_path,
                     (unsigned long long)st->output_bytes,
                     (unsigned long long)st->received_datagrams,
@@ -1217,6 +1242,13 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     (unsigned long long)st->dropped_groups,
                     (unsigned long long)st->missing_data_shards,
                     (unsigned long long)st->decoded_blocks,
+                    (unsigned long long)st->groups_received,
+                    (unsigned long long)st->groups_recovered,
+                    (unsigned long long)st->groups_emitted,
+                    (unsigned long long)st->groups_failed,
+                    (unsigned long long)st->window_overflow,
+                    (unsigned long long)st->pending_recovered_groups,
+                    (unsigned long long)st->skipped_groups,
                     flow->decode_mark_written ? "yes" : "no");
             wire_flow_decoder_print_latency(flow->dec);
         }

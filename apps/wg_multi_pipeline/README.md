@@ -61,13 +61,16 @@ simulated loss, recovery, and decoded output):
 make fec-trace
 ```
 
-**Systematic FEC best-effort wire receive:** use this only for live media. After the
-end marker and `--idle-sec` timeout, unrecoverable groups output their received
-data shards in order and skip missing data shards; parity is not output.
+**Systematic FEC best-effort wire receive:** use this only for live media, not
+hash-verified transfers. After END, missing or unrecoverable groups are skipped
+(`skipped_groups`) so later recovered groups are still written in order.
+Unrecoverable systematic groups also output whatever data shards arrived and
+omit missing data shards (`missing_data_shards`); parity is not output. The
+file will not match the source sha256.
 
 ```bash
 ./build/wg_multi_pipeline --codec xor-fec \
-  --udp-recv 9000 received.ts --idle-sec 1 --best-effort
+  --udp-recv 9000 received.ts --idle-sec 3 --best-effort
 ```
 
 `rs-fec` uses the BSD-licensed native Vandermonde backend provided by

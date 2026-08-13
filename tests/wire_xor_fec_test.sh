@@ -10,20 +10,58 @@ recover_output="$base/wire_xor_recovered.ts"
 partial_output="$base/wire_xor_partial.ts"
 PKG=1400
 VALID=$((PKG * 4))
+ready_timeout_sec=${READY_TIMEOUT_SEC:-5}
+receiver_pid=
 
 cleanup() {
-    [ -n "${receiver_pid:-}" ] && kill "$receiver_pid" 2>/dev/null || true
+    if [ -n "${receiver_pid:-}" ]; then
+        kill "$receiver_pid" 2>/dev/null || true
+        wait "$receiver_pid" 2>/dev/null || true
+        receiver_pid=
+    fi
 }
 trap cleanup EXIT INT TERM
+
+wait_receiver_ready() {
+    log=$1
+    deadline=$(($(date +%s) + ready_timeout_sec))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ -f "$log" ] && grep -q 'udp-recv: listening on UDP port' "$log" 2>/dev/null; then
+            return 0
+        fi
+        if [ -n "${receiver_pid:-}" ] && ! kill -0 "$receiver_pid" 2>/dev/null; then
+            echo "error: receiver exited before ready (log=$log)" >&2
+            [ -f "$log" ] && cat "$log" >&2
+            cleanup
+            return 1
+        fi
+        sleep 0.05
+    done
+    echo "error: timed out after ${ready_timeout_sec}s waiting for receiver ready (log=$log)" >&2
+    [ -f "$log" ] && cat "$log" >&2
+    cleanup
+    return 1
+}
 
 start_receiver() {
     port=$1
     output=$2
+    rlog="$output.log"
 
+    # Truncate this case's output/log so ready wait never matches a prior run.
+    : >"$output"
+    : >"$rlog"
+
+    # idle-sec=3: ready-log wait already guarantees bind; 3s only avoids false
+    # idle timeouts under test scheduling / sender startup. Does not change
+    # XOR/FEC, best-effort, or assert_output success criteria.
     "$bin" --codec xor-fec --udp-recv "$port" "$output" \
-        --idle-sec 1 --best-effort >"$output.log" 2>&1 &
+        --idle-sec 3 --best-effort >"$rlog" 2>&1 &
     receiver_pid=$!
-    sleep 1
+
+    wait_receiver_ready "$rlog" || return 1
+    # Brief post-ready buffer only; not the sync mechanism.
+    sleep 0.05
 }
 
 send_group() {
