@@ -10,6 +10,8 @@
 #include <inttypes.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -612,10 +614,33 @@ static int wire_udp_file_output(uint32_t flow_id, const uint8_t *data, size_t le
 }
 
 #define WIRE_MAX_FLOWS MF_MAX_FLOWS
+#define WIRE_DECODE_QUEUE_CAP 2048u
+#define WIRE_RECV_POLL_MS     100
+
+typedef struct WireDecodeJob {
+    WireHeader header;
+    uint16_t   payload_len;
+    uint8_t    payload[PKG_SIZE];
+} WireDecodeJob;
+
+typedef struct WireDecodeQueue {
+    WireDecodeJob   *slots;
+    size_t           cap;
+    size_t           head;
+    size_t           tail;
+    size_t           count;
+    int              recv_done;
+    pthread_mutex_t  mtx;
+    pthread_cond_t   not_empty;
+    pthread_cond_t   not_full;
+} WireDecodeQueue;
 
 /*
  * Wire UDP receive demux key is WireHeader.flow_id only (full uint32_t).
  * Peer sockaddr is stored for output naming / logs and never used for lookup.
+ *
+ * Recv thread: parse + enqueue. One decode worker per flow (recover/emit/write),
+ * matching per-flow encode+send threads on the TX path.
  */
 typedef struct WireFlowCtx {
     bool              active;
@@ -633,7 +658,175 @@ typedef struct WireFlowCtx {
     uint16_t          expected_shards;
     size_t            input_size;
     int               best_effort;
+    int               queue_inited;
+    int               worker_started;
+    pthread_t         worker;
+    WireDecodeQueue   q;
+    atomic_int        decode_complete;
+    atomic_int        worker_failed;
 } WireFlowCtx;
+
+static void wire_flow_queue_destroy(WireFlowCtx *flow)
+{
+    if (flow == NULL || !flow->queue_inited) {
+        return;
+    }
+    pthread_cond_destroy(&flow->q.not_full);
+    pthread_cond_destroy(&flow->q.not_empty);
+    pthread_mutex_destroy(&flow->q.mtx);
+    free(flow->q.slots);
+    flow->q.slots = NULL;
+    flow->queue_inited = 0;
+}
+
+static int wire_flow_queue_init(WireFlowCtx *flow)
+{
+    if (flow == NULL) {
+        return -1;
+    }
+    memset(&flow->q, 0, sizeof(flow->q));
+    flow->q.cap = WIRE_DECODE_QUEUE_CAP;
+    flow->q.slots = calloc(flow->q.cap, sizeof(*flow->q.slots));
+    if (flow->q.slots == NULL) {
+        return -1;
+    }
+    if (pthread_mutex_init(&flow->q.mtx, NULL) != 0) {
+        free(flow->q.slots);
+        flow->q.slots = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&flow->q.not_empty, NULL) != 0) {
+        pthread_mutex_destroy(&flow->q.mtx);
+        free(flow->q.slots);
+        flow->q.slots = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&flow->q.not_full, NULL) != 0) {
+        pthread_cond_destroy(&flow->q.not_empty);
+        pthread_mutex_destroy(&flow->q.mtx);
+        free(flow->q.slots);
+        flow->q.slots = NULL;
+        return -1;
+    }
+    flow->queue_inited = 1;
+    return 0;
+}
+
+static void *wire_flow_decode_thread(void *arg)
+{
+    WireFlowCtx *flow = arg;
+
+    if (flow == NULL) {
+        return NULL;
+    }
+
+    for (;;) {
+        WireDecodeJob job;
+
+        pthread_mutex_lock(&flow->q.mtx);
+        while (flow->q.count == 0 && !flow->q.recv_done) {
+            pthread_cond_wait(&flow->q.not_empty, &flow->q.mtx);
+        }
+        if (flow->q.count == 0 && flow->q.recv_done) {
+            pthread_mutex_unlock(&flow->q.mtx);
+            break;
+        }
+        job = flow->q.slots[flow->q.head];
+        flow->q.head = (flow->q.head + 1u) % flow->q.cap;
+        flow->q.count--;
+        pthread_cond_signal(&flow->q.not_full);
+        pthread_mutex_unlock(&flow->q.mtx);
+
+        if (wire_flow_decoder_ingest(
+                flow->dec, &job.header, job.payload,
+                job.header.type == WIRE_TYPE_DATA ? (size_t)job.payload_len
+                                                  : 0) != 0) {
+            atomic_store(&flow->worker_failed, 1);
+            pthread_mutex_lock(&flow->q.mtx);
+            flow->q.recv_done = 1;
+            pthread_cond_broadcast(&flow->q.not_full);
+            pthread_mutex_unlock(&flow->q.mtx);
+            return NULL;
+        }
+        if (wire_flow_decoder_is_complete(flow->dec)) {
+            atomic_store(&flow->decode_complete, 1);
+        }
+    }
+
+    if (flow->best_effort) {
+        if (wire_flow_decoder_flush_best_effort(flow->dec) != 0) {
+            atomic_store(&flow->worker_failed, 1);
+            return NULL;
+        }
+        if (wire_flow_decoder_is_complete(flow->dec)) {
+            atomic_store(&flow->decode_complete, 1);
+        }
+    }
+    return NULL;
+}
+
+static int wire_flow_start_worker(WireFlowCtx *flow)
+{
+    if (flow == NULL || flow->dec == NULL || !flow->queue_inited) {
+        return -1;
+    }
+    if (flow->worker_started) {
+        return 0;
+    }
+    if (pthread_create(&flow->worker, NULL, wire_flow_decode_thread, flow) !=
+        0) {
+        return -1;
+    }
+    flow->worker_started = 1;
+    return 0;
+}
+
+static void wire_flow_stop_worker(WireFlowCtx *flow)
+{
+    if (flow == NULL || !flow->worker_started) {
+        return;
+    }
+    pthread_mutex_lock(&flow->q.mtx);
+    flow->q.recv_done = 1;
+    pthread_cond_broadcast(&flow->q.not_empty);
+    pthread_cond_broadcast(&flow->q.not_full);
+    pthread_mutex_unlock(&flow->q.mtx);
+    (void)pthread_join(flow->worker, NULL);
+    flow->worker_started = 0;
+}
+
+static int wire_flow_enqueue(WireFlowCtx *flow, const WireHeader *header,
+                             const uint8_t *payload, size_t payload_len)
+{
+    WireDecodeJob *slot;
+
+    if (flow == NULL || header == NULL || !flow->queue_inited) {
+        return -1;
+    }
+    if (payload_len > PKG_SIZE) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&flow->q.mtx);
+    while (flow->q.count == flow->q.cap && !flow->q.recv_done) {
+        pthread_cond_wait(&flow->q.not_full, &flow->q.mtx);
+    }
+    if (flow->q.recv_done || atomic_load(&flow->worker_failed)) {
+        pthread_mutex_unlock(&flow->q.mtx);
+        return -1;
+    }
+    slot = &flow->q.slots[flow->q.tail];
+    slot->header = *header;
+    slot->payload_len = (uint16_t)payload_len;
+    if (payload_len > 0 && payload != NULL) {
+        memcpy(slot->payload, payload, payload_len);
+    }
+    flow->q.tail = (flow->q.tail + 1u) % flow->q.cap;
+    flow->q.count++;
+    pthread_cond_signal(&flow->q.not_empty);
+    pthread_mutex_unlock(&flow->q.mtx);
+    return 0;
+}
 
 static int wire_flow_ensure_decoder(WireFlowCtx *flow)
 {
@@ -643,7 +836,7 @@ static int wire_flow_ensure_decoder(WireFlowCtx *flow)
         return -1;
     }
     if (flow->dec != NULL) {
-        return 0;
+        return wire_flow_start_worker(flow);
     }
     memset(&cfg, 0, sizeof(cfg));
     cfg.flow_id = flow->flow_id;
@@ -654,7 +847,10 @@ static int wire_flow_ensure_decoder(WireFlowCtx *flow)
     cfg.output_fn = wire_udp_file_output;
     cfg.output_ctx = flow->output;
     flow->dec = wire_flow_decoder_create(&cfg);
-    return flow->dec != NULL ? 0 : -1;
+    if (flow->dec == NULL) {
+        return -1;
+    }
+    return wire_flow_start_worker(flow);
 }
 
 /*
@@ -837,6 +1033,8 @@ static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
             flows[index].expected_shards = expected_shards;
             flows[index].input_size = input_size;
             flows[index].best_effort = best_effort;
+            atomic_init(&flows[index].decode_complete, 0);
+            atomic_init(&flows[index].worker_failed, 0);
             if (output_path != NULL) {
                 strncpy(flows[index].output_path, output_path,
                         sizeof(flows[index].output_path) - 1u);
@@ -848,7 +1046,16 @@ static WireFlowCtx *wire_flow_alloc(WireFlowCtx flows[], size_t max_flows,
                     return NULL;
                 }
             }
+            if (wire_flow_queue_init(&flows[index]) != 0) {
+                if (flows[index].output != NULL) {
+                    fclose(flows[index].output);
+                    flows[index].output = NULL;
+                }
+                flows[index].active = false;
+                return NULL;
+            }
             if (wire_flow_ensure_decoder(&flows[index]) != 0) {
+                wire_flow_queue_destroy(&flows[index]);
                 if (flows[index].output != NULL) {
                     fclose(flows[index].output);
                     flows[index].output = NULL;
@@ -867,6 +1074,8 @@ static void wire_flow_close(WireFlowCtx *flow)
     if (flow == NULL || !flow->active) {
         return;
     }
+    wire_flow_stop_worker(flow);
+    wire_flow_queue_destroy(flow);
     wire_flow_decoder_destroy(flow->dec);
     flow->dec = NULL;
     if (flow->output != NULL) {
@@ -886,11 +1095,34 @@ static bool wire_flows_all_complete(const WireFlowCtx flows[], size_t max_flows)
             continue;
         }
         saw_active = true;
-        if (!wire_flow_decoder_is_complete(flows[index].dec)) {
+        if (!atomic_load(&flows[index].decode_complete)) {
             return false;
         }
     }
     return saw_active;
+}
+
+static int wire_flows_any_failed(const WireFlowCtx flows[], size_t max_flows)
+{
+    size_t index;
+
+    for (index = 0; index < max_flows; index++) {
+        if (flows[index].active && atomic_load(&flows[index].worker_failed)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void wire_flows_stop_workers(WireFlowCtx flows[], size_t max_flows)
+{
+    size_t index;
+
+    for (index = 0; index < max_flows; index++) {
+        if (flows[index].active) {
+            wire_flow_stop_worker(&flows[index]);
+        }
+    }
 }
 
 int wire_udp_recv(const WireUdpRecvConfig *config)
@@ -979,16 +1211,21 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             (unsigned)config->local_node_id,
             multi_mode ? ", prefix mode" : "",
             config->decode_mark ? ", decode-mark" : "");
+    fprintf(stderr, "udp-recv: per-flow decode threads (max_flows=%zu)\n",
+            max_flows);
 
     last_receive = monotonic_seconds();
     for (;;) {
         struct pollfd poll_fd = {.fd = sock, .events = POLLIN};
-        int           polled = poll(&poll_fd, 1, 1000);
+        int           polled = poll(&poll_fd, 1, WIRE_RECV_POLL_MS);
 
         if (polled < 0 && errno == EINTR) {
             continue;
         }
         if (polled < 0) {
+            goto cleanup;
+        }
+        if (wire_flows_any_failed(flows, max_flows)) {
             goto cleanup;
         }
         if (polled == 0) {
@@ -1000,34 +1237,26 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
                     break;
                 }
             }
+            if (saw_flow && wire_flows_all_complete(flows, max_flows)) {
+                break;
+            }
             if (saw_flow &&
                 monotonic_seconds() - last_receive >= (double)config->idle_sec) {
                 /*
                  * After idle_sec with no packets, stop even if END was never seen
-                 * (path loss, sender crash). Report incomplete flows below.
+                 * (path loss, sender crash). Workers drain queued shards, then
+                 * best-effort flush. Report incomplete flows below.
                  */
                 if (multi_mode) {
                     fprintf(stderr,
                             "udp-recv: idle for %u s; ending multi-flow receive\n",
                             config->idle_sec);
-                    break;
-                }
-                if (!wire_flow_decoder_end_seen(flows[0].dec)) {
+                } else {
                     fprintf(stderr,
-                            "udp-recv: idle for %u s without END; ending receive\n",
+                            "udp-recv: idle for %u s; ending receive\n",
                             config->idle_sec);
-                    break;
                 }
-                if (wire_flow_decoder_end_seen(flows[0].dec)) {
-                    if (config->best_effort &&
-                        !wire_flow_decoder_is_complete(flows[0].dec)) {
-                        if (wire_flow_decoder_flush_best_effort(flows[0].dec) !=
-                            0) {
-                            goto cleanup;
-                        }
-                    }
-                    break;
-                }
+                break;
             }
             if (!saw_flow &&
                 monotonic_seconds() - last_receive >= (double)config->idle_sec) {
@@ -1145,14 +1374,14 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
             if (wire_flow_ensure_decoder(flow) != 0) {
                 goto cleanup;
             }
-            if (wire_flow_decoder_ingest(
-                    flow->dec, &header, datagram + WIRE_HEADER_SIZE,
+            if (wire_flow_enqueue(
+                    flow, &header, datagram + WIRE_HEADER_SIZE,
                     header.type == WIRE_TYPE_DATA ? (size_t)header.payload_len
                                                   : 0) != 0) {
                 goto cleanup;
             }
 
-            if (!multi_mode && wire_flow_decoder_is_complete(flow->dec)) {
+            if (!multi_mode && atomic_load(&flow->decode_complete)) {
                 break;
             }
             if (multi_mode && wire_flows_all_complete(flows, max_flows)) {
@@ -1161,7 +1390,12 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
         }
     }
 
-    result = 0;
+    wire_flows_stop_workers(flows, max_flows);
+    if (wire_flows_any_failed(flows, max_flows)) {
+        result = -1;
+    } else {
+        result = 0;
+    }
     for (fi = 0; fi < max_flows; fi++) {
         WireFlowCtx *flow = &flows[fi];
         uint64_t     missing_groups = 0;

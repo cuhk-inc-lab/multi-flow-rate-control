@@ -70,5 +70,36 @@ cmp "$input0" "$out0"
 cmp "$input1" "$out1"
 grep -q 'flow 0' "$base/wire_multi_receiver_stress.log"
 grep -q 'flow 1' "$base/wire_multi_receiver_stress.log"
+grep -q 'per-flow decode threads' "$base/wire_multi_receiver_stress.log"
+
+# Two-flow RS: each flow has its own decode worker (same as encode threads).
+rm -f "${prefix}"src_*_flow_*.ts
+dd if=/dev/urandom of="$input0" bs=1M count=2 status=none
+dd if=/dev/urandom of="$input1" bs=1M count=2 status=none
+port=$((port + 1))
+
+"$bin" --codec rs --rs-profile=16+2 --udp-recv "$port" "$prefix" --max-flows 2 \
+    --idle-sec 8 \
+    >"$base/wire_multi_receiver_rs.log" 2>&1 &
+receiver_pid=$!
+sleep 1
+
+"$bin" --codec rs --rs-profile=16+2 --udp-send-multi \
+    --flow "0:127.0.0.1:$port:$input0:20" \
+    --flow "1:127.0.0.1:$port:$input1:20" \
+    >"$base/wire_multi_sender_rs.log" 2>&1
+test $? -eq 0
+
+wait "$receiver_pid"
+receiver_pid=
+
+out0=$(ls "${prefix}"src_*_flow_0.ts 2>/dev/null | head -n 1)
+out1=$(ls "${prefix}"src_*_flow_1.ts 2>/dev/null | head -n 1)
+test -n "$out0" && test -n "$out1"
+cmp "$input0" "$out0"
+cmp "$input1" "$out1"
+grep -q 'per-flow decode threads' "$base/wire_multi_receiver_rs.log"
+grep -q 'flow 0' "$base/wire_multi_receiver_rs.log"
+grep -q 'flow 1' "$base/wire_multi_receiver_rs.log"
 
 echo "wire multi-flow tests passed"
