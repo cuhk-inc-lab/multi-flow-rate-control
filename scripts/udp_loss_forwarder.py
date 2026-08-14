@@ -63,9 +63,11 @@ class Forwarder:
 
         self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         self.rx.bind(self.listen_addr)
 
         self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.tx.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
 
     def stop(self, _signum: int | None = None, _frame=None) -> None:
         self._stop = True

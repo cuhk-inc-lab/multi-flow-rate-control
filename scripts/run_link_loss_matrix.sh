@@ -1,26 +1,34 @@
 #!/usr/bin/env sh
-# Sweep link loss (tc netem) vs codec / RS geometry.
+# Sweep link loss vs codec / RS geometry.
 #
 # Default: Node1 → Node2 only (receiver on Node2 ap0).
-# Loss is applied on Node1 **station0** egress (same N1→N2 hop).  Root netem on
-# Node2 ap0 only affects egress and does not drop inbound traffic from Node1.
 #
-#   LOSS_LIST="0 1 2 5 8" CODECS="none rs" RS_PROFILES="16+2 16+4" \
-#     ./scripts/run_link_loss_matrix.sh build/ffrs_seed.bin
+#   LOSS_MODE=forwarder LOSS_LIST="0 1 2 5" CODECS="rs" RS_PROFILES="16+2" \
+#     BEST_EFFORT=1 ./scripts/run_link_loss_matrix.sh build/ffrs_seed.bin
+#
+# Loss modes:
+#   LOSS_MODE=forwarder (preferred): udp_loss_forwarder on the receiver.
+#     Sender hits RECEIVER_IP:FWD_LISTEN_PORT; forwarder drops i.i.d. datagrams
+#     and delivers survivors to 127.0.0.1:PORT_BASE (wg recv). No tc.
+#   LOSS_MODE=tc: netem on Node1 station0 egress (WiFi). Root netem on Node2
+#     ap0 only affects egress and does not drop inbound traffic from Node1.
 #
 # Four-hop (legacy): TWO_NODE=0 RECEIVER_SSH=fyp1@10.10.10.164 RECEIVER_IP=10.10.34.2 \
 #   TC_DEV=station1 ./scripts/run_link_loss_matrix.sh seed.ts
 #
 # Env:
 #   TWO_NODE=1             Node1→Node2 direct (default)
-#   LOSS_LIST              tc netem loss % on NODE2 TC_DEV
+#   LOSS_MODE              forwarder (default) | tc
+#   LOSS_LIST              loss percent (1 = 1%)
 #   CODECS / RS_PROFILES / RATE
+#   FWD_LISTEN_PORT        forwarder listen (default 9210)
+#   PORT_BASE              wg recv port (default 9200)
 #   TC_LOCAL=1             apply tc on this host (default 1 for TWO_NODE=1)
 #   TC_SSH / TC_DEV        two-node default: station0 on sender (local tc)
 #   FINAL_DST / TTL / LOCAL_NODE_ID   two-node defaults: 2 / 2 / 2
 #   IDLE_SEC               receiver idle (default 60 for loss runs)
 #   BEST_EFFORT=1          receiver --best-effort (skip gaps; hash expected FAIL)
-#   APPLY_TC=1
+#   APPLY_TC=1             only used when LOSS_MODE=tc
 
 set -eu
 
@@ -36,12 +44,16 @@ loss_list=${LOSS_LIST:-"0 1 2 3 5 8 10"}
 codecs=${CODECS:-"none rs"}
 rs_profiles=${RS_PROFILES:-"16+2 16+4"}
 rate=${RATE:-40}
+loss_mode=${LOSS_MODE:-forwarder}
 apply_tc=${APPLY_TC:-1}
 idle_sec=${IDLE_SEC:-60}
 best_effort=${BEST_EFFORT:-0}
+fwd_listen_port=${FWD_LISTEN_PORT:-9210}
+recv_port=${PORT_BASE:-9200}
 ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_root=${RESULT_DIR:-"build/link-loss-$timestamp"}
+fwd_pid=
 
 if [ "$two_node" = "1" ]; then
     receiver_ssh=${RECEIVER_SSH:-fyp1@10.10.10.162}
@@ -53,7 +65,11 @@ if [ "$two_node" = "1" ]; then
     tc_local=${TC_LOCAL:-1}
     tc_ssh=${TC_SSH:-}
     tc_dev=${TC_DEV:-station0}
-    path_label="Node1→Node2 (tc egress dev $tc_dev → recv $receiver_ip ap0)"
+    if [ "$loss_mode" = "forwarder" ]; then
+        path_label="Node1→Node2 (udp_loss_forwarder on recv $receiver_ip:$fwd_listen_port → 127.0.0.1:$recv_port)"
+    else
+        path_label="Node1→Node2 (tc egress dev $tc_dev → recv $receiver_ip ap0)"
+    fi
 else
     receiver_ssh=${RECEIVER_SSH:-fyp1@10.10.10.164}
     receiver_ip=${RECEIVER_IP:-10.10.34.2}
@@ -88,6 +104,9 @@ die() { echo "error: $*" >&2; exit 1; }
 
 apply_netem() {
     loss=$1
+    if [ "$loss_mode" = "forwarder" ]; then
+        return 0
+    fi
     if [ "$apply_tc" != "1" ]; then
         echo "  (APPLY_TC=0, assuming tc already set to ${loss}% on $tc_target)"
         return 0
@@ -100,6 +119,56 @@ apply_netem() {
         || die "tc netem failed on $tc_target"
 }
 
+stop_forwarder() {
+    ssh -n $ssh_opts "$receiver_ssh" \
+        "fuser -k ${fwd_listen_port}/udp >/dev/null 2>&1 || true" || true
+    sleep 0.3
+    fwd_pid=
+}
+
+start_forwarder() {
+    loss=$1
+    local_dir=$2
+    loss_frac=$(awk -v p="$loss" 'BEGIN { printf "%.6f", (p + 0) / 100.0 }')
+    remote_summary="/tmp/udp-fwd-${timestamp}-loss${loss}.json"
+    remote_log="/tmp/udp-fwd-${timestamp}-loss${loss}.log"
+    stop_forwarder
+    # ssh -f returns locally; a plain ssh waits forever because the remote
+    # python keeps the session open even with nohup/setsid.
+    ssh -f -n $ssh_opts "$receiver_ssh" \
+        "cd '$HOME/work/multi-flow-rate-control' && \
+         exec python3 scripts/udp_loss_forwarder.py \
+           --listen-host 0.0.0.0 --listen-port '$fwd_listen_port' \
+           --forward-host 127.0.0.1 --forward-port '$recv_port' \
+           --loss '$loss_frac' --seed 42 \
+           --summary-json '$remote_summary' \
+           > '$remote_log' 2>&1"
+    sleep 0.5
+    if ! ssh -n $ssh_opts "$receiver_ssh" \
+        "ss -ulnp | grep -q ':${fwd_listen_port} '"; then
+        die "failed to start udp_loss_forwarder on $receiver_ssh (port $fwd_listen_port not listening)"
+    fi
+    fwd_pid=$(ssh -n $ssh_opts "$receiver_ssh" \
+        "ss -ulnp | sed -n 's/.*:${fwd_listen_port} .*pid=\\([0-9][0-9]*\\).*/\\1/p' | head -1")
+    echo "  forwarder pid=${fwd_pid:-?} loss=${loss}% ($loss_frac) $receiver_ip:$fwd_listen_port -> 127.0.0.1:$recv_port"
+    fwd_remote_summary=$remote_summary
+    fwd_remote_log=$remote_log
+    fwd_local_dir=$local_dir
+}
+
+fetch_forwarder_summary() {
+    if [ -n "${fwd_local_dir:-}" ] && [ -n "${fwd_remote_summary:-}" ]; then
+        mkdir -p "$fwd_local_dir"
+        scp $ssh_opts "$receiver_ssh:$fwd_remote_summary" \
+            "$fwd_local_dir/forwarder-summary.json" 2>/dev/null || true
+        scp $ssh_opts "$receiver_ssh:$fwd_remote_log" \
+            "$fwd_local_dir/forwarder.log" 2>/dev/null || true
+        if [ -f "$fwd_local_dir/forwarder-summary.json" ]; then
+            echo "  forwarder $(tr '\n' ' ' < "$fwd_local_dir/forwarder-summary.json")"
+        fi
+    fi
+}
+
 summary_csv="$result_root/summary.csv"
 mkdir -p "$result_root"
 echo "loss_pct,codec,rs_profile,rate_mbps,status,flows_pass,wire_shard_loss_pct,block_completion_pct,missing_groups,recovered_groups,groups_failed,window_overflow,pending_recovered_groups,skipped_groups,output_bytes,payload_bytes,byte_completion_pct,e2e_p95_us,n2_avg_mbps,notes" \
@@ -107,10 +176,16 @@ echo "loss_pct,codec,rs_profile,rate_mbps,status,flows_pass,wire_shard_loss_pct,
 
 echo "Link loss matrix: $path_label"
 echo "  receiver=$receiver_ssh ($receiver_ip) final_dst=$final_dst ttl=$ttl local_node_id=$local_node_id"
-echo "  loss_list=$loss_list codecs=$codecs rs_profiles=$rs_profiles rate=$rate idle=${idle_sec}s best_effort=$best_effort"
+echo "  loss_mode=$loss_mode loss_list=$loss_list codecs=$codecs rs_profiles=$rs_profiles rate=$rate idle=${idle_sec}s best_effort=$best_effort"
+if [ "$loss_mode" = "forwarder" ]; then
+    echo "  forwarder $receiver_ip:$fwd_listen_port -> 127.0.0.1:$recv_port (no tc)"
+    sudo -n tc qdisc del dev "$tc_dev" root 2>/dev/null || true
+fi
+
+trap 'stop_forwarder' EXIT INT TERM
 
 for loss in $loss_list; do
-    echo "=== link loss ${loss}% (tc on $tc_target) ==="
+    echo "=== link loss ${loss}% ($loss_mode) ==="
     apply_netem "$loss"
 
     for codec in $codecs; do
@@ -130,15 +205,25 @@ for loss in $loss_list; do
                 rs_env="RS_PROFILE=$profile"
             fi
             echo "--- $label @ ${rate}Mbps ---"
+            send_port_env=
+            if [ "$loss_mode" = "forwarder" ]; then
+                mkdir -p "$subdir"
+                start_forwarder "$loss" "$subdir"
+                send_port_env="SEND_PORT=$fwd_listen_port"
+            fi
             # shellcheck disable=SC2086
             env CODECS="$codec" RATES="$rate" FLOWS=1 DURATION_S=15 \
-                MONITOR_RELAYS="$monitor_relays" IDLE_SEC="$idle_sec" PORT_BASE=9200 \
+                MONITOR_RELAYS="$monitor_relays" IDLE_SEC="$idle_sec" PORT_BASE="$recv_port" \
                 FINAL_DST="$final_dst" TTL="$ttl" LOCAL_NODE_ID="$local_node_id" \
-                BEST_EFFORT="$best_effort" \
+                BEST_EFFORT="$best_effort" $send_port_env \
                 RESULT_DIR="$subdir" $rs_env \
                 "$script_dir/run_wire_multiflow_matrix.sh" \
                 "$receiver_ssh" "$receiver_ip" "$seed" \
                 || true
+            if [ "$loss_mode" = "forwarder" ]; then
+                stop_forwarder
+                fetch_forwarder_summary
+            fi
 
             if [ ! -f "$subdir/results.csv" ]; then
                 echo "$loss,$codec,${profile:-—},$rate,ERR,0,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,no_results" >> "$summary_csv"
