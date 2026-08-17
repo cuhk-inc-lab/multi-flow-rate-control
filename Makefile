@@ -30,7 +30,8 @@ LIB_SRCS = \
 	$(SRC_DIR)/flow_peer_map.c \
 	$(SRC_DIR)/ingress_push.c \
 	$(SRC_DIR)/wire_header.c \
-	$(SRC_DIR)/tx_queue.c
+	$(SRC_DIR)/tx_queue.c \
+	$(SRC_DIR)/fec_transport.c
 
 LIB_OBJS = $(LIB_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o) \
            $(OBJ_DIR)/circular_buffer.o
@@ -256,8 +257,8 @@ $(OBJ_DIR)/circular_buffer.o: $(CB_SRC) | $(OBJ_DIR)
 $(LIB): $(LIB_OBJS) | $(OBJ_DIR)
 	ar rcs $@ $^
 
-$(TEST_BIN): $(TEST_DIR)/run_tests.c $(LIB_OBJS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) $(TEST_DIR)/run_tests.c $(LIB_OBJS) -o $@ $(LDFLAGS)
+$(TEST_BIN): $(TEST_DIR)/run_tests.c $(LIB) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(TEST_DIR)/run_tests.c $(LIB) -o $@ $(LDFLAGS)
 
 $(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -c $< -o $@

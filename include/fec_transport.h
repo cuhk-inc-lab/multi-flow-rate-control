@@ -31,7 +31,8 @@ typedef enum {
     FEC_ERR_DOWNSTREAM = 7,
     FEC_ERR_STALE = 8,
     FEC_ERR_NOT_FEC = 9,
-    FEC_ERR_EXHAUSTED = 10
+    FEC_ERR_EXHAUSTED = 10,
+    FEC_ERR_BUSY = 11
 } FecStatus;
 
 typedef enum {

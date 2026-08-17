@@ -28,6 +28,7 @@ typedef struct RsGeometry {
     size_t k;
     size_t r;
     size_t n;
+    size_t shard_bytes;
 } RsGeometry;
 
 /*
@@ -57,7 +58,9 @@ static unsigned char   rs_gf_mul_table[256][256];
 static int             rs_mul_table_ready;
 static int             rs_matrix_ready;
 static uint64_t        rs_matrix_init_ns;
-static RsGeometry      rs_geo = {.k = 4u, .r = 2u, .n = 6u};
+static RsGeometry      rs_geo = {
+    .k = 4u, .r = 2u, .n = 6u, .shard_bytes = PKG_SIZE
+};
 static RsEncodePlan    rs_encode_plan;
 static RsEncodeImpl    rs_encode_impl = RS_ENCODE_AUTO;
 static RsEncodeImpl    rs_last_encode_impl = RS_ENCODE_GENERAL;
@@ -102,11 +105,11 @@ static unsigned char gf_inv(unsigned char value)
     return (unsigned char)ginv((int)value);
 }
 
-static int params_valid(size_t k, size_t r)
+static int params_valid(size_t k, size_t r, size_t shard_bytes)
 {
     size_t n;
 
-    if (k < 1u || r < 1u) {
+    if (k < 1u || r < 1u || shard_bytes < 1u || shard_bytes > UINT16_MAX) {
         return 0;
     }
     n = k + r;
@@ -114,7 +117,7 @@ static int params_valid(size_t k, size_t r)
     if (n > RS_ABS_MAX_SHARDS) {
         return 0;
     }
-    if (n * PKG_SIZE > CODEC_MAX_ENCODE_BLOCK) {
+    if (n * shard_bytes > CODEC_MAX_ENCODE_BLOCK) {
         return 0;
     }
     return 1;
@@ -292,14 +295,14 @@ static int rs_encode_plan_build(RsEncodePlan *plan, size_t k, size_t r)
     uint8_t *table = NULL;
 
     rs_encode_plan_clear(plan);
-    if (!params_valid(k, r) || !rs_mul_table_ready) {
+    if (!params_valid(k, r, rs_geo.shard_bytes) || !rs_mul_table_ready) {
         return -1;
     }
 
     plan->k = k;
     plan->r = r;
     plan->n = n;
-    plan->shard_bytes = PKG_SIZE;
+    plan->shard_bytes = rs_geo.shard_bytes;
     memcpy(plan->coeff, rs_generator, sizeof(plan->coeff));
 
     if (rs_encode_mul_table_bytes(k, r, &table_bytes) != 0) {
@@ -344,6 +347,7 @@ static void rs_init(void)
     rs_geo.k = 4u;
     rs_geo.r = 2u;
     rs_geo.n = 6u;
+    rs_geo.shard_bytes = PKG_SIZE;
     rs_matrix_ready = 0;
     rs_encode_plan_clear(&rs_encode_plan);
     if (rebuild_generator() == 0 &&
@@ -465,12 +469,16 @@ void RsCodec_get_encode_plan_geometry(size_t *k, size_t *r, size_t *n,
     }
 }
 
-int RsCodec_set_params(size_t data_shards, size_t parity_shards)
+int RsCodec_set_params_ex(size_t data_shards, size_t parity_shards,
+                          size_t shard_bytes)
 {
     RsEncodePlan new_plan;
     int ok;
 
-    if (!params_valid(data_shards, parity_shards) || !rs_ready()) {
+    if (shard_bytes == 0u) {
+        shard_bytes = PKG_SIZE;
+    }
+    if (!params_valid(data_shards, parity_shards, shard_bytes) || !rs_ready()) {
         return -1;
     }
 
@@ -478,6 +486,7 @@ int RsCodec_set_params(size_t data_shards, size_t parity_shards)
 
     pthread_mutex_lock(&rs_lock);
     if (rs_geo.k == data_shards && rs_geo.r == parity_shards &&
+        rs_geo.shard_bytes == shard_bytes &&
         rs_matrix_ready && rs_encode_plan.initialized) {
         pthread_mutex_unlock(&rs_lock);
         return 0;
@@ -486,6 +495,7 @@ int RsCodec_set_params(size_t data_shards, size_t parity_shards)
     rs_geo.k = data_shards;
     rs_geo.r = parity_shards;
     rs_geo.n = data_shards + parity_shards;
+    rs_geo.shard_bytes = shard_bytes;
     ok = rebuild_generator() == 0 &&
          rs_encode_plan_build(&new_plan, data_shards, parity_shards) == 0;
     if (!ok) {
@@ -503,6 +513,11 @@ int RsCodec_set_params(size_t data_shards, size_t parity_shards)
     rs_matrix_ready = 1;
     pthread_mutex_unlock(&rs_lock);
     return 0;
+}
+
+int RsCodec_set_params(size_t data_shards, size_t parity_shards)
+{
+    return RsCodec_set_params_ex(data_shards, parity_shards, PKG_SIZE);
 }
 
 void RsCodec_get_params(size_t *data_shards, size_t *parity_shards)
@@ -548,7 +563,8 @@ int RsCodec_params_is_wire_shard_count(uint16_t shard_count)
     if (shard_count <= rs_geo.k) {
         return 0;
     }
-    return params_valid(rs_geo.k, (size_t)shard_count - rs_geo.k);
+    return params_valid(rs_geo.k, (size_t)shard_count - rs_geo.k,
+                        rs_geo.shard_bytes);
 }
 
 int RsCodec_set_params_from_shard_count(uint16_t shard_count)
@@ -745,7 +761,8 @@ static void rs_encode(const Codec *self, unsigned char *data, size_t len)
 
     use_legacy = (rs_encode_impl == RS_ENCODE_LEGACY);
     /* Explicit reference only — AUTO default 4+2 uses unlocked general table. */
-    use_rscode_4_2 = (rs_encode_impl == RS_ENCODE_RSCODE) && (k == 4u && r == 2u);
+    use_rscode_4_2 = (rs_encode_impl == RS_ENCODE_RSCODE) &&
+                     (k == 4u && r == 2u && plan->shard_bytes == PKG_SIZE);
     use_fast = !use_legacy && !use_rscode_4_2 &&
                rs_geometry_is_fast_16_2(k, r, len) &&
                (rs_encode_impl == RS_ENCODE_AUTO ||
@@ -803,7 +820,7 @@ static void rs_encode(const Codec *self, unsigned char *data, size_t len)
 static void rs_decode(const Codec *self, unsigned char *data, size_t len)
 {
     (void)self;
-    if (data == NULL || len != rs_geo.n * PKG_SIZE) {
+    if (data == NULL || len != rs_geo.n * rs_geo.shard_bytes) {
         return;
     }
 }
@@ -812,14 +829,14 @@ static size_t rs_input_block_size(const Codec *self)
 {
     (void)self;
     (void)rs_ready();
-    return rs_geo.k * PKG_SIZE;
+    return rs_geo.k * rs_geo.shard_bytes;
 }
 
 static size_t rs_output_block_size(const Codec *self)
 {
     (void)self;
     (void)rs_ready();
-    return rs_geo.n * PKG_SIZE;
+    return rs_geo.n * rs_geo.shard_bytes;
 }
 
 static size_t rs_data_shards(const Codec *self)
@@ -926,15 +943,16 @@ static CodecRecoverStatus rs_recover(const Codec *self,
             repair_row[column] = value;
         }
 
-        for (byte = 0; byte < PKG_SIZE; byte++) {
+        for (byte = 0; byte < rs_geo.shard_bytes; byte++) {
             unsigned char value = 0;
 
             for (term = 0; term < rs_geo.k; term++) {
                 value ^= gf_mul(repair_row[term],
-                                shards[(size_t)survivors[term] * PKG_SIZE +
+                                shards[(size_t)survivors[term] *
+                                           rs_geo.shard_bytes +
                                        byte]);
             }
-            shards[shard * PKG_SIZE + byte] = value;
+            shards[shard * rs_geo.shard_bytes + byte] = value;
         }
     }
     return CODEC_RECOVER_OK;

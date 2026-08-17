@@ -6,6 +6,7 @@
 #include "wire_header.h"
 
 #include <arpa/inet.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,6 +89,12 @@ struct FecDecoder {
     FecStats stats;
 };
 
+static pthread_mutex_t fec_backend_mu = PTHREAD_MUTEX_INITIALIZER;
+static int fec_backend_users;
+static uint16_t fec_backend_k;
+static uint16_t fec_backend_r;
+static uint16_t fec_backend_shard;
+
 void fec_transport_config_init(FecTransportConfig *config)
 {
     if (config == NULL) {
@@ -129,7 +136,7 @@ static int config_complete(const FecTransportConfig *in,
     if (out->shard_size == 0u) {
         out->shard_size = (uint16_t)PKG_SIZE;
     }
-    if (out->shard_size != (uint16_t)PKG_SIZE) {
+    if (out->shard_size < 32u) {
         return 0;
     }
     valid_span = (uint32_t)out->data_shards * (uint32_t)out->shard_size;
@@ -154,24 +161,51 @@ static int config_complete(const FecTransportConfig *in,
     return 1;
 }
 
+static void unbind_rs(void)
+{
+    pthread_mutex_lock(&fec_backend_mu);
+    if (fec_backend_users > 0) {
+        fec_backend_users--;
+    }
+    pthread_mutex_unlock(&fec_backend_mu);
+}
+
 static int bind_rs(const FecTransportConfig *config, const Codec **codec)
 {
     size_t data_shards;
     size_t parity_shards;
+    int ok = 0;
 
-    if (RsCodec_set_params(config->data_shards, config->parity_shards) != 0) {
+    pthread_mutex_lock(&fec_backend_mu);
+    if (fec_backend_users > 0 &&
+        (fec_backend_k != config->data_shards ||
+         fec_backend_r != config->parity_shards ||
+         fec_backend_shard != config->shard_size)) {
+        pthread_mutex_unlock(&fec_backend_mu);
+        return 0;
+    }
+    if (RsCodec_set_params_ex(config->data_shards, config->parity_shards,
+                              config->shard_size) != 0) {
+        pthread_mutex_unlock(&fec_backend_mu);
         return 0;
     }
     *codec = RsCodec_get();
-    if (*codec == NULL) {
-        return 0;
+    if (*codec != NULL) {
+        RsCodec_get_params(&data_shards, &parity_shards);
+        ok = data_shards == config->data_shards &&
+             parity_shards == config->parity_shards &&
+             Codec_output_block_size(*codec) ==
+                 (size_t)(config->data_shards + config->parity_shards) *
+                 (size_t)config->shard_size;
     }
-    RsCodec_get_params(&data_shards, &parity_shards);
-    return data_shards == config->data_shards &&
-           parity_shards == config->parity_shards &&
-           Codec_output_block_size(*codec) ==
-               (size_t)(config->data_shards + config->parity_shards) *
-               (size_t)config->shard_size;
+    if (ok) {
+        fec_backend_k = config->data_shards;
+        fec_backend_r = config->parity_shards;
+        fec_backend_shard = config->shard_size;
+        fec_backend_users++;
+    }
+    pthread_mutex_unlock(&fec_backend_mu);
+    return ok;
 }
 
 static FecQueueItem *queue_slot(FecEncoder *encoder, size_t index)
@@ -378,6 +412,7 @@ FecEncoder *fec_encoder_create(const FecTransportConfig *config,
     stride = align8(offsetof(FecQueueItem, datagram) + max_datagram);
     encoder = calloc(1, sizeof(*encoder));
     if (encoder == NULL) {
+        unbind_rs();
         return NULL;
     }
     encoder->config = resolved;
@@ -412,6 +447,7 @@ void fec_encoder_destroy(FecEncoder *encoder)
     free(encoder->block);
     free(encoder->q_storage);
     free(encoder);
+    unbind_rs();
 }
 
 FecStatus fec_encoder_reset(FecEncoder *encoder, uint32_t epoch)
@@ -439,17 +475,49 @@ FecStatus fec_encoder_reset(FecEncoder *encoder, uint32_t epoch)
 
 int fec_encoder_has_pending(const FecEncoder *encoder)
 {
-    return encoder != NULL && encoder->data_count != 0;
+    return encoder != NULL &&
+           (encoder->data_count != 0 || encoder->q_count != 0);
+}
+
+static uint64_t bytes_to_ns(uint64_t bytes, uint64_t rate_bps)
+{
+    if (rate_bps == 0u || bytes == 0u) {
+        return 0;
+    }
+    return (bytes * 8ull * 1000000000ull + rate_bps - 1ull) / rate_bps;
 }
 
 uint64_t fec_encoder_next_update_ns(const FecEncoder *encoder)
 {
-    if (encoder == NULL || !encoder->pending_since_valid ||
-        encoder->data_count == 0 ||
-        encoder->config.flush_timeout_ns == 0u) {
+    uint64_t flush_at = 0;
+    uint64_t pace_at = 0;
+
+    if (encoder == NULL) {
         return 0;
     }
-    return encoder->pending_since_ns + encoder->config.flush_timeout_ns;
+    if (encoder->pending_since_valid && encoder->data_count != 0 &&
+        encoder->config.flush_timeout_ns != 0u) {
+        flush_at = encoder->pending_since_ns + encoder->config.flush_timeout_ns;
+    }
+    if (encoder->q_count > 0u && encoder->config.wire_rate_bps != 0u &&
+        encoder->last_refill_valid) {
+        const FecQueueItem *item =
+            (const FecQueueItem *)(encoder->q_storage +
+                                   encoder->q_head * encoder->q_stride);
+
+        if (encoder->tokens < item->len) {
+            pace_at = encoder->last_refill_ns +
+                      bytes_to_ns(item->len - encoder->tokens,
+                                  encoder->config.wire_rate_bps);
+        }
+    }
+    if (flush_at == 0u) {
+        return pace_at;
+    }
+    if (pace_at == 0u) {
+        return flush_at;
+    }
+    return flush_at < pace_at ? flush_at : pace_at;
 }
 
 FecStatus fec_encoder_flush(FecEncoder *encoder)
@@ -935,7 +1003,7 @@ static FecStatus recover_group(FecDecoder *decoder, FecDecodeGroup *group)
 }
 
 static FecDecodeGroup *find_group(FecDecoder *decoder, uint64_t group_id,
-                                  int *stale)
+                                  int *stale, FecStatus *err)
 {
     size_t index;
     FecDecodeGroup *oldest = NULL;
@@ -943,6 +1011,7 @@ static FecDecodeGroup *find_group(FecDecoder *decoder, uint64_t group_id,
     FecDecodeGroup *completed = NULL;
 
     *stale = 0;
+    *err = FEC_OK;
     for (index = 0; index < decoder->group_window; index++) {
         FecDecodeGroup *group = &decoder->groups[index];
 
@@ -988,8 +1057,17 @@ static FecDecodeGroup *find_group(FecDecoder *decoder, uint64_t group_id,
         return NULL;
     }
     if (oldest != NULL) {
+        FecStatus emit_status = emit_available(decoder, oldest);
+
+        if (emit_status != FEC_OK) {
+            *err = emit_status;
+            return NULL;
+        }
+        if (oldest->emit_blocked) {
+            *err = FEC_ERR_QUEUE_FULL;
+            return NULL;
+        }
         decoder->stats.evicted_groups++;
-        emit_available(decoder, oldest);
         record_group_loss(decoder, oldest, 1);
         group_clear(oldest, decoder->n, decoder->shard_size,
                     decoder->message_shards);
@@ -1025,6 +1103,9 @@ static FecStatus release_older_groups(FecDecoder *decoder, uint64_t new_group_id
         status = emit_available(decoder, oldest);
         if (status != FEC_OK) {
             return status;
+        }
+        if (oldest->emit_blocked) {
+            return FEC_OK;
         }
         oldest->released_unrecoverable = 1;
     }
@@ -1073,6 +1154,7 @@ FecDecoder *fec_decoder_create(const FecTransportConfig *config,
     }
     decoder = calloc(1, sizeof(*decoder));
     if (decoder == NULL) {
+        unbind_rs();
         return NULL;
     }
     decoder->config = resolved;
@@ -1118,6 +1200,7 @@ void fec_decoder_destroy(FecDecoder *decoder)
     }
     free(decoder->groups);
     free(decoder);
+    unbind_rs();
 }
 
 FecStatus fec_decoder_reset(FecDecoder *decoder, uint32_t epoch)
@@ -1169,6 +1252,7 @@ FecStatus fec_decoder_input(FecDecoder *decoder,
     uint32_t bit_index;
     int stale = 0;
     FecStatus status;
+    FecStatus find_err = FEC_OK;
 
     if (decoder == NULL || datagram == NULL || length == 0u) {
         return FEC_ERR_INVAL;
@@ -1205,13 +1289,13 @@ FecStatus fec_decoder_input(FecDecoder *decoder,
         decoder->highest_group_id = header.block_id;
         decoder->highest_group_valid = 1;
     }
-    group = find_group(decoder, header.block_id, &stale);
+    group = find_group(decoder, header.block_id, &stale, &find_err);
     if (group == NULL) {
         if (stale) {
             decoder->stats.stale_datagrams++;
             return FEC_ERR_STALE;
         }
-        return FEC_ERR_CODEC;
+        return find_err != FEC_OK ? find_err : FEC_ERR_CODEC;
     }
     if (header.shard_index >= decoder->message_shards) {
         status = apply_tail_hint(decoder, group, &header);
@@ -1322,6 +1406,9 @@ FecStatus fec_decoder_update(FecDecoder *decoder, uint64_t now_ns)
         status = emit_available(decoder, group);
         if (status != FEC_OK) {
             return status;
+        }
+        if (group->emit_blocked) {
+            continue;
         }
         record_group_loss(decoder, group, 1);
         group_clear(group, decoder->n, decoder->shard_size,
