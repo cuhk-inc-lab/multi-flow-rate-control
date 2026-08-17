@@ -64,8 +64,9 @@ make fec-trace
 **Systematic FEC wire receive:** `--udp-recv` defaults to `--best-effort` (live
 media). Missing or unrecoverable groups are skipped
 (`skipped_groups`) so later recovered groups are still written in order:
-mid-stream when a new block cannot enter the reorder window, and after END
-for any remaining holes. Unrecoverable systematic groups also output whatever
+mid-stream when a new block cannot enter the reorder window, after END
+for remaining holes, and when the head has fewer than k shards while a
+later group is already recovered. Unrecoverable systematic groups also output whatever
 data shards arrived and omit missing data shards (`missing_data_shards`);
 parity is not output. The file will not match the source sha256. Use `--strict`
 for hash-verified complete-file transfers.

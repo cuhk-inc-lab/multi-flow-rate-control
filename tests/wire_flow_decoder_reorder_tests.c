@@ -1,8 +1,9 @@
 /*
  * Phase A/C plus best-effort mid-stream make_room: out-of-order receive +
  * per-group recovery + ordered emit, reorder-window counters, skip of
- * unrecoverable heads after END, and skip of stuck heads when a new block
- * cannot enter the window.
+ * unrecoverable heads after END, skip of stuck heads when a new block
+ * cannot enter the window, and best-effort skip of a below-k head when a
+ * later group is already recovered.
  */
 #include "codec.h"
 #include "rs_codec.h"
@@ -565,9 +566,13 @@ static void test_best_effort_skips_missing_head_and_emits_later(void)
 
     EXPECT(ingest_rs_block(dec, 9, 1, enc1, expected, v1, (unsigned)-1) == 0);
     st = wire_flow_decoder_stats(dec);
-    EXPECT(st->decoded_blocks == 0);
-    EXPECT(st->skipped_groups == 0);
-    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
+    EXPECT(st->skipped_groups == 1);
+    EXPECT(st->decoded_blocks == 1);
+    EXPECT(st->dropped_groups == 0);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) == 0);
+    EXPECT(wire_flow_decoder_next_block(dec) == 2);
+    EXPECT(ob.len == sizeof(pt1));
+    EXPECT(memcmp(out, pt1, sizeof(pt1)) == 0);
     EXPECT(!wire_flow_decoder_is_complete(dec));
 
     send_end(dec, 9, 2, expected);
@@ -583,7 +588,7 @@ static void test_best_effort_skips_missing_head_and_emits_later(void)
     wire_flow_decoder_destroy(dec);
 }
 
-static void test_best_effort_in_window_does_not_skip_early(void)
+static void test_best_effort_incomplete_later_does_not_skip_head(void)
 {
     uint16_t expected = 0;
     size_t input_size = 0;
@@ -605,13 +610,14 @@ static void test_best_effort_in_window_does_not_skip_early(void)
     dec = make_dec_mode(11, expected, input_size, &ob, 1);
     EXPECT(dec != NULL);
 
-    EXPECT(ingest_rs_block(dec, 11, 1, enc1, expected, v1, (unsigned)-1) == 0);
+    /* One shard of block 1 is not RECOVERED, so the missing head still waits. */
+    EXPECT(ingest_one_shard(dec, 11, 1, 0, expected, v1, enc1) == 0);
     st = wire_flow_decoder_stats(dec);
     EXPECT(st->skipped_groups == 0);
     EXPECT(st->window_overflow == 0);
     EXPECT(st->decoded_blocks == 0);
     EXPECT(wire_flow_decoder_next_block(dec) == 0);
-    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) == 0);
 
     wire_flow_decoder_destroy(dec);
 }
@@ -644,12 +650,12 @@ static void test_best_effort_make_room_missing_head_accepts_block_w(void)
                            (unsigned)-1) == 0);
     st = wire_flow_decoder_stats(dec);
     EXPECT(st->window_overflow == 0);
-    EXPECT(st->skipped_groups >= 1);
+    EXPECT(st->skipped_groups >= block_w);
     EXPECT(st->groups_received >= 1);
-    EXPECT(st->decoded_blocks == 0);
+    EXPECT(st->decoded_blocks == 1);
     EXPECT(st->dropped_groups == 0);
-    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
-    EXPECT(wire_flow_decoder_next_block(dec) == 1);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) == 0);
+    EXPECT(wire_flow_decoder_next_block(dec) == block_w + 1);
 
     send_end(dec, 12, block_w + 1, expected);
     EXPECT(st->window_overflow == 0);
@@ -699,12 +705,12 @@ static void test_best_effort_make_room_failed_head_accepts_block_w(void)
                            (unsigned)-1) == 0);
 
     EXPECT(st->window_overflow == 0);
-    EXPECT(st->skipped_groups >= 1);
+    EXPECT(st->skipped_groups >= block_w);
     EXPECT(st->groups_failed >= 1);
-    EXPECT(st->decoded_blocks == 0);
+    EXPECT(st->decoded_blocks == 1);
     EXPECT(st->dropped_groups == 0);
-    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) >= 1);
-    EXPECT(wire_flow_decoder_next_block(dec) == 1);
+    EXPECT(wire_flow_decoder_pending_recovered_groups(dec) == 0);
+    EXPECT(wire_flow_decoder_next_block(dec) == block_w + 1);
 
     send_end(dec, 13, block_w + 1, expected);
     EXPECT(st->window_overflow == 0);
@@ -747,12 +753,21 @@ static void test_best_effort_skips_failed_head_and_emits_later(void)
     EXPECT(ingest_rs_block_drop_many(dec, 10, 0, enc0, expected, v0, drop, 3) ==
            0);
     EXPECT(ingest_rs_block(dec, 10, 1, enc1, expected, v1, (unsigned)-1) == 0);
-    send_end(dec, 10, 2, expected);
 
     st = wire_flow_decoder_stats(dec);
-    EXPECT(wire_flow_decoder_is_complete(dec));
     EXPECT(st->skipped_groups == 1);
     EXPECT(st->groups_failed >= 1);
+    EXPECT(st->decoded_blocks == 1);
+    EXPECT(st->dropped_groups == 0);
+    EXPECT(wire_flow_decoder_next_block(dec) == 2);
+    EXPECT(ob.len >= sizeof(pt1));
+    EXPECT(memcmp(out + (ob.len - sizeof(pt1)), pt1, sizeof(pt1)) == 0);
+    EXPECT(!wire_flow_decoder_is_complete(dec));
+
+    send_end(dec, 10, 2, expected);
+
+    EXPECT(wire_flow_decoder_is_complete(dec));
+    EXPECT(st->skipped_groups == 1);
     EXPECT(st->decoded_blocks == 1);
     EXPECT(st->dropped_groups == 0);
     EXPECT(wire_flow_decoder_next_block(dec) == 2);
@@ -774,7 +789,7 @@ int main(void)
     test_window_overflow_beyond_reorder_limit();
     test_best_effort_skips_missing_head_and_emits_later();
     test_best_effort_skips_failed_head_and_emits_later();
-    test_best_effort_in_window_does_not_skip_early();
+    test_best_effort_incomplete_later_does_not_skip_head();
     test_best_effort_make_room_missing_head_accepts_block_w();
     test_best_effort_make_room_failed_head_accepts_block_w();
 

@@ -46,11 +46,13 @@ ACTIVE head a last-chance recover and it still cannot recover.
   (`pending_recovered_groups`) and are not written.
 - **Best-effort (CLI default, `--best-effort`):** skip missing or FAILED head after END
   (`skipped_groups++`; not `dropped_groups`). Mid-stream, skip stuck heads
-  only when a new DATA block cannot enter the reorder window (`make_room`).
-  In-window holes still wait until END. Systematic codecs may still write
-  received data shards (`missing_data_shards`). Then emit later RECOVERED
-  groups in order. Hash is expected to FAIL; use skip / byte / block gap, not
-  wire loss.
+  when a new DATA block cannot enter the reorder window (`make_room`). Also
+  skip a missing/FAILED head or an ACTIVE head with fewer than k shards as
+  soon as a later group is already RECOVERED (do not wait for END or a full
+  window). In-window holes with no later RECOVERED group still wait.
+  Systematic codecs may still write received data shards
+  (`missing_data_shards`). Then emit later RECOVERED groups in order. Hash
+  is expected to FAIL; use skip / byte / block gap, not wire loss.
 
 `dropped_groups` remains a compat field. Best-effort holes use `skipped_groups`.
 

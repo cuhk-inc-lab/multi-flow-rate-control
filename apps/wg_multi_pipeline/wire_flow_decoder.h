@@ -26,10 +26,12 @@
  *   - Strict: emit only RECOVERED; missing/FAILED head stalls (hash PASS iff
  *     next_emit_block == end_block_count with no gaps).
  *   - Best-effort: after END, skip missing/FAILED head (skipped_groups).
- *     Mid-stream, skip stuck heads only when a new block cannot enter the
- *     reorder window. Optionally write systematic data shards that arrived,
- *     then emit later RECOVERED groups in order. Hash is expected to FAIL;
- *     use skip/byte gap metrics.
+ *     Mid-stream, skip stuck heads when a new block cannot enter the reorder
+ *     window. Also skip a missing/FAILED head or an ACTIVE head with fewer
+ *     than k shards as soon as a later group is already RECOVERED, so HOL
+ *     does not wait for END or a full window. Optionally write systematic
+ *     data shards that arrived, then emit later RECOVERED groups in order.
+ *     Hash is expected to FAIL; use skip/byte gap metrics.
  */
 
 #include "codec.h"

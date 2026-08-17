@@ -659,6 +659,44 @@ static int make_room_for_block(WireFlowDecoder *dec, uint64_t block_id)
     return 0;
 }
 
+static bool later_recovered_waiting(const WireFlowDecoder *dec)
+{
+    size_t index;
+
+    if (dec == NULL) {
+        return false;
+    }
+    for (index = 0; index < WIRE_FLOW_GROUP_WINDOW; index++) {
+        const WireGroup *group = &dec->groups[index];
+
+        if (group->state == WIRE_GROUP_RECOVERED &&
+            group->block_id > dec->next_emit_block) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Best-effort: a missing head, a FAILED head, or an ACTIVE head with fewer
+ * than k shards cannot recover yet. Skip it only when a later group is
+ * already RECOVERED (HOL stall), not while still waiting on this group.
+ */
+static bool head_below_recover_threshold(const WireFlowDecoder *dec,
+                                         const WireGroup *head)
+{
+    size_t k;
+
+    if (head == NULL || head->state == WIRE_GROUP_FAILED) {
+        return true;
+    }
+    if (head->state != WIRE_GROUP_ACTIVE || dec == NULL || dec->codec == NULL) {
+        return false;
+    }
+    k = Codec_data_shards(dec->codec);
+    return k == 0 || (size_t)group_received_count(head) < k;
+}
+
 static int try_emit_from_head(WireFlowDecoder *dec)
 {
     for (;;) {
@@ -678,6 +716,22 @@ static int try_emit_from_head(WireFlowDecoder *dec)
         }
         if (dec->best_effort && dec->end_seen &&
             (group == NULL || group->state == WIRE_GROUP_FAILED)) {
+            if (skip_unrecoverable_head(dec, group) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (dec->best_effort &&
+            head_below_recover_threshold(dec, group) &&
+            later_recovered_waiting(dec)) {
+            if (group != NULL && group->state == WIRE_GROUP_ACTIVE &&
+                try_recover_group(dec, group, true) == WIRE_RECOVER_OK) {
+                if (write_decoded_group(dec, group) != 0) {
+                    return -1;
+                }
+                dec->next_emit_block++;
+                continue;
+            }
             if (skip_unrecoverable_head(dec, group) != 0) {
                 return -1;
             }
