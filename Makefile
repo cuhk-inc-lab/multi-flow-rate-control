@@ -29,7 +29,8 @@ LIB_SRCS = \
 	$(SRC_DIR)/pipe_io.c \
 	$(SRC_DIR)/flow_peer_map.c \
 	$(SRC_DIR)/ingress_push.c \
-	$(SRC_DIR)/wire_header.c
+	$(SRC_DIR)/wire_header.c \
+	$(SRC_DIR)/tx_queue.c
 
 LIB_OBJS = $(LIB_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o) \
            $(OBJ_DIR)/circular_buffer.o
