@@ -154,7 +154,7 @@ run_recovery() {
 run_strict_failure() {
     output="$base/wire_rs_strict_incomplete.ts"
 
-    start_receiver "$partial_port" "$output"
+    start_receiver "$partial_port" "$output" --strict
     start_drop_proxy 21918 "$partial_port" "1,3,4"
     run_sender 21918
     wait "$proxy_pid"

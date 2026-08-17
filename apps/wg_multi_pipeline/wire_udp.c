@@ -1206,10 +1206,11 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
 
     fprintf(stderr,
             "udp-recv: listening on UDP port %u (max_flows=%zu local_node_id=%u"
-            ", demux=wire_flow_id%s%s)\n",
+            ", demux=wire_flow_id%s%s%s)\n",
             (unsigned)config->port, max_flows,
             (unsigned)config->local_node_id,
             multi_mode ? ", prefix mode" : "",
+            config->best_effort ? ", best-effort" : ", strict",
             config->decode_mark ? ", decode-mark" : "");
     fprintf(stderr, "udp-recv: per-flow decode threads (max_flows=%zu)\n",
             max_flows);

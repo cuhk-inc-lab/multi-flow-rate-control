@@ -696,7 +696,7 @@ decode_mark_opt=
 if [ "$decode_mark" = "1" ]; then
     decode_mark_opt="--decode-mark"
 fi
-best_effort_opt=
+best_effort_opt="--strict"
 if [ "$best_effort" = "1" ]; then
     best_effort_opt="--best-effort"
 fi

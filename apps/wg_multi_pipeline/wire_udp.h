@@ -24,6 +24,7 @@ typedef struct WireUdpRecvConfig {
     const char *output_path;
     CodecKind   codec_kind;
     unsigned    idle_sec;
+    /* 1 = skip unrecoverable groups (CLI default). 0 = --strict. */
     int         best_effort;
     uint32_t    max_flows;
     /* Demo/teaching: after Codec_decode path, append a text mark into the output. */

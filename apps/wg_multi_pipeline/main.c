@@ -289,7 +289,7 @@ static void print_usage(const char *prog)
             "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
             "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
             "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort|--strict] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Wire v3: header carries final_dst + ttl (defaults final-dst=4, ttl=8).\n"
@@ -310,6 +310,8 @@ static void print_usage(const char *prog)
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
             "\n"
             "Wire UDP modes use group/shard headers and support cross-host transfer.\n"
+            "--udp-recv defaults to --best-effort (skip unrecoverable groups).\n"
+            "Use --strict for hash/cmp-complete transfers. Non-systematic codecs stay strict.\n"
             "Verify output: cmp <input.ts> <output.ts>\n",
             prog, prog, prog, prog, prog, prog, prog);
 }
@@ -743,7 +745,7 @@ int main(int argc, char **argv)
         WireUdpRecvConfig cfg;
         unsigned idle_sec = 3u;
         unsigned max_flows = 0u;
-        int best_effort = 0;
+        int best_effort = 1;
         int decode_mark = 0;
         char *end = NULL;
         long port;
@@ -801,6 +803,9 @@ int main(int argc, char **argv)
                 argi += 2;
             } else if (strcmp(argv[argi], "--best-effort") == 0) {
                 cfg.best_effort = 1;
+                argi++;
+            } else if (strcmp(argv[argi], "--strict") == 0) {
+                cfg.best_effort = 0;
                 argi++;
             } else if (strcmp(argv[argi], "--decode-mark") == 0) {
                 cfg.decode_mark = 1;
@@ -874,6 +879,15 @@ int main(int argc, char **argv)
             } else {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
+            }
+        }
+        if (cfg.best_effort) {
+            const Codec *recv_codec = Codec_get(codec_kind);
+
+            if (recv_codec != NULL && !Codec_is_systematic(recv_codec)) {
+                fprintf(stderr,
+                        "udp-recv: best-effort needs a systematic codec; using strict\n");
+                cfg.best_effort = 0;
             }
         }
         return wire_udp_recv(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

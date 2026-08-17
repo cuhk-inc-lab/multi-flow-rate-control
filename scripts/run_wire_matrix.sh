@@ -210,7 +210,7 @@ for codec in $codecs; do
         echo "=== $label: UDP port $port ==="
         # shellcheck disable=SC2086
         ssh $ssh_opts "$receiver_ssh" \
-            "cd '$remote_repo' && exec ./build/wg_multi_pipeline --codec '$codec' --udp-recv '$port' '$remote_output' --idle-sec '$idle_sec' $decode_mark_opt" \
+            "cd '$remote_repo' && exec ./build/wg_multi_pipeline --codec '$codec' --udp-recv '$port' '$remote_output' --idle-sec '$idle_sec' --strict $decode_mark_opt" \
             > "$receiver_log" 2>&1 &
         receiver_pid=$!
         sleep 1

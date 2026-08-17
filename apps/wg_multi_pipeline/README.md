@@ -61,17 +61,20 @@ simulated loss, recovery, and decoded output):
 make fec-trace
 ```
 
-**Systematic FEC best-effort wire receive:** use this only for live media, not
-hash-verified transfers. Missing or unrecoverable groups are skipped
+**Systematic FEC wire receive:** `--udp-recv` defaults to `--best-effort` (live
+media). Missing or unrecoverable groups are skipped
 (`skipped_groups`) so later recovered groups are still written in order:
 mid-stream when a new block cannot enter the reorder window, and after END
 for any remaining holes. Unrecoverable systematic groups also output whatever
 data shards arrived and omit missing data shards (`missing_data_shards`);
-parity is not output. The file will not match the source sha256.
+parity is not output. The file will not match the source sha256. Use `--strict`
+for hash-verified complete-file transfers.
 
 ```bash
 ./build/wg_multi_pipeline --codec xor-fec \
-  --udp-recv 9000 received.ts --idle-sec 3 --best-effort
+  --udp-recv 9000 received.ts --idle-sec 3
+# equivalent: add --best-effort (now the default)
+# hash-complete: add --strict
 ```
 
 `rs-fec` uses the BSD-licensed native Vandermonde backend provided by

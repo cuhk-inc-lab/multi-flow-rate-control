@@ -40,11 +40,11 @@ ACTIVE head a last-chance recover and it still cannot recover.
 
 ### Emit
 
-- **Strict (default):** only emit when head is RECOVERED. Missing or FAILED
+- **Strict (`--strict`):** only emit when head is RECOVERED. Missing or FAILED
   head stalls. Hash PASS requires every group emitted in order
   (`next_emit_block == end_block_count`). Later recovered groups wait in RAM
   (`pending_recovered_groups`) and are not written.
-- **Best-effort (`--best-effort`):** skip missing or FAILED head after END
+- **Best-effort (CLI default, `--best-effort`):** skip missing or FAILED head after END
   (`skipped_groups++`; not `dropped_groups`). Mid-stream, skip stuck heads
   only when a new DATA block cannot enter the reorder window (`make_room`).
   In-window holes still wait until END. Systematic codecs may still write

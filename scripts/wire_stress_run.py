@@ -678,6 +678,7 @@ class Orchestrator:
                     str(len(rg.streams)),
                     "--idle-sec",
                     str(rg.idle_sec),
+                    "--strict",
                     *suffix_args,
                 ]
                 log(
@@ -707,6 +708,7 @@ class Orchestrator:
                     f"--lock-memory "
                     f"--udp-recv {rg.port} {shlex.quote(rg.prefix)} "
                     f"--max-flows {len(rg.streams)} --idle-sec {rg.idle_sec} "
+                    f"--strict "
                     f"{suffix_sh}"
                 )
                 log(
