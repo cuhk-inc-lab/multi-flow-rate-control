@@ -174,8 +174,11 @@ fields keep the previous layout. Defaults: `--final-dst 4`, `--ttl 8`,
 receiver `--local-node-id 4`.
 
 For application-layer hops VM1→VM2→VM3→VM4, send to the **next hop** UDP
-address while setting `final_dst` to the final node. Relays:
-[`../wire_relay/README.md`](../wire_relay/README.md).
+address while setting `final_dst` to the final node. Each hop can be one
+`wire_relay` (source encode / opaque forward / sink decode). This app's
+`--udp-send` / `--udp-recv` still work as source or sink.
+Relays: [`../wire_relay/README.md`](../wire_relay/README.md),
+[`../../docs/WIRE_RELAY_PIPELINE.md`](../../docs/WIRE_RELAY_PIPELINE.md).
 
 ## Cross-VM wire multi-flow (single sender/receiver process)
 

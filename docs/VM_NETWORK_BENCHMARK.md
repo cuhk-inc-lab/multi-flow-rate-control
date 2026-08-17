@@ -33,8 +33,8 @@ directories:
 
 ```bash
 cd ~/work/multi-flow-rate-control
-make wg-demo
-make wire-relay    # needed on VM2/VM3 for application-layer hops
+make wg-demo       # optional: still usable as source/sink
+make wire-relay    # per-node encode / forward / decode
 ```
 
 Allow the chosen UDP port in both VM firewalls/security groups.
@@ -77,31 +77,36 @@ On VM1:
 
 ### Application-layer four-hop relay (VM1 → VM2 → VM3 → VM4)
 
-UDP next-hop and header `final_dst` are different:
+UDP next-hop and header `final_dst` are different. Each node can run the
+same `wire_relay` binary:
 
-- VM1 `sendto(VM2)`; header `final_dst=4`
-- VM2/VM3 run `wire_relay` (opaque forward; no decode)
-- VM4 `--udp-recv` with `--local-node-id 4`
+- VM1 `--source`: encode, fill `final_dst=4`, `sendto(VM2)`
+- VM2/VM3: `final_dst != me` → TTL-- and opaque forward (recode hooks reserved)
+- VM4 `--local-decode`: `final_dst == 4` → decode to file
 
 Do **not** rely on kernel `ip_forward` to skip the relay processes.
 
 ```bash
-# VM4
-./build/wg_multi_pipeline --codec copy --local-node-id 4 \
-  --udp-recv 9000 /tmp/out.ts --idle-sec 5
+# VM4 (sink)
+./build/wire_relay --local-node-id 4 --listen 9000 --next-hop 127.0.0.1:9 \
+  --local-decode --codec copy --output /tmp/out.ts --idle-exit-sec 30
 
-# VM3
+# VM3 (forward)
 ./build/wire_relay --local-node-id 3 --listen 9000 --next-hop VM4_IP:9000
 
-# VM2
+# VM2 (forward)
 ./build/wire_relay --local-node-id 2 --listen 9000 --next-hop VM3_IP:9000
 
-# VM1
-./build/wg_multi_pipeline --codec copy --final-dst 4 --ttl 8 \
-  --udp-send VM2_IP 9000 input.ts
+# VM1 (source)
+./build/wire_relay --local-node-id 1 --listen 9000 --next-hop VM2_IP:9000 \
+  --source input.ts --final-dst 4 --ttl 8 --codec copy --rate-mbps 100 \
+  --idle-exit-sec 30
 ```
 
-Details: [`apps/wire_relay/README.md`](../apps/wire_relay/README.md).
+`wg_multi_pipeline --udp-send` / `--udp-recv` remain valid as source/sink if
+you prefer the older CLI. Pipeline design:
+[`docs/WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md). CLI:
+[`apps/wire_relay/README.md`](../apps/wire_relay/README.md).
 
 After the receiver exits, compare SHA-256 hashes or copy the output back to
 VM1 and use `cmp`:

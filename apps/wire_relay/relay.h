@@ -3,6 +3,7 @@
 
 #include "egress_queue.h"
 #include "generation_cache.h"
+#include "local_source.h"
 #include "process.h"
 #include "recode.h"
 #include "relay_deferred.h"
@@ -10,6 +11,23 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * Unified per-node pipeline (wire_relay):
+ *
+ *   UDP in
+ *     → ttl==0? drop
+ *     → final_dst == local_node_id?
+ *           yes → delivery_fn (decode → file/app); no TTL-- / no egress
+ *           no  → TTL--
+ *               → [optional] recode_fn (per-datagram; NULL = opaque)
+ *               → [optional] decode_reencode_fn (Phase 3A reserved; stub OPAQUE)
+ *               → EgressQueue → sendto(next-hop)
+ *
+ *   Local file/FIFO (optional LocalSourceConfig)
+ *     → encode → fill final_dst/ttl → relay_inject_wire_datagram
+ *       → same Destination Check / transit / egress as UDP in
+ */
 
 #ifndef RELAY_MAX_FLOWS
 #define RELAY_MAX_FLOWS 8u
@@ -75,15 +93,28 @@ typedef struct RelayConfig {
     const char         *next_hop_host;
     uint16_t            next_hop_port;
     /*
-     * Optional Phase-1 hook (default NULL = FORWARD_ORIGINAL / opaque).
-     * When set, must still produce a complete wire datagram; TX only sends
-     * those bytes.
+     * Optional per-datagram mid-hop transform after TTL--
+     * (default NULL = opaque forward). When set, must still produce a
+     * complete wire datagram; TX only sends those bytes.
      */
     RelayRecodeFn       recode_fn;
     void               *recode_ctx;
+    /*
+     * Reserved Phase 3A generation-level decode-and-reencode hook
+     * (default NULL = not called). Stub: relay_decode_reencode_stub.
+     * Non-OPAQUE actions are not implemented and fall back to opaque.
+     */
+    RelayDecodeReencodeFn decode_reencode_fn;
+    void                 *decode_reencode_ctx;
     /* See RelayDeliveryFn: runs outside ingress_mu (P0A). */
     RelayDeliveryFn     delivery_fn;
     void               *delivery_ctx;
+    /*
+     * Optional local file/FIFO source. When non-NULL, relay_run starts a
+     * thread that encodes and injects into the same ingress/egress path.
+     * Pointer must remain valid for the duration of relay_run.
+     */
+    const LocalSourceConfig *local_source;
     RelayProcessMode    process_mode; /* default FORWARD */
     RelayProcessFn      process_fn;   /* optional; default continue forward */
     void               *process_ctx;

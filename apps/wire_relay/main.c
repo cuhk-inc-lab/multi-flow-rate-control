@@ -1,4 +1,5 @@
 #include "local_decode.h"
+#include "local_source.h"
 #include "relay.h"
 #include "relay_deferred.h"
 
@@ -18,23 +19,20 @@ static void print_usage(const char *prog)
             "     [--process forward|cache]\n"
             "     [--gen-timeout-ms N] [--max-gens N]\n"
             "     [--max-gens-per-flow N] [--max-cache-bytes N]\n"
-            "     [--local-decode --codec copy|xor-fec|rs-fec|rs\n"
+            "     [--transit-hook identity]   (optional per-datagram recode_fn)\n"
+            "     [--decode-reencode-stub]    (reserve Phase 3A hook; always OPAQUE)\n"
+            "     [--local-decode --codec copy|xor-fec|rs-fec|rs|none\n"
             "         (--output FILE | --output-dir DIR)]\n"
+            "     [--source FILE --final-dst N --ttl N --codec ...\n"
+            "         [--flow-id N] [--rate-mbps N]]\n"
             "     [--test-tx-hold-us N]   (TEST ONLY; default 0)\n"
             "\n"
-            "Explicit-hop opaque UDP relay (wire header v3).\n"
-            "RX -> per-flow deferred packet queue -> processing worker ->\n"
-            "  destination check(final_dst) -> TTL-- ->\n"
-            "  [--process cache: GenerationCache observe] ->\n"
-            "  global EgressQueue -> TX sendto(next-hop).\n"
-            "inject (harness) stays synchronous and does not enter deferred;\n"
-            "mixing inject with UDP RX does not preserve per-flow order.\n"
-            "With --local-decode: final_dst==local_node_id packets decode via\n"
-            "LocalDecodeHub / WireFlowDecoder. Local packets skip TTL--,\n"
-            "GenerationCache, EgressQueue, and next-hop send.\n"
-            "Locality is only wire_header_is_local (never UDP/IP dst).\n"
-            "  --output FILE      L1 single-flow sink\n"
-            "  --output-dir DIR   L2 multi-flow: DIR/flow_<id>.bin\n",
+            "Unified per-node wire v3 pipeline:\n"
+            "  UDP in -> ttl==0 drop -> final_dst==me? decode : TTL-- ->\n"
+            "    [optional transit hooks] -> EgressQueue -> next-hop\n"
+            "  Local file/FIFO (--source) -> encode -> inject -> same path\n"
+            "Phase 3A decode-reencode / 3B network recode are reserved only.\n"
+            "Locality is only wire_header_is_local (never UDP/IP dst).\n",
             prog);
 }
 
@@ -88,6 +86,10 @@ static int parse_codec_kind(const char *text, CodecKind *out)
     if (text == NULL || out == NULL) {
         return -1;
     }
+    if (strcmp(text, "none") == 0) {
+        *out = CODEC_KIND_NONE;
+        return 0;
+    }
     if (strcmp(text, "copy") == 0) {
         *out = CODEC_KIND_COPY;
         return 0;
@@ -112,6 +114,7 @@ int main(int argc, char **argv)
     RelayConfig cfg;
     LocalDecodeHub hub;
     LocalDecodeHubConfig hub_cfg;
+    LocalSourceConfig source_cfg;
     char next_hop_host[256];
     uint8_t local_node_id = 0;
     uint16_t listen_port = 0;
@@ -132,14 +135,23 @@ int main(int argc, char **argv)
     int have_next_hop = 0;
     int local_decode = 0;
     int have_codec = 0;
+    int have_source = 0;
+    int transit_identity = 0;
+    int decode_reencode_stub = 0;
     CodecKind codec_kind = CODEC_KIND_COPY;
     const char *output_path = NULL;
     const char *output_dir = NULL;
+    const char *source_path = NULL;
+    uint8_t source_final_dst = 0;
+    uint8_t source_ttl = 0;
+    uint32_t source_flow_id = 0;
+    double source_rate_mbps = 0.0;
     int hub_inited = 0;
     RelayStatus st;
 
     memset(&cfg, 0, sizeof(cfg));
     memset(&hub, 0, sizeof(hub));
+    memset(&source_cfg, 0, sizeof(source_cfg));
     memset(next_hop_host, 0, sizeof(next_hop_host));
 
     if (argc < 2) {
@@ -237,7 +249,8 @@ int main(int argc, char **argv)
 
             if (argi + 1 >= argc ||
                 parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
-                parsed < 1ul || parsed > (unsigned long)RELAY_MAX_ACTIVE_FLOWS_LIMIT) {
+                parsed < 1ul ||
+                parsed > (unsigned long)RELAY_MAX_ACTIVE_FLOWS_LIMIT) {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
@@ -297,17 +310,6 @@ int main(int argc, char **argv)
             }
             max_cache_bytes = (uint64_t)parsed;
             argi += 2;
-        } else if (strcmp(argv[argi], "--test-tx-hold-us") == 0) {
-            unsigned long parsed;
-
-            if (argi + 1 >= argc ||
-                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
-                parsed > UINT32_MAX) {
-                print_usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            test_tx_hold_us = (uint32_t)parsed;
-            argi += 2;
         } else if (strcmp(argv[argi], "--local-decode") == 0) {
             local_decode = 1;
             argi += 1;
@@ -320,18 +322,95 @@ int main(int argc, char **argv)
             have_codec = 1;
             argi += 2;
         } else if (strcmp(argv[argi], "--output") == 0) {
-            if (argi + 1 >= argc || argv[argi + 1][0] == '\0') {
+            if (argi + 1 >= argc) {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
             output_path = argv[argi + 1];
             argi += 2;
         } else if (strcmp(argv[argi], "--output-dir") == 0) {
-            if (argi + 1 >= argc || argv[argi + 1][0] == '\0') {
+            if (argi + 1 >= argc) {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
             output_dir = argv[argi + 1];
+            argi += 2;
+        } else if (strcmp(argv[argi], "--source") == 0) {
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            source_path = argv[argi + 1];
+            have_source = 1;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--final-dst") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 || parsed == 0 ||
+                parsed > 255ul) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            source_final_dst = (uint8_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--ttl") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 || parsed == 0 ||
+                parsed > 255ul) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            source_ttl = (uint8_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--flow-id") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed > UINT32_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            source_flow_id = (uint32_t)parsed;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--rate-mbps") == 0) {
+            char *end = NULL;
+            double value;
+
+            if (argi + 1 >= argc) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            value = strtod(argv[argi + 1], &end);
+            if (end == argv[argi + 1] || *end != '\0' || value < 0.0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            source_rate_mbps = value;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--transit-hook") == 0) {
+            if (argi + 1 >= argc || strcmp(argv[argi + 1], "identity") != 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            transit_identity = 1;
+            argi += 2;
+        } else if (strcmp(argv[argi], "--decode-reencode-stub") == 0) {
+            decode_reencode_stub = 1;
+            argi += 1;
+        } else if (strcmp(argv[argi], "--test-tx-hold-us") == 0) {
+            unsigned long parsed;
+
+            if (argi + 1 >= argc ||
+                parse_ulong_arg(argv[argi + 1], &parsed) != 0 ||
+                parsed > UINT32_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            test_tx_hold_us = (uint32_t)parsed;
             argi += 2;
         } else {
             print_usage(argv[0]);
@@ -357,10 +436,25 @@ int main(int argc, char **argv)
             print_usage(argv[0]);
             return EXIT_FAILURE;
         }
-    } else if (have_codec || output_path != NULL || output_dir != NULL) {
+    }
+    if (have_source) {
+        if (!have_codec) {
+            fprintf(stderr, "wire-relay: --source requires --codec\n");
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        if (source_final_dst == 0 || source_ttl == 0) {
+            fprintf(stderr,
+                    "wire-relay: --source requires --final-dst and --ttl\n");
+            print_usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (!local_decode && !have_source &&
+        (have_codec || output_path != NULL || output_dir != NULL)) {
         fprintf(stderr,
                 "wire-relay: --codec/--output/--output-dir require "
-                "--local-decode\n");
+                "--local-decode or --source\n");
         return EXIT_FAILURE;
     }
 
@@ -368,9 +462,14 @@ int main(int argc, char **argv)
     cfg.listen_port = listen_port;
     cfg.next_hop_host = next_hop_host;
     cfg.next_hop_port = next_hop_port;
-    cfg.recode_fn = NULL;
+    cfg.recode_fn = transit_identity ? relay_recode_identity : NULL;
+    cfg.recode_ctx = NULL;
+    cfg.decode_reencode_fn =
+        decode_reencode_stub ? relay_decode_reencode_stub : NULL;
+    cfg.decode_reencode_ctx = NULL;
     cfg.delivery_fn = NULL;
     cfg.delivery_ctx = NULL;
+    cfg.local_source = NULL;
     cfg.process_mode = process_mode;
     cfg.process_fn = NULL;
     cfg.idle_exit_sec = idle_exit_sec;
@@ -407,6 +506,29 @@ int main(int argc, char **argv)
         cfg.delivery_ctx = &hub;
         /* Allow LOCAL_ENCODER inject when final_dst==local for sink decode. */
         cfg.reject_local_encoder_loopback = 0;
+    }
+
+    if (have_source) {
+        source_cfg.input_path = source_path;
+        source_cfg.codec_kind = codec_kind;
+        source_cfg.flow_id = source_flow_id;
+        source_cfg.final_dst = source_final_dst;
+        source_cfg.ttl = source_ttl;
+        source_cfg.source_rate_mbps = source_rate_mbps;
+        cfg.local_source = &source_cfg;
+        if (source_final_dst == local_node_id) {
+            /* Source targeting self must be able to local-deliver. */
+            cfg.reject_local_encoder_loopback = 0;
+            if (!local_decode) {
+                fprintf(stderr,
+                        "wire-relay: --source with final_dst==local_node_id "
+                        "requires --local-decode\n");
+                if (hub_inited) {
+                    local_decode_hub_destroy(&hub);
+                }
+                return EXIT_FAILURE;
+            }
+        }
     }
 
     st = relay_run(&cfg);

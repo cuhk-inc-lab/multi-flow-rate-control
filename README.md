@@ -48,7 +48,8 @@ ingress_push / ingress_push_tuple
   → paced worker → write(output_fd)
 ```
 
-Encode / decode / file harness live in `apps/wg_multi_pipeline/` (demo app).
+Local file encode/decode harness: `apps/wg_multi_pipeline/` (demo).
+Per-node wire hop (encode / forward / decode): `apps/wire_relay/`.
 
 ## Application — `wg_multi_pipeline`
 
@@ -90,6 +91,9 @@ Script catalog (purpose + usage + key env):
 **[docs/SCRIPTS.md](docs/SCRIPTS.md)**.
 RS codec (architecture, API, runtime profiles):
 **[docs/RS_CODEC.md](docs/RS_CODEC.md)**.
+Per-node wire hop:
+**[apps/wire_relay/README.md](apps/wire_relay/README.md)**,
+**[docs/WIRE_RELAY_PIPELINE.md](docs/WIRE_RELAY_PIPELINE.md)**.
 
 ## Common script entry points
 
@@ -113,20 +117,26 @@ make                  # libmulti_flow.a
 make test             # unit tests (run_tests.c)
 make integration-test # multi-file + wire + wire_relay loopback
 make wg-demo          # build wg_multi_pipeline
-make wire-relay       # build apps/wire_relay (opaque UDP hop relay)
+make wire-relay       # build apps/wire_relay (per-node encode/forward/decode)
 make sanitize         # ASan + test + integration-test
 make tsan             # TSan + test + integration-test
 make clean
 ```
 
 Wire UDP uses header **v3** (`include/wire_header.h`): 44-byte header with
-`final_dst` + `ttl` in the former reserved bytes. Application-layer multi-hop:
+`final_dst` + `ttl` in the former reserved bytes. Each node runs one
+`wire_relay`: local file/FIFO encode, destination check, optional decode,
+opaque forward (recode / decode-reencode hooks reserved). Application-layer
+multi-hop:
 
 ```text
-VM1 encode → VM2 wire_relay → VM3 wire_relay → VM4 decode
+VM1 --source  →  VM2 forward  →  VM3 forward  →  VM4 --local-decode
+     encode         (ttl--)          (ttl--)          decode
 ```
 
-See [`apps/wire_relay/README.md`](apps/wire_relay/README.md).
+`wg_multi_pipeline --udp-send` / `--udp-recv` still work as a source/sink.
+See [`apps/wire_relay/README.md`](apps/wire_relay/README.md) and
+[`docs/WIRE_RELAY_PIPELINE.md`](docs/WIRE_RELAY_PIPELINE.md).
 
 ## Library modules
 

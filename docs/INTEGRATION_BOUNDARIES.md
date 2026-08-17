@@ -132,5 +132,8 @@ Block sizes (`stream_config.h`): `PKG_SIZE` 188, `DECODE_BLOCK` 752, `ENCODE_BLO
 | `buffer_transfer.h` | `BufferTransfer_pump` (demo) |
 | `wire_header.h` | `WireHeader`, `wire_header_encode/decode`, `wire_header_is_local` (v3) |
 
-Application-layer hop relay (opaque forward, destination check on `final_dst`):
-`apps/wire_relay/` — see that app's README.
+Application-layer per-node hop (`apps/wire_relay/`): destination check on
+`final_dst` only. Local file/FIFO encode (`--source`), local decode
+(`--local-decode`), opaque forward by default. Recode / decode-reencode
+hooks are reserved (no real transform yet). See that app's README and
+[`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md).

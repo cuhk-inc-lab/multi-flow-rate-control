@@ -43,6 +43,12 @@ struct RelayCtx {
     int                         tx_started;
     pthread_t                   processing_thread;
     int                         processing_started;
+    pthread_t                   source_thread;
+    int                         source_started;
+    volatile sig_atomic_t       source_done;
+    LocalSourceStats            source_stats;
+    int                         source_result;
+    uint64_t                    last_activity_ns;
     int                         listen_sock;
     int                         send_sock;
     struct sockaddr_storage     next_hop;
@@ -460,6 +466,7 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
     slot->rx++;
     ctx->total.rx++;
     now_ns = relay_mono_ns();
+    ctx->last_activity_ns = now_ns;
 
     if (source == RELAY_SRC_LOCAL_ENCODER &&
         wire_header_is_local(&header, ctx->config.local_node_id) &&
@@ -567,6 +574,35 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
          * independent copy when insert succeeded.
          */
         (void)insert_st;
+        /*
+         * Phase 3A reserved hook. Non-OPAQUE is not implemented yet: log once
+         * via stderr and keep opaque forward so behavior stays unchanged.
+         */
+        if (ctx->config.decode_reencode_fn != NULL) {
+            RelayDecodeReencodeAction dra;
+
+            dra = ctx->config.decode_reencode_fn(
+                &header, datagram, out_len, gen, insert_st,
+                NULL, NULL, ctx->config.decode_reencode_ctx);
+            if (dra != RELAY_DECODE_REENCODE_OPAQUE) {
+                static int warned_3a;
+
+                if (!warned_3a) {
+                    fprintf(stderr,
+                            "wire-relay: decode_reencode non-OPAQUE ignored "
+                            "(Phase 3A not implemented); opaque forward\n");
+                    warned_3a = 1;
+                }
+            }
+        }
+    } else if (ctx->config.decode_reencode_fn != NULL) {
+        /*
+         * Hook may still observe packets without cache; gen is NULL.
+         * Stub / future 3A must return OPAQUE until implemented.
+         */
+        (void)ctx->config.decode_reencode_fn(
+            &header, datagram, out_len, NULL, GEN_INSERT_INVALID, NULL, NULL,
+            ctx->config.decode_reencode_ctx);
     }
 
     if (action == RELAY_PROCESS_DROP) {
@@ -871,16 +907,22 @@ static void relay_ctx_cleanup(RelayCtx *ctx)
     /*
      * Shutdown order (Phase 1):
      *  1) stop ingress / RX already exited
-     *  2) deferred hub shutdown + join processing
-     *  3) wait inject_in_flight; destroy generation cache
-     *  4) egress shutdown + join TX
-     *  5) destroy egress
-     *  6) destroy deferred (free residual datagrams once)
-     *  7) destroy mutexes / sockets
+     *  2) join local source (injects fail with SHUTDOWN once stop set)
+     *  3) deferred hub shutdown + join processing
+     *  4) wait inject_in_flight; destroy generation cache
+     *  5) egress shutdown + join TX
+     *  6) destroy egress
+     *  7) destroy deferred (free residual datagrams once)
+     *  8) destroy mutexes / sockets
      */
     pthread_mutex_lock(&ctx->ingress_mu);
     ctx->stop = 1;
     pthread_mutex_unlock(&ctx->ingress_mu);
+
+    if (ctx->source_started) {
+        (void)pthread_join(ctx->source_thread, NULL);
+        ctx->source_started = 0;
+    }
 
     if (ctx->deferred_inited) {
         relay_deferred_hub_shutdown(&ctx->deferred);
@@ -1153,10 +1195,44 @@ void relay_deferred_stats_snapshot(const RelayCtx *ctx,
     relay_deferred_hub_stats_snapshot(&ctx->deferred, out);
 }
 
+static int local_source_emit_inject(const uint8_t *datagram, size_t len,
+                                    void *arg)
+{
+    RelayCtx *ctx = arg;
+    RelayIngressStatus st;
+
+    if (ctx == NULL) {
+        return -1;
+    }
+    st = relay_inject_wire_datagram(ctx, datagram, len);
+    return st == RELAY_INGRESS_OK ? 0 : -1;
+}
+
+static void *local_source_thread_main(void *arg)
+{
+    RelayCtx *ctx = arg;
+    LocalSourceStats stats;
+    int rc;
+
+    memset(&stats, 0, sizeof(stats));
+    rc = local_source_run(ctx->config.local_source, local_source_emit_inject,
+                          ctx, &stats);
+    ctx->source_stats = stats;
+    ctx->source_result = rc;
+    ctx->source_done = 1;
+    fprintf(stderr,
+            "wire-relay local-source: result=%d blocks=%llu source_bytes=%llu "
+            "wire_datagrams=%llu emit_errors=%llu\n",
+            rc, (unsigned long long)stats.blocks,
+            (unsigned long long)stats.source_bytes,
+            (unsigned long long)stats.wire_datagrams,
+            (unsigned long long)stats.emit_errors);
+    return NULL;
+}
+
 RelayStatus relay_run(const RelayConfig *config)
 {
     RelayCtx ctx;
-    uint64_t last_rx_ns;
     RelayStatus status = RELAY_OK;
     unsigned char rxbuf[RELAY_MAX_DATAGRAM];
 
@@ -1165,12 +1241,22 @@ RelayStatus relay_run(const RelayConfig *config)
         config->next_hop_port == 0) {
         return RELAY_ERR;
     }
+    if (config->local_source != NULL) {
+        if (config->local_source->input_path == NULL ||
+            config->local_source->final_dst == 0 ||
+            config->local_source->ttl == 0) {
+            return RELAY_ERR;
+        }
+    }
 
+    memset(&ctx, 0, sizeof(ctx));
     if (relay_ctx_init_common(&ctx, config, 1) != 0) {
         return RELAY_ERR;
     }
 
     ctx.stop = 0;
+    ctx.source_done = 0;
+    ctx.last_activity_ns = relay_mono_ns();
     g_signal_ctx = &ctx;
     signal(SIGINT, relay_on_signal);
     signal(SIGTERM, relay_on_signal);
@@ -1179,7 +1265,8 @@ RelayStatus relay_run(const RelayConfig *config)
             "wire-relay: local_node_id=%u listen=%u next-hop=%s:%u "
             "egress_capacity=%zu egress_wait_ms=%u "
             "deferred_per_flow=%zu deferred_total=%zu max_active_flows=%u "
-            "test_tx_hold_us=%u inline_rx=%d process=%s recode=%s\n",
+            "test_tx_hold_us=%u inline_rx=%d process=%s recode=%s "
+            "decode_reencode=%s local_source=%s\n",
             (unsigned)ctx.config.local_node_id,
             (unsigned)ctx.config.listen_port,
             ctx.config.next_hop_host,
@@ -1192,7 +1279,9 @@ RelayStatus relay_run(const RelayConfig *config)
             (unsigned)ctx.config.test_tx_hold_us,
             RELAY_TEST_INLINE_RX,
             ctx.cache_enabled ? "cache" : "forward",
-            ctx.config.recode_fn != NULL ? "enabled" : "disabled");
+            ctx.config.recode_fn != NULL ? "enabled" : "disabled",
+            ctx.config.decode_reencode_fn != NULL ? "reserved" : "disabled",
+            ctx.config.local_source != NULL ? "enabled" : "disabled");
     if (ctx.config.test_tx_hold_us != 0) {
         fprintf(stderr,
                 "wire-relay: WARNING test-only TX hold enabled (%u us); "
@@ -1200,7 +1289,19 @@ RelayStatus relay_run(const RelayConfig *config)
                 (unsigned)ctx.config.test_tx_hold_us);
     }
 
-    last_rx_ns = relay_mono_ns();
+    if (ctx.config.local_source != NULL) {
+        if (pthread_create(&ctx.source_thread, NULL, local_source_thread_main,
+                           &ctx) != 0) {
+            perror("wire-relay: local source pthread_create");
+            status = RELAY_ERR;
+            ctx.stop = 1;
+            g_signal_ctx = NULL;
+            relay_ctx_cleanup(&ctx);
+            return status;
+        }
+        ctx.source_started = 1;
+    }
+
     while (!ctx.stop) {
         struct pollfd pfd = {.fd = ctx.listen_sock, .events = POLLIN};
         int poll_ms = 1000;
@@ -1232,12 +1333,14 @@ RelayStatus relay_run(const RelayConfig *config)
                 sync_cache_stats_to_total(&ctx);
                 pthread_mutex_unlock(&ctx.ingress_mu);
             }
-            if (ctx.config.idle_exit_sec > 0) {
+            if (ctx.config.idle_exit_sec > 0 &&
+                !(ctx.source_started && !ctx.source_done)) {
                 uint64_t now = relay_mono_ns();
                 uint64_t idle_ns =
                     (uint64_t)ctx.config.idle_exit_sec * 1000000000ull;
 
-                if (now >= last_rx_ns && now - last_rx_ns >= idle_ns) {
+                if (now >= ctx.last_activity_ns &&
+                    now - ctx.last_activity_ns >= idle_ns) {
                     fprintf(stderr,
                             "wire-relay: idle for %u s; exiting\n",
                             ctx.config.idle_exit_sec);
@@ -1259,7 +1362,7 @@ RelayStatus relay_run(const RelayConfig *config)
             status = RELAY_ERR;
             break;
         }
-        last_rx_ns = relay_mono_ns();
+        ctx.last_activity_ns = relay_mono_ns();
 
         owned = malloc((size_t)received);
         if (owned == NULL) {
@@ -1296,6 +1399,13 @@ RelayStatus relay_run(const RelayConfig *config)
 
     ctx.stop = 1;
     g_signal_ctx = NULL;
+    if (ctx.source_started) {
+        (void)pthread_join(ctx.source_thread, NULL);
+        ctx.source_started = 0;
+        if (ctx.source_result != 0) {
+            status = RELAY_ERR;
+        }
+    }
     sync_cache_stats_to_total(&ctx);
     print_stats(&ctx);
     relay_ctx_cleanup(&ctx);

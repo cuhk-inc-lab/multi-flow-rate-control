@@ -5,8 +5,9 @@
 | Command | What it runs |
 |---------|----------------|
 | `make test` | Unit tests in `tests/run_tests.c` (queues, pacing, **5-tuple peer map**, …) |
-| `make integration-test` | Automated multi-file `wg_multi_pipeline` roundtrip (3 flows, `cmp`) + wire loopback/FEC/rs tests |
+| `make integration-test` | Automated multi-file `wg_multi_pipeline` roundtrip (3 flows, `cmp`) + wire loopback/FEC/rs + `wire_relay` tests |
 | `make wg-demo` | Build `build/wg_multi_pipeline` only |
+| `make wire-relay` | Build `build/wire_relay` (per-node encode/forward/decode) |
 | `make rs-recovery-bench` | Matrix RS recover latency (`tests/rs_recovery_bench.c`) |
 | `make sanitize` | ASan + `test` + `integration-test` |
 | `make tsan` | TSan + `test` + `integration-test` |
@@ -118,6 +119,11 @@ segment from the same tuple.
 The **multi-file demo** mocks UDP by assigning a fixed `flow_id` per input path
 (`ingress_push(mgr, flow_id, …)`), so the rest of the pipeline is the same as after
 a successful `ingress_push_tuple` lookup.
+
+**Wire hop (`wire_relay`):** per-node encode / destination check / decode /
+opaque forward. Unit tests: `relay_local_source_tests`, `relay_local_decode_tests`,
+`relay_deferred_tests`, `relay_gen_cache_tests`. Loopback:
+`tests/wire_relay_loopback.sh`. Design: [`docs/WIRE_RELAY_PIPELINE.md`](../docs/WIRE_RELAY_PIPELINE.md).
 
 ---
 

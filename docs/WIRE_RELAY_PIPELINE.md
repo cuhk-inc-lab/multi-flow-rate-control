@@ -1,12 +1,38 @@
 # Wire Relay Pipeline Design
 
-Application-layer explicit-hop relay for wire header **v3**
+Application-layer **per-node** program for wire header **v3**
 (`final_dst` + `ttl`). Binary: `apps/wire_relay/` → `build/wire_relay`.
+Each node runs this one binary: local encode, destination check, optional
+decode, and opaque forward. Mid-hop recode / decode-reencode are reserved.
 
 Wire v3 has **no independent coding vector** — only
 `type` / `shard_index` / `shard_count` / `valid_len` (plus routing fields).
 Generation key is `(flow_id, block_id)`. Do not invent a separate
 `generation_id` field on the wire.
+
+---
+
+## Unified per-node pipeline
+
+Target structure (encode / decode / forward implemented; mid-hop transform reserved):
+
+```text
+UDP in
+  → ttl==0? drop
+  → final_dst == local_node_id?
+        yes → delivery_fn (LocalDecodeHub → file); no TTL-- / egress
+        no  → TTL--
+            → [optional] recode_fn            # per-datagram; NULL = opaque
+            → [optional] decode_reencode_fn   # Phase 3A reserved; stub=OPAQUE
+            → [--process cache] observe
+            → EgressQueue → sendto(next-hop)
+
+Local file / FIFO (--source)
+  → encode → fill final_dst/ttl → relay_inject_wire_datagram
+  → same Destination Check / transit / egress as UDP in
+```
+
+Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
 
 ---
 
@@ -19,7 +45,8 @@ Generation key is `(flow_id, block_id)`. Do not invent a separate
 | **L0** | Extract reusable `WireFlowDecoder` from udp-recv | **Implemented** |
 | **L1** | Explicit-hop relay local-destination decode (`--output FILE`) | **Implemented** |
 | **L2** | Multi-flow local decode (`--output-dir DIR`) | **Implemented** |
-| **3A** | Decode-and-reencode relay (recover source, re-run current FEC encoder) | Future |
+| **S0** | Local file/FIFO source encode → inject (`--source`) | **Implemented** |
+| **3A** | Decode-and-reencode relay (recover source, re-run current FEC encoder) | **Interface reserved** (`decode_reencode_fn`; stub OPAQUE) |
 | **3B** | True network recode | Future — requires new wire version |
 
 ### Local destination decode (L1 / L2)
@@ -126,11 +153,24 @@ Cache copy and EgressPacket ownership are **independent**. On admission failure,
 default policy is **still forward** the current packet without caching
 (`gen_admission_failed++`).
 
+### Local source (S0)
+
+`--source FILE --final-dst N --ttl N --codec ... [--flow-id] [--rate-mbps]`:
+
+- Encodes on a background thread inside `relay_run`.
+- Emits wire v3 DATA + END via `relay_inject_wire_datagram`.
+- Shares Destination Check / TTL / transit hooks / EgressQueue with UDP RX.
+- `FILE` may be a regular file or named FIFO.
+- If `final_dst == local_node_id`, `--local-decode` is required.
+
 ### Phase 3A vs 3B
 
 - **3A — decode-and-reencode:** After collecting enough recoverable shards,
   decode source, re-run the existing FEC encoder. Possible on wire v3.
+  Hook: `RelayDecodeReencodeFn` / `--decode-reencode-stub` (always OPAQUE today).
 - **3B — true network recode:** Needs a future wire version with coding vectors.
+  Do not overload `recode_fn` / `decode_reencode_fn` for 3B.
+- Per-datagram optional transform today: `recode_fn` / `--transit-hook identity`.
 
 ---
 
@@ -139,7 +179,7 @@ default policy is **still forward** the current packet without caching
 ### 1. Wire-level local injection
 
 `relay_inject_wire_datagram()` accepts an **already encoded** wire v3
-datagram only. It is **not** raw local data → encoder.
+datagram only. Raw local data → encoder is `local_source_run` / `--source`.
 
 ### 2. No arbitrary network recode on wire v3
 

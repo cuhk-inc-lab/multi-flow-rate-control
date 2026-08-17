@@ -18,3 +18,25 @@ int relay_recode_identity(const uint8_t *in, size_t in_len,
     *out_len = in_len;
     return 0;
 }
+
+RelayDecodeReencodeAction relay_decode_reencode_stub(
+    const WireHeader *hdr,
+    const uint8_t *datagram,
+    size_t len,
+    GenerationEntry *gen,
+    GenerationInsertStatus insert_status,
+    RelayDecodeReencodeEmitFn emit_fn,
+    void *emit_ctx,
+    void *ctx)
+{
+    (void)hdr;
+    (void)datagram;
+    (void)len;
+    (void)gen;
+    (void)insert_status;
+    (void)emit_fn;
+    (void)emit_ctx;
+    (void)ctx;
+    /* Phase 3A not implemented: never hold or replace. */
+    return RELAY_DECODE_REENCODE_OPAQUE;
+}

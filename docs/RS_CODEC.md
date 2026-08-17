@@ -186,5 +186,8 @@ and adapting r for on-path control loops.
 ## 7. Related docs
 
 - [`apps/wg_multi_pipeline/README.md`](../apps/wg_multi_pipeline/README.md)
+- [`apps/wire_relay/README.md`](../apps/wire_relay/README.md) — same `--codec rs`
+  on `--source` / `--local-decode`
+- [`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md)
 - [`VM_NETWORK_BENCHMARK.md`](VM_NETWORK_BENCHMARK.md)
 - [`SCRIPTS.md`](SCRIPTS.md)
