@@ -22,6 +22,7 @@
 
 #include "flow_buffer.h"
 #include "mixed_queue.h"
+#include "tx_queue.h"
 
 /* ---- packet / flow_buffer (from test_flow_buffer.c) ---- */
 
@@ -1472,6 +1473,288 @@ static int test_wire_header_roundtrip(void)
     return 0;
 }
 
+/* ---- tx_queue ---- */
+
+static TxqPacket txq_make_pkt(uint64_t seq, const char *text)
+{
+    TxqPacket pkt;
+    size_t len = strlen(text) + 1u;
+
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.payload = malloc(len);
+    /* malloc failure would skew the test; assert non-null. */
+    if (pkt.payload != NULL) {
+        memcpy(pkt.payload, text, len);
+    }
+    pkt.length = len;
+    pkt.seq = seq;
+    pkt.free_fn = NULL; /* default free() */
+    return pkt;
+}
+
+static int test_tx_queue_basic(void)
+{
+    TxQueue q;
+    TxqPacket pkt;
+    TxqStatus st;
+
+    if (txq_init(&q, 2, 0, TXQ_POLICY_TRY) != TXQ_OK) {
+        return 1;
+    }
+
+    if (txq_capacity_items(&q) != 2 || txq_capacity_bytes(&q) != 0) {
+        txq_destroy(&q);
+        return 1;
+    }
+
+    pkt = txq_make_pkt(1, "a");
+    if (txq_try_push(&q, &pkt) != TXQ_OK) {
+        free(pkt.payload);
+        txq_destroy(&q);
+        return 1;
+    }
+    pkt = txq_make_pkt(2, "b");
+    if (txq_try_push(&q, &pkt) != TXQ_OK) {
+        free(pkt.payload);
+        txq_destroy(&q);
+        return 1;
+    }
+
+    if (txq_count(&q) != 2) {
+        txq_destroy(&q);
+        return 1;
+    }
+
+    /* Full now: must decline and leave ownership with caller. */
+    pkt = txq_make_pkt(3, "c");
+    st = txq_try_push(&q, &pkt);
+    if (st != TXQ_ERR_FULL) {
+        free(pkt.payload);
+        txq_destroy(&q);
+        return 1;
+    }
+    free(pkt.payload); /* caller still owns it */
+
+    /* FIFO order. */
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 1) {
+        txq_destroy(&q);
+        return 1;
+    }
+    free(pkt.payload);
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 2) {
+        txq_destroy(&q);
+        return 1;
+    }
+    free(pkt.payload);
+
+    if (txq_try_pop(&q, &pkt) != TXQ_ERR_EMPTY) {
+        txq_destroy(&q);
+        return 1;
+    }
+
+    txq_destroy(&q);
+    return 0;
+}
+
+static int test_tx_queue_push_front(void)
+{
+    TxQueue q;
+    TxqPacket pkt;
+
+    if (txq_init(&q, 4, 0, TXQ_POLICY_BLOCK) != TXQ_OK) {
+        return 1;
+    }
+
+    pkt = txq_make_pkt(1, "a");
+    if (txq_push(&q, &pkt) != TXQ_OK) { free(pkt.payload); txq_destroy(&q); return 1; }
+    pkt = txq_make_pkt(2, "b");
+    if (txq_push(&q, &pkt) != TXQ_OK) { free(pkt.payload); txq_destroy(&q); return 1; }
+
+    /* Retransmit: prepend seq 1 again, must come out before seq 2. */
+    pkt = txq_make_pkt(1, "a-retx");
+    if (txq_push_front(&q, &pkt) != TXQ_OK) { free(pkt.payload); txq_destroy(&q); return 1; }
+
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 1) { txq_destroy(&q); return 1; }
+    free(pkt.payload);
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 1) { txq_destroy(&q); return 1; }
+    free(pkt.payload);
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 2) { txq_destroy(&q); return 1; }
+    free(pkt.payload);
+
+    txq_destroy(&q);
+    return 0;
+}
+
+static int test_tx_queue_byte_cap(void)
+{
+    TxQueue q;
+    TxqPacket pkt;
+
+    /* 2 slots, but only 10 bytes total. */
+    if (txq_init(&q, 2, 10, TXQ_POLICY_TRY) != TXQ_OK) {
+        return 1;
+    }
+
+    pkt = txq_make_pkt(1, "0123456"); /* 8 bytes incl nul */
+    if (txq_try_push(&q, &pkt) != TXQ_OK) { free(pkt.payload); txq_destroy(&q); return 1; }
+
+    /* Second 8-byte packet (16 total) exceeds the 10-byte cap => FULL. */
+    pkt = txq_make_pkt(2, "abcdefg"); /* 8 bytes */
+    if (txq_try_push(&q, &pkt) != TXQ_ERR_FULL) { free(pkt.payload); txq_destroy(&q); return 1; }
+    free(pkt.payload);
+
+    if (txq_bytes(&q) != 8) { txq_destroy(&q); return 1; }
+
+    /* Drain one, byte budget recovers. */
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 1) { txq_destroy(&q); return 1; }
+    free(pkt.payload);
+
+    pkt = txq_make_pkt(2, "abcdefg");
+    if (txq_try_push(&q, &pkt) != TXQ_OK) { free(pkt.payload); txq_destroy(&q); return 1; }
+
+    txq_destroy(&q);
+    return 0;
+}
+
+/* Gate that blocks until the test sets the global flag. */
+static atomic_int g_gate_open;
+static uint64_t gate_blocking(TxQueue *q, const TxqPacket *pkt, void *ctx)
+{
+    (void)q; (void)pkt; (void)ctx;
+    return atomic_load_explicit(&g_gate_open, memory_order_acquire) ? 0u : 100000000u;
+}
+
+static int test_tx_queue_gate(void)
+{
+    TxQueue q;
+    TxqPacket pkt;
+
+    atomic_store(&g_gate_open, 0);
+    if (txq_init(&q, 4, 0, TXQ_POLICY_TRY) != TXQ_OK) {
+        return 1;
+    }
+    txq_set_release_gate(&q, gate_blocking, NULL);
+
+    pkt = txq_make_pkt(1, "x");
+    if (txq_try_push(&q, &pkt) != TXQ_OK) { free(pkt.payload); txq_destroy(&q); return 1; }
+
+    /* try_pop must report GATED while the gate is closed. */
+    if (txq_try_pop(&q, &pkt) != TXQ_ERR_GATED) { txq_destroy(&q); return 1; }
+
+    /* Open the gate and notify; try_pop now succeeds. */
+    atomic_store(&g_gate_open, 1);
+    txq_release_notify(&q);
+    if (txq_try_pop(&q, &pkt) != TXQ_OK || pkt.seq != 1) { txq_destroy(&q); return 1; }
+    free(pkt.payload);
+
+    txq_destroy(&q);
+    return 0;
+}
+
+/* Threaded backpressure: a blocking push must wait until a pop frees space. */
+typedef struct {
+    TxQueue *q;
+    int      pushed;
+} PushCtx;
+
+static void *pusher_thread(void *arg)
+{
+    PushCtx *ctx = arg;
+    TxqPacket pkt;
+    int i;
+
+    for (i = 0; i < 5; i++) {
+        char buf[16];
+        pkt = txq_make_pkt((uint64_t)i, buf);
+        if (pkt.payload == NULL) {
+            return NULL;
+        }
+        snprintf(buf, sizeof(buf), "p%d", i);
+        /* Re-copy the (possibly truncated) label into the already-allocated buf. */
+        memcpy(pkt.payload, buf, strlen(buf) + 1u);
+        pkt.length = strlen(buf) + 1u;
+        if (txq_push(ctx->q, &pkt) == TXQ_OK) {
+            ctx->pushed++;
+        } else {
+            free(pkt.payload);
+        }
+    }
+    return NULL;
+}
+
+static int test_tx_queue_backpressure(void)
+{
+    TxQueue q;
+    PushCtx ctx;
+    pthread_t tid;
+    TxqPacket pkt;
+    int i;
+
+    /* Capacity 2, BLOCK policy: pusher must stall after 2 until we drain. */
+    if (txq_init(&q, 2, 0, TXQ_POLICY_BLOCK) != TXQ_OK) {
+        return 1;
+    }
+    ctx.q = &q;
+    ctx.pushed = 0;
+
+    if (pthread_create(&tid, NULL, pusher_thread, &ctx) != 0) {
+        txq_destroy(&q);
+        return 1;
+    }
+
+    /* Drain everything; ordering follows push order. */
+    for (i = 0; i < 5; i++) {
+        if (txq_pop(&q, &pkt) != TXQ_OK || pkt.seq != (uint64_t)i) {
+            txq_destroy(&q);
+            return 1;
+        }
+        free(pkt.payload);
+    }
+
+    pthread_join(tid, NULL);
+    if (ctx.pushed != 5) {
+        txq_destroy(&q);
+        return 1;
+    }
+
+    txq_destroy(&q);
+    return 0;
+}
+
+static int test_tx_queue_shutdown(void)
+{
+    TxQueue q;
+    TxqPacket pkt;
+    TxqStatus st;
+
+    if (txq_init(&q, 4, 0, TXQ_POLICY_BLOCK) != TXQ_OK) {
+        return 1;
+    }
+    /* Empty + not shut down => try_pop EMPTY. */
+    if (txq_try_pop(&q, &pkt) != TXQ_ERR_EMPTY) {
+        txq_destroy(&q);
+        return 1;
+    }
+    /* Shutdown on empty queue => pop returns SHUTDOWN. */
+    txq_shutdown(&q);
+    st = txq_pop(&q, &pkt);
+    if (st != TXQ_ERR_SHUTDOWN) {
+        txq_destroy(&q);
+        return 1;
+    }
+    /* Push after shutdown is rejected; caller keeps ownership. */
+    pkt = txq_make_pkt(1, "z");
+    if (txq_try_push(&q, &pkt) != TXQ_ERR_SHUTDOWN) {
+        free(pkt.payload);
+        txq_destroy(&q);
+        return 1;
+    }
+    free(pkt.payload);
+
+    txq_destroy(&q);
+    return 0;
+}
+
 int main(void)
 {
     if (test_packet_create_free() != 0) {
@@ -1536,6 +1819,30 @@ int main(void)
     }
     if (test_wire_header_roundtrip() != 0) {
         fprintf(stderr, "test_wire_header_roundtrip failed\n");
+        return 1;
+    }
+    if (test_tx_queue_basic() != 0) {
+        fprintf(stderr, "test_tx_queue_basic failed\n");
+        return 1;
+    }
+    if (test_tx_queue_push_front() != 0) {
+        fprintf(stderr, "test_tx_queue_push_front failed\n");
+        return 1;
+    }
+    if (test_tx_queue_byte_cap() != 0) {
+        fprintf(stderr, "test_tx_queue_byte_cap failed\n");
+        return 1;
+    }
+    if (test_tx_queue_gate() != 0) {
+        fprintf(stderr, "test_tx_queue_gate failed\n");
+        return 1;
+    }
+    if (test_tx_queue_backpressure() != 0) {
+        fprintf(stderr, "test_tx_queue_backpressure failed\n");
+        return 1;
+    }
+    if (test_tx_queue_shutdown() != 0) {
+        fprintf(stderr, "test_tx_queue_shutdown failed\n");
         return 1;
     }
 
