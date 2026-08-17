@@ -41,6 +41,8 @@ typedef enum RsProfile {
 const Codec *RsCodec_get(void);
 
 int RsCodec_set_params(size_t data_shards, size_t parity_shards);
+int RsCodec_set_params_ex(size_t data_shards, size_t parity_shards,
+                          size_t shard_bytes);
 void RsCodec_get_params(size_t *data_shards, size_t *parity_shards);
 
 int RsCodec_set_profile(RsProfile profile);

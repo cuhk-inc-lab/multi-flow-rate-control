@@ -409,17 +409,229 @@ static int test_pacing_budget(void)
     EXPECT(encoder);
     EXPECT(fec_encoder_reset(encoder, 1) == FEC_OK);
     EXPECT(push_records(encoder, 3, 2) == 0);
+    EXPECT(fec_encoder_has_pending(encoder));
     EXPECT(fec_encoder_drain(encoder, 1) == FEC_OK);
     EXPECT(wire.count == 1);
+    EXPECT(fec_encoder_has_pending(encoder));
     EXPECT(fec_encoder_drain(encoder, 2) == FEC_OK);
     EXPECT(wire.count == 3);
     EXPECT(fec_encoder_drain(encoder, SIZE_MAX) == FEC_OK);
     EXPECT(wire.count == 6);
+    EXPECT(!fec_encoder_has_pending(encoder));
     fec_encoder_get_stats(encoder, &stats);
     EXPECT(stats.data_datagrams_tx == 3);
     EXPECT(stats.metadata_datagrams_tx == 1);
     EXPECT(stats.parity_datagrams_tx == 2);
     fec_encoder_destroy(encoder);
+    return 0;
+}
+
+static int test_wire_rate_bps(void)
+{
+    FecTransportConfig config;
+    Capture wire = {0};
+    FecCallbacks enc_cb = {.output = capture_output, .ctx = &wire};
+    FecEncoder *encoder;
+    FecStats stats;
+    uint64_t wake;
+
+    config_profile(&config, 4, 2);
+    config.wire_rate_bps = 8000ull;
+    config.wire_burst_bytes = 1500ull;
+    encoder = fec_encoder_create(&config, &enc_cb);
+    EXPECT(encoder);
+    EXPECT(fec_encoder_reset(encoder, 1) == FEC_OK);
+    EXPECT(push_records(encoder, 3, 2) == 0);
+    EXPECT(fec_encoder_update(encoder, 1) == FEC_OK);
+    EXPECT(wire.count == 1);
+    fec_encoder_get_stats(encoder, &stats);
+    EXPECT(stats.wire_pacing_deferred >= 1);
+    EXPECT(fec_encoder_has_pending(encoder));
+    wake = fec_encoder_next_update_ns(encoder);
+    EXPECT(wake > 1);
+    EXPECT(fec_encoder_update(encoder, wake) == FEC_OK);
+    EXPECT(wire.count >= 2);
+    fec_encoder_destroy(encoder);
+    return 0;
+}
+
+static int test_shard_size_1300(void)
+{
+    FecTransportConfig config;
+    Capture wire = {0};
+    Capture app = {0};
+    FecCallbacks enc_cb = {.output = capture_output, .ctx = &wire};
+    FecCallbacks dec_cb = {.output = capture_output, .ctx = &app};
+    FecEncoder *encoder;
+    FecDecoder *decoder;
+    uint8_t rec[40];
+    size_t i;
+
+    memset(rec, 0x5a, sizeof(rec));
+    config_profile(&config, 4, 2);
+    config.shard_size = 1300;
+    encoder = fec_encoder_create(&config, &enc_cb);
+    decoder = fec_decoder_create(&config, &dec_cb);
+    EXPECT(encoder && decoder);
+    EXPECT(fec_encoder_reset(encoder, 1) == FEC_OK);
+    EXPECT(fec_decoder_reset(decoder, 1) == FEC_OK);
+    EXPECT(fec_encoder_push(encoder, rec, sizeof(rec), 1) == FEC_OK);
+    EXPECT(fec_encoder_flush(encoder) == FEC_OK);
+    EXPECT(fec_encoder_drain(encoder, SIZE_MAX) == FEC_OK);
+    EXPECT(wire.count >= 3);
+    for (i = 0; i < wire.count; i++) {
+        EXPECT(fec_decoder_input(decoder, wire.buf[i], wire.len[i], 2) == FEC_OK);
+    }
+    EXPECT(app.count == 1);
+    EXPECT(app.len[0] == sizeof(rec));
+    EXPECT(memcmp(app.buf[0], rec, sizeof(rec)) == 0);
+    fec_encoder_destroy(encoder);
+    fec_decoder_destroy(decoder);
+    return 0;
+}
+
+static int test_profile_conflict(void)
+{
+    FecTransportConfig a;
+    FecTransportConfig b;
+    Capture wire = {0};
+    FecCallbacks cb = {.output = capture_output, .ctx = &wire};
+    FecEncoder *enc_a;
+    FecEncoder *enc_b;
+
+    config_profile(&a, 4, 2);
+    config_profile(&b, 16, 2);
+    enc_a = fec_encoder_create(&a, &cb);
+    EXPECT(enc_a);
+    enc_b = fec_encoder_create(&b, &cb);
+    EXPECT(enc_b == NULL);
+    fec_encoder_destroy(enc_a);
+    enc_b = fec_encoder_create(&b, &cb);
+    EXPECT(enc_b);
+    fec_encoder_destroy(enc_b);
+    return 0;
+}
+
+static int test_decoder_blocked_retry(void)
+{
+    FecTransportConfig config;
+    Capture wire = {0};
+    Capture app = {0};
+    FecCallbacks enc_cb = {.output = capture_output, .ctx = &wire};
+    FecCallbacks dec_cb = {.output = capture_output, .ctx = &app};
+    FecEncoder *encoder;
+    FecDecoder *decoder;
+
+    config_profile(&config, 4, 2);
+    encoder = fec_encoder_create(&config, &enc_cb);
+    decoder = fec_decoder_create(&config, &dec_cb);
+    EXPECT(encoder && decoder);
+    EXPECT(fec_encoder_reset(encoder, 1) == FEC_OK);
+    EXPECT(fec_decoder_reset(decoder, 1) == FEC_OK);
+    EXPECT(push_records(encoder, 3, 4) == 0);
+    EXPECT(fec_encoder_drain(encoder, SIZE_MAX) == FEC_OK);
+    app.block_next = 1;
+    EXPECT(fec_decoder_input(decoder, wire.buf[0], wire.len[0], 1) == FEC_OK);
+    EXPECT(app.count == 0);
+    EXPECT(fec_decoder_update(decoder, 2) == FEC_OK);
+    EXPECT(app.count == 1);
+    fec_encoder_destroy(encoder);
+    fec_decoder_destroy(decoder);
+    return 0;
+}
+
+static int test_decoder_evict_blocked(void)
+{
+    FecTransportConfig config;
+    Capture wire = {0};
+    Capture app = {0};
+    FecCallbacks enc_cb = {.output = capture_output, .ctx = &wire};
+    FecCallbacks dec_cb = {.output = capture_output, .ctx = &app};
+    FecEncoder *encoder;
+    FecDecoder *decoder;
+    WireHeader first;
+    size_t i;
+    int saw_full = 0;
+    uint8_t extra[8];
+
+    memset(extra, 0x11, sizeof(extra));
+    config_profile(&config, 4, 2);
+    config.group_window = 1;
+    encoder = fec_encoder_create(&config, &enc_cb);
+    decoder = fec_decoder_create(&config, &dec_cb);
+    EXPECT(encoder && decoder);
+    EXPECT(fec_encoder_reset(encoder, 1) == FEC_OK);
+    EXPECT(fec_decoder_reset(decoder, 1) == FEC_OK);
+    EXPECT(push_records(encoder, 3, 6) == 0);
+    EXPECT(fec_encoder_push(encoder, extra, sizeof(extra), 10) == FEC_OK);
+    EXPECT(fec_encoder_flush(encoder) == FEC_OK);
+    EXPECT(fec_encoder_drain(encoder, SIZE_MAX) == FEC_OK);
+    EXPECT(wire_header_decode(&first, wire.buf[0], wire.len[0]) == 0);
+    app.block_next = 100;
+    EXPECT(fec_decoder_input(decoder, wire.buf[0], wire.len[0], 1) == FEC_OK);
+    EXPECT(app.count == 0);
+    for (i = 1; i < wire.count; i++) {
+        WireHeader header;
+
+        EXPECT(wire_header_decode(&header, wire.buf[i], wire.len[i]) == 0);
+        if (header.block_id <= first.block_id) {
+            continue;
+        }
+        EXPECT(fec_decoder_input(decoder, wire.buf[i], wire.len[i], 2) ==
+               FEC_ERR_QUEUE_FULL);
+        saw_full = 1;
+        break;
+    }
+    EXPECT(saw_full);
+    EXPECT(app.count == 0);
+    app.block_next = 0;
+    EXPECT(fec_decoder_update(decoder, 3) == FEC_OK);
+    EXPECT(app.count >= 1);
+    fec_encoder_destroy(encoder);
+    fec_decoder_destroy(decoder);
+    return 0;
+}
+
+static int test_drop_any_two_shards(void)
+{
+    FecTransportConfig config;
+    size_t drop_a;
+    size_t drop_b;
+
+    config_profile(&config, 4, 2);
+    for (drop_a = 0; drop_a < 6u; drop_a++) {
+        for (drop_b = drop_a + 1u; drop_b < 6u; drop_b++) {
+            Capture wire = {0};
+            Capture app = {0};
+            FecCallbacks enc_cb = {.output = capture_output, .ctx = &wire};
+            FecCallbacks dec_cb = {.output = capture_output, .ctx = &app};
+            FecEncoder *encoder;
+            FecDecoder *decoder;
+            size_t i;
+
+            encoder = fec_encoder_create(&config, &enc_cb);
+            decoder = fec_decoder_create(&config, &dec_cb);
+            EXPECT(encoder && decoder);
+            EXPECT(fec_encoder_reset(encoder, 1) == FEC_OK);
+            EXPECT(fec_decoder_reset(decoder, 1) == FEC_OK);
+            EXPECT(push_records(encoder, 3, 9) == 0);
+            EXPECT(fec_encoder_drain(encoder, SIZE_MAX) == FEC_OK);
+            for (i = 0; i < wire.count; i++) {
+                WireHeader header;
+
+                EXPECT(wire_header_decode(&header, wire.buf[i], wire.len[i]) == 0);
+                if (header.shard_index == drop_a ||
+                    header.shard_index == drop_b) {
+                    continue;
+                }
+                EXPECT(fec_decoder_input(decoder, wire.buf[i], wire.len[i],
+                                         1) == FEC_OK);
+            }
+            EXPECT(records_match(&app, 3, 9));
+            fec_encoder_destroy(encoder);
+            fec_decoder_destroy(decoder);
+        }
+    }
     return 0;
 }
 
@@ -458,6 +670,12 @@ int main(void)
         test_queue_overflow_no_silent_loss() != 0 ||
         test_partial_group_known_zeros() != 0 ||
         test_pacing_budget() != 0 ||
+        test_wire_rate_bps() != 0 ||
+        test_shard_size_1300() != 0 ||
+        test_profile_conflict() != 0 ||
+        test_decoder_blocked_retry() != 0 ||
+        test_decoder_evict_blocked() != 0 ||
+        test_drop_any_two_shards() != 0 ||
         test_incompatible_wire() != 0) {
         return 1;
     }
