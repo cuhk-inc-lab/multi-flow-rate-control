@@ -125,6 +125,7 @@ RELAY_DECODE_OBJS = \
 	$(OBJ_DIR)/wg_rs_codec.o \
 	$(RSCODE_OBJS)
 
+FEC_TRANSPORT_TEST_BIN = $(OBJ_DIR)/fec_transport_tests
 RELAY_GEN_CACHE_TEST_BIN = $(OBJ_DIR)/relay_gen_cache_tests
 RELAY_EGRESS_QUEUE_TEST_BIN = $(OBJ_DIR)/relay_egress_queue_tests
 RELAY_DEFERRED_TEST_BIN = $(OBJ_DIR)/relay_deferred_tests
@@ -137,7 +138,7 @@ WIRE_FLOW_DECODER_REORDER_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_reorder_tests
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
-.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline integration-test fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
+.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline integration-test fec-transport fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
 
 all: $(LIB)
 
@@ -167,6 +168,9 @@ rs-recovery-bench: $(RS_RECOVERY_BENCH_BIN)
 rs-encode-bench: $(RS_ENCODE_BENCH_BIN)
 	./$(RS_ENCODE_BENCH_BIN)
 
+fec-transport: $(FEC_TRANSPORT_TEST_BIN)
+	./$(FEC_TRANSPORT_TEST_BIN)
+
 test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BIN) \
 	$(RELAY_DEFERRED_TEST_BIN) \
 	$(RELAY_LOCAL_DECODE_TEST_BIN) \
@@ -174,7 +178,8 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN) \
 	$(WIRE_FLOW_DECODER_SYS_TEST_BIN) $(WIRE_FLOW_DECODER_REORDER_TEST_BIN) \
 	$(RS_ENCODE_FAST_TEST_BIN) \
-	$(RS_ENCODE_GENERAL_TEST_BIN)
+	$(RS_ENCODE_GENERAL_TEST_BIN) \
+	$(FEC_TRANSPORT_TEST_BIN)
 	./$(TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
 	./$(RELAY_EGRESS_QUEUE_TEST_BIN)
@@ -187,6 +192,7 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 	./$(WIRE_FLOW_DECODER_REORDER_TEST_BIN)
 	./$(RS_ENCODE_FAST_TEST_BIN)
 	./$(RS_ENCODE_GENERAL_TEST_BIN)
+	./$(FEC_TRANSPORT_TEST_BIN)
 
 integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) \
 	$(RELAY_EGRESS_QUEUE_TEST_BIN) $(RELAY_DEFERRED_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN) \
@@ -194,10 +200,12 @@ integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(REL
 	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN) \
 	$(WIRE_FLOW_DECODER_SYS_TEST_BIN) $(WIRE_FLOW_DECODER_REORDER_TEST_BIN) \
 	$(RS_ENCODE_FAST_TEST_BIN) \
-	$(RS_ENCODE_GENERAL_TEST_BIN)
+	$(RS_ENCODE_GENERAL_TEST_BIN) \
+	$(FEC_TRANSPORT_TEST_BIN)
 	./$(WG_CODEC_TEST_BIN)
 	./$(RS_ENCODE_FAST_TEST_BIN)
 	./$(RS_ENCODE_GENERAL_TEST_BIN)
+	./$(FEC_TRANSPORT_TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
 	./$(RELAY_EGRESS_QUEUE_TEST_BIN)
 	./$(RELAY_DEFERRED_TEST_BIN)
@@ -382,6 +390,17 @@ $(RS_ENCODE_FAST_TEST_BIN): $(TEST_DIR)/rs_encode_fast_tests.c \
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(RS_ENCODE_GENERAL_TEST_BIN): $(TEST_DIR)/rs_encode_general_tests.c \
+	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
+	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
+$(OBJ_DIR)/fec_transport.o: $(SRC_DIR)/fec_transport.c include/fec_transport.h \
+	$(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(RSCODE_DIR) -c $< -o $@
+
+$(FEC_TRANSPORT_TEST_BIN): $(TEST_DIR)/fec_transport_tests.c \
+	$(OBJ_DIR)/fec_transport.o $(OBJ_DIR)/wire_header.o \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
 	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
