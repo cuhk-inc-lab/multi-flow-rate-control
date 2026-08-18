@@ -870,9 +870,22 @@ static void *tx_worker_main(void *arg)
         /* After ownership leaves the queue, before send/capture. */
         tx_test_hold(ctx);
 
+        slot = flow_stats_slot(ctx, pkt.flow_id);
+        if (ctx->config.egress_fn != NULL) {
+            WireHeader header;
+
+            if (wire_header_decode(&header, pkt.datagram, pkt.len) != 0 ||
+                ctx->config.egress_fn(pkt.datagram, pkt.len, &header,
+                                      ctx->config.egress_ctx) != 0) {
+                slot->drop_malformed++;
+                ctx->total.drop_malformed++;
+                free(pkt.datagram);
+                continue;
+            }
+        }
+
         if (ctx->tx_capture_fn != NULL) {
             ctx->tx_capture_fn(pkt.datagram, pkt.len, ctx->tx_capture_ctx);
-            slot = flow_stats_slot(ctx, pkt.flow_id);
             slot->forward++;
             ctx->total.forward++;
             free(pkt.datagram);
@@ -885,7 +898,6 @@ static void *tx_worker_main(void *arg)
                           ctx->next_hop_len);
         } while (sent < 0 && errno == EINTR);
 
-        slot = flow_stats_slot(ctx, pkt.flow_id);
         if (sent < 0 || (size_t)sent != pkt.len) {
             slot->drop_send++;
             ctx->total.drop_send++;
@@ -1265,7 +1277,7 @@ RelayStatus relay_run(const RelayConfig *config)
             "wire-relay: local_node_id=%u listen=%u next-hop=%s:%u "
             "egress_capacity=%zu egress_wait_ms=%u "
             "deferred_per_flow=%zu deferred_total=%zu max_active_flows=%u "
-            "test_tx_hold_us=%u inline_rx=%d process=%s recode=%s "
+            "test_tx_hold_us=%u inline_rx=%d process=%s recode=%s egress=%s "
             "decode_reencode=%s local_source=%s\n",
             (unsigned)ctx.config.local_node_id,
             (unsigned)ctx.config.listen_port,
@@ -1280,6 +1292,7 @@ RelayStatus relay_run(const RelayConfig *config)
             RELAY_TEST_INLINE_RX,
             ctx.cache_enabled ? "cache" : "forward",
             ctx.config.recode_fn != NULL ? "enabled" : "disabled",
+            ctx.config.egress_fn != NULL ? "enabled" : "disabled",
             ctx.config.decode_reencode_fn != NULL ? "reserved" : "disabled",
             ctx.config.local_source != NULL ? "enabled" : "disabled");
     if (ctx.config.test_tx_hold_us != 0) {

@@ -23,6 +23,9 @@ typedef struct Capture {
     size_t   count;
     size_t   bytes;
     uint8_t  saw_end;
+    uint8_t  payload[32];
+    size_t   payload_len;
+    uint8_t  ttl;
     uint32_t flow_id;
 } Capture;
 
@@ -37,9 +40,91 @@ static void capture_tx(const uint8_t *datagram, size_t len, void *ctx)
     cap->count++;
     cap->bytes += len;
     cap->flow_id = hdr.flow_id;
+    cap->ttl = hdr.ttl;
+    if (hdr.type == WIRE_TYPE_DATA && cap->payload_len == 0 &&
+        hdr.payload_len <= sizeof(cap->payload) &&
+        len >= WIRE_HEADER_SIZE + (size_t)hdr.payload_len) {
+        memcpy(cap->payload, datagram + WIRE_HEADER_SIZE, hdr.payload_len);
+        cap->payload_len = hdr.payload_len;
+    }
     if (hdr.type == WIRE_TYPE_END) {
         cap->saw_end = 1;
     }
+}
+
+static void test_plus_minus_transit_hooks(void)
+{
+    RelayConfig cfg;
+    RelayCtx *ctx = NULL;
+    Capture cap;
+    WireHeader hdr;
+    uint8_t datagram[WIRE_HEADER_SIZE + 16];
+    uint8_t transformed[sizeof(datagram)];
+    uint8_t original[16];
+    size_t out_len = 0;
+    size_t i;
+    int spins;
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = WIRE_TYPE_DATA;
+    hdr.final_dst = 4;
+    hdr.ttl = 8;
+    hdr.flow_id = 77;
+    hdr.shard_count = 4;
+    hdr.valid_len = sizeof(original);
+    hdr.payload_len = sizeof(original);
+    wire_header_encode(datagram, &hdr);
+    for (i = 0; i < sizeof(original); i++) {
+        original[i] = (uint8_t)(250u + i);
+    }
+    memcpy(datagram + WIRE_HEADER_SIZE, original, sizeof(original));
+
+    EXPECT(relay_recode_payload_add1(datagram, sizeof(datagram), transformed,
+                                     sizeof(transformed), &out_len, &hdr,
+                                     NULL) == 0);
+    EXPECT(out_len == sizeof(datagram));
+    for (i = 0; i < sizeof(original); i++) {
+        EXPECT(transformed[WIRE_HEADER_SIZE + i] ==
+               (uint8_t)(original[i] + 1u));
+    }
+    EXPECT(relay_egress_payload_sub1(transformed, out_len, &hdr, NULL) == 0);
+    EXPECT(memcmp(transformed + WIRE_HEADER_SIZE, original,
+                  sizeof(original)) == 0);
+
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&cap, 0, sizeof(cap));
+    cfg.local_node_id = 2;
+    cfg.next_hop_host = "127.0.0.1";
+    cfg.next_hop_port = 1;
+    cfg.recode_fn = relay_recode_payload_add1;
+    cfg.egress_fn = relay_egress_payload_sub1;
+    cfg.process_mode = RELAY_PROCESS_FORWARD;
+    cfg.egress_capacity = 16;
+    EXPECT(relay_harness_open(&ctx, &cfg, capture_tx, &cap) == RELAY_OK);
+    EXPECT(relay_inject_wire_datagram(ctx, datagram, sizeof(datagram)) ==
+           RELAY_INGRESS_OK);
+    for (spins = 0; spins < 2000 && cap.count == 0; spins++) {
+        usleep(1000);
+    }
+    EXPECT(cap.count == 1);
+    EXPECT(cap.flow_id == 77);
+    EXPECT(cap.ttl == 7);
+    EXPECT(cap.payload_len == sizeof(original));
+    EXPECT(memcmp(cap.payload, original, sizeof(original)) == 0);
+    relay_harness_close(ctx);
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = WIRE_TYPE_END;
+    hdr.final_dst = 4;
+    hdr.ttl = 8;
+    hdr.flow_id = 77;
+    wire_header_encode(datagram, &hdr);
+    EXPECT(relay_recode_payload_add1(datagram, WIRE_HEADER_SIZE, transformed,
+                                     sizeof(transformed), &out_len, &hdr,
+                                     NULL) == 0);
+    EXPECT(out_len == WIRE_HEADER_SIZE);
+    EXPECT(relay_egress_payload_sub1(transformed, out_len, &hdr, NULL) == 0);
+    EXPECT(memcmp(datagram, transformed, WIRE_HEADER_SIZE) == 0);
 }
 
 static int emit_inject(const uint8_t *datagram, size_t len, void *ctx)
@@ -192,6 +277,7 @@ static void test_source_inject_local_decode(void)
 
 int main(void)
 {
+    test_plus_minus_transit_hooks();
     test_source_inject_forward();
     test_source_inject_local_decode();
     printf("relay_local_source_tests: ok\n");

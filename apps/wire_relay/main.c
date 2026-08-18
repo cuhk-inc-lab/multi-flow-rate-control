@@ -19,7 +19,8 @@ static void print_usage(const char *prog)
             "     [--process forward|cache]\n"
             "     [--gen-timeout-ms N] [--max-gens N]\n"
             "     [--max-gens-per-flow N] [--max-cache-bytes N]\n"
-            "     [--transit-hook identity]   (optional per-datagram recode_fn)\n"
+            "     [--transit-hook identity|plus-minus]\n"
+            "       identity: ingress copy only; plus-minus: ingress +1, egress -1\n"
             "     [--decode-reencode-stub]    (reserve Phase 3A hook; always OPAQUE)\n"
             "     [--local-decode --codec copy|xor-fec|rs-fec|rs|none\n"
             "         (--output FILE | --output-dir DIR)]\n"
@@ -137,6 +138,7 @@ int main(int argc, char **argv)
     int have_codec = 0;
     int have_source = 0;
     int transit_identity = 0;
+    int transit_plus_minus = 0;
     int decode_reencode_stub = 0;
     CodecKind codec_kind = CODEC_KIND_COPY;
     const char *output_path = NULL;
@@ -392,11 +394,20 @@ int main(int argc, char **argv)
             source_rate_mbps = value;
             argi += 2;
         } else if (strcmp(argv[argi], "--transit-hook") == 0) {
-            if (argi + 1 >= argc || strcmp(argv[argi + 1], "identity") != 0) {
+            if (argi + 1 >= argc) {
                 print_usage(argv[0]);
                 return EXIT_FAILURE;
             }
-            transit_identity = 1;
+            if (strcmp(argv[argi + 1], "identity") == 0) {
+                transit_identity = 1;
+                transit_plus_minus = 0;
+            } else if (strcmp(argv[argi + 1], "plus-minus") == 0) {
+                transit_identity = 0;
+                transit_plus_minus = 1;
+            } else {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
             argi += 2;
         } else if (strcmp(argv[argi], "--decode-reencode-stub") == 0) {
             decode_reencode_stub = 1;
@@ -462,8 +473,13 @@ int main(int argc, char **argv)
     cfg.listen_port = listen_port;
     cfg.next_hop_host = next_hop_host;
     cfg.next_hop_port = next_hop_port;
-    cfg.recode_fn = transit_identity ? relay_recode_identity : NULL;
+    cfg.recode_fn =
+        transit_plus_minus ? relay_recode_payload_add1 :
+        transit_identity ? relay_recode_identity : NULL;
     cfg.recode_ctx = NULL;
+    cfg.egress_fn =
+        transit_plus_minus ? relay_egress_payload_sub1 : NULL;
+    cfg.egress_ctx = NULL;
     cfg.decode_reencode_fn =
         decode_reencode_stub ? relay_decode_reencode_stub : NULL;
     cfg.decode_reencode_ctx = NULL;

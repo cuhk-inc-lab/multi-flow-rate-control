@@ -45,9 +45,10 @@ The cross-VM wire modes use wire header **v3** (44 bytes): flow ID, block ID,
 shard index/count, payload/valid length, timestamps, plus `final_dst` and `ttl`
 in the former reserved bytes. They support the following codecs:
 
-- `copy`: preserves the existing 4-input-packet to 8-output-packet block
-  geometry without `+1/-1` arithmetic.
-- `block`: the existing `+1/-1` BlockCodec.
+- `copy`: four input shards copied unchanged to four wire shards; no
+  redundancy or arithmetic.
+- `block`: four input shards transformed byte-wise with uniform `+1`; decode
+  applies uniform `-1`. It has the same 4-to-4 geometry as `copy`.
 - `xor-fec`: four data shards plus one XOR parity shard. The receiver restores
   one missing shard; `--best-effort` writes available data shards from groups
   that still cannot be recovered after the idle timeout.

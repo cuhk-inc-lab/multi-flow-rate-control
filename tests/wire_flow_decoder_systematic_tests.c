@@ -147,7 +147,7 @@ static void test_systematic_complete_without_nondata_shards_copy(void)
     OutBuf ob;
     uint8_t out[8192];
     WireFlowDecoder *dec;
-    unsigned char encoded[ENCODE_BLOCK];
+    unsigned char encoded[DECODE_BLOCK];
     uint8_t plaintext[200];
     uint16_t valid_len = 0;
     uint16_t shard_count = 0;
@@ -158,7 +158,7 @@ static void test_systematic_complete_without_nondata_shards_copy(void)
     EXPECT(codec != NULL && Codec_is_systematic(codec));
     data_shards = Codec_data_shards(codec);
     EXPECT(data_shards == 4);
-    EXPECT(Codec_parity_shards(codec) == 4);
+    EXPECT(Codec_parity_shards(codec) == 0);
 
     for (i = 0; i < sizeof(plaintext); i++) {
         plaintext[i] = (uint8_t)(i * 3u + 1u);
@@ -172,7 +172,7 @@ static void test_systematic_complete_without_nondata_shards_copy(void)
     dec = make_dec(codec, 1, &ob);
     EXPECT(dec != NULL);
 
-    /* Drop all pad shards 4..7. */
+    /* Copy has exactly four data shards and no padding/parity shards. */
     EXPECT(ingest_data_shards_only(dec, 1, 0, encoded, shard_count, valid_len,
                                    data_shards) == 0);
     fill_end(&end, 1, 1, shard_count);
@@ -235,7 +235,7 @@ static void test_systematic_data_shard_missing_does_not_emit(void)
     OutBuf ob;
     uint8_t out[8192];
     WireFlowDecoder *dec;
-    unsigned char encoded[ENCODE_BLOCK];
+    unsigned char encoded[DECODE_BLOCK];
     uint8_t plaintext[160];
     uint16_t valid_len = 0;
     uint16_t shard_count = 0;
@@ -252,14 +252,10 @@ static void test_systematic_data_shard_missing_does_not_emit(void)
     dec = make_dec(codec, 3, &ob);
     EXPECT(dec != NULL);
 
-    /*
-     * received_count == 4 (== data_shards) but missing data shard 1;
-     * include pad shard 4 so a count-only check would wrongly pass.
-     */
+    /* Missing data shard 1: copy has no parity from which to recover it. */
     EXPECT(ingest_shard(dec, 3, 0, 0, shard_count, valid_len, encoded) == 0);
     EXPECT(ingest_shard(dec, 3, 0, 2, shard_count, valid_len, encoded) == 0);
     EXPECT(ingest_shard(dec, 3, 0, 3, shard_count, valid_len, encoded) == 0);
-    EXPECT(ingest_shard(dec, 3, 0, 4, shard_count, valid_len, encoded) == 0);
     fill_end(&end, 3, 1, shard_count);
     EXPECT(wire_flow_decoder_ingest(dec, &end, NULL, 0) == 0);
 
@@ -277,8 +273,8 @@ static void test_systematic_out_of_order_blocks_stay_ordered(void)
     OutBuf ob;
     uint8_t out[8192];
     WireFlowDecoder *dec;
-    unsigned char enc0[ENCODE_BLOCK];
-    unsigned char enc1[ENCODE_BLOCK];
+    unsigned char enc0[DECODE_BLOCK];
+    unsigned char enc1[DECODE_BLOCK];
     uint8_t pt0[64];
     uint8_t pt1[64];
     uint8_t expect[128];
@@ -324,7 +320,7 @@ static void test_non_systematic_codec_unchanged(void)
     OutBuf ob;
     uint8_t out[8192];
     WireFlowDecoder *dec;
-    unsigned char encoded[ENCODE_BLOCK];
+    unsigned char encoded[DECODE_BLOCK];
     uint8_t plaintext[120];
     uint16_t valid_len = 0;
     uint16_t shard_count = 0;
@@ -334,7 +330,7 @@ static void test_non_systematic_codec_unchanged(void)
     EXPECT(codec != NULL);
     EXPECT(!Codec_is_systematic(codec));
     EXPECT(Codec_data_shards(codec) == 4);
-    EXPECT(Codec_parity_shards(codec) == 4);
+    EXPECT(Codec_parity_shards(codec) == 0);
 
     for (i = 0; i < sizeof(plaintext); i++) {
         plaintext[i] = (uint8_t)(i + 9u);
@@ -348,14 +344,18 @@ static void test_non_systematic_codec_unchanged(void)
     dec = make_dec(codec, 5, &ob);
     EXPECT(dec != NULL);
 
-    /* Data shards only — must NOT fast-path (non-systematic). */
-    EXPECT(ingest_data_shards_only(dec, 5, 0, encoded, shard_count, valid_len,
-                                   4) == 0);
+    /* Three transformed shards are insufficient for a non-systematic block. */
+    EXPECT(ingest_shard(dec, 5, 0, 0, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 5, 0, 1, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 5, 0, 2, shard_count, valid_len, encoded) == 0);
+    EXPECT(ob.len == 0);
+    EXPECT(ingest_shard(dec, 5, 0, 3, shard_count, valid_len, encoded) == 0);
     fill_end(&end, 5, 1, shard_count);
     EXPECT(wire_flow_decoder_ingest(dec, &end, NULL, 0) == 0);
 
-    EXPECT(!wire_flow_decoder_is_complete(dec));
-    EXPECT(ob.len == 0);
+    EXPECT(wire_flow_decoder_is_complete(dec));
+    EXPECT(ob.len == sizeof(plaintext));
+    EXPECT(memcmp(out, plaintext, sizeof(plaintext)) == 0);
 
     wire_flow_decoder_destroy(dec);
 }
@@ -366,7 +366,7 @@ static void test_systematic_short_final_block_valid_len(void)
     OutBuf ob;
     uint8_t out[8192];
     WireFlowDecoder *dec;
-    unsigned char encoded[ENCODE_BLOCK];
+    unsigned char encoded[DECODE_BLOCK];
     uint8_t plaintext[97]; /* short final block */
     uint16_t valid_len = 0;
     uint16_t shard_count = 0;
@@ -403,7 +403,7 @@ static void test_systematic_short_final_block_valid_len(void)
 int main(void)
 {
     fprintf(stderr,
-            "P1b codec map: copy sys=1 d=4 p=4; block sys=0 d=4 p=4; "
+            "P1b codec map: copy sys=1 d=4 p=0; block sys=0 d=4 p=0; "
             "xor-fec sys=1 d=4 p=1; rs-fec sys=1 d=4 p=2; rs sys=1 d=k p=r\n");
 
     test_systematic_complete_without_nondata_shards_copy();

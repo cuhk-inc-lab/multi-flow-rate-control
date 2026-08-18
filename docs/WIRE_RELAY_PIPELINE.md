@@ -22,10 +22,10 @@ UDP in
   → final_dst == local_node_id?
         yes → delivery_fn (LocalDecodeHub → file); no TTL-- / egress
         no  → TTL--
-            → [optional] recode_fn            # per-datagram; NULL = opaque
+            → [optional] recode_fn            # ingress; NULL = opaque
             → [optional] decode_reencode_fn   # Phase 3A reserved; stub=OPAQUE
             → [--process cache] observe
-            → EgressQueue → sendto(next-hop)
+            → EgressQueue → [optional] egress_fn → sendto(next-hop)
 
 Local file / FIFO (--source)
   → encode → fill final_dst/ttl → relay_inject_wire_datagram
@@ -170,7 +170,9 @@ default policy is **still forward** the current packet without caching
   Hook: `RelayDecodeReencodeFn` / `--decode-reencode-stub` (always OPAQUE today).
 - **3B — true network recode:** Needs a future wire version with coding vectors.
   Do not overload `recode_fn` / `decode_reencode_fn` for 3B.
-- Per-datagram optional transform today: `recode_fn` / `--transit-hook identity`.
+- Per-datagram optional transforms today: `--transit-hook identity` copies at
+  ingress; `--transit-hook plus-minus` applies DATA payload `+1` at ingress and
+  `-1` after egress dequeue. Headers and END datagrams are unchanged.
 
 ---
 

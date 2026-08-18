@@ -26,10 +26,21 @@ typedef int (*RelayRecodeFn)(const uint8_t *in, size_t in_len,
                              uint8_t *out, size_t out_cap, size_t *out_len,
                              const WireHeader *hdr, void *ctx);
 
+/* In-place transform after EgressQueue dequeue and before send/capture. */
+typedef int (*RelayEgressFn)(uint8_t *datagram, size_t len,
+                             const WireHeader *hdr, void *ctx);
+
 /* Identity copy; available if a caller wants an explicit no-op hook. */
 int relay_recode_identity(const uint8_t *in, size_t in_len,
                           uint8_t *out, size_t out_cap, size_t *out_len,
                           const WireHeader *hdr, void *ctx);
+
+/* Case-c arithmetic: DATA payload +1 at ingress, then -1 at egress. */
+int relay_recode_payload_add1(const uint8_t *in, size_t in_len,
+                              uint8_t *out, size_t out_cap, size_t *out_len,
+                              const WireHeader *hdr, void *ctx);
+int relay_egress_payload_sub1(uint8_t *datagram, size_t len,
+                              const WireHeader *hdr, void *ctx);
 
 typedef enum {
     /* Keep current datagram on the opaque forward path. */

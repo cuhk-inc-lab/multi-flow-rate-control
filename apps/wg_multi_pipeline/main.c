@@ -299,7 +299,7 @@ static void print_usage(const char *prog)
             "  ingress -> FlowManager (split + pacing) -> raw bytes\n"
             "         -> selected codec encode -> buffer transfer -> decode -> file\n"
             "\n"
-            "Codecs: block (default, existing demo), copy (4-to-8 benchmark without arithmetic),\n"
+            "Codecs: block (default, 4-shard uniform +1/-1), copy (4-shard identity),\n"
             "        xor-fec (4 data + 1 XOR parity), rs-fec (liberasurecode RS 4+2),\n"
             "        rs (column-wise RS(n,k); default RS(6,4)), none (file/FIFO relay; --no-codec)\n"
             "RS params: --rs-k=N --rs-parity=M  or  --rs-profile=K+R  (e.g. 16+2); default 4+2.\n"

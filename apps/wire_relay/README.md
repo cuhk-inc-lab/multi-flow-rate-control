@@ -1,8 +1,7 @@
 # wire_relay
 
 Explicit-hop UDP relay for wire header **v3** (`final_dst` + `ttl`), with
-local source encode, local-destination decode, and reserved mid-hop transform
-hooks (no real recode / decode-reencode yet).
+local source encode, local-destination decode, and optional mid-hop transforms.
 
 ## Build
 
@@ -21,16 +20,18 @@ UDP in
   → final_dst == local_node_id?
         yes → [--local-decode] LocalDecodeHub / WireFlowDecoder → file
         no  → TTL--
-            → [--transit-hook identity] per-datagram recode_fn
+            → [--transit-hook identity|plus-minus] ingress transform
             → [--decode-reencode-stub] Phase 3A reserved (OPAQUE)
             → [--process cache] GenerationCache observe
-            → EgressQueue → sendto(next-hop)
+            → EgressQueue → [plus-minus: payload -1] → sendto(next-hop)
 
 Local file/FIFO
   → [--source] encode → inject → same Destination Check / transit / egress
 ```
 
-- Default mid-hop path is still **opaque forward** (no real recode yet).
+- Default mid-hop path is **opaque forward**.
+- `plus-minus` applies `+1` to each DATA payload byte before enqueue and `-1`
+  after dequeue. Headers and END datagrams are unchanged.
 - Locality is only `wire_header_is_local` / `final_dst` (never UDP/IP dst).
 - `relay_inject_wire_datagram()` accepts already-encoded wire v3 datagrams;
   `--source` is the raw file/FIFO → encoder path.
@@ -78,7 +79,7 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
   [--max-gens N] \
   [--max-gens-per-flow N] \
   [--max-cache-bytes N] \
-  [--transit-hook identity] \
+  [--transit-hook identity|plus-minus] \
   [--decode-reencode-stub] \
   [--local-decode --codec copy|xor-fec|rs-fec|rs|none \
       (--output FILE | --output-dir DIR)] \
@@ -102,7 +103,8 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--max-gens` | Global generation limit (default 256) |
 | `--max-gens-per-flow` | Per-flow generation limit (default 32) |
 | `--max-cache-bytes` | Cache memory cap (default 32MiB) |
-| `--transit-hook identity` | Install per-datagram identity `recode_fn` |
+| `--transit-hook identity` | Copy each ingress datagram through `recode_fn` |
+| `--transit-hook plus-minus` | DATA payload ingress `+1`, egress `-1`; END/header unchanged |
 | `--decode-reencode-stub` | Install Phase 3A stub (always OPAQUE) |
 | `--local-decode` | Enable local-destination decode |
 | `--source FILE` | Local file/FIFO encode → inject |
@@ -111,6 +113,14 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--flow-id` / `--rate-mbps` | Optional source pacing |
 | `--output` | L1 single-flow output file |
 | `--output-dir` | L2 multi-flow output directory |
+
+### Relay benchmark cases
+
+- Case b (copy): sender/receiver use `--codec copy`; relay uses the default
+  opaque transit path.
+- Case c (+1/-1): sender/receiver use `--codec block`; relay adds
+  `--transit-hook plus-minus`. Sender `+1`/receiver `-1` and relay
+  ingress `+1`/egress `-1` each close independently.
 
 ### L2 sink example (VM4)
 

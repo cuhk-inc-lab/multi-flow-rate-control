@@ -1,52 +1,33 @@
 #include "block_codec.h"
 #include "stream_config.h"
 
-#include <string.h>
-
 static void block_encode(const Codec *self, unsigned char *data, size_t len)
 {
-    unsigned char in[DECODE_BLOCK];
+    size_t byte;
 
     (void)self;
 
-    if (len != ENCODE_BLOCK) {
+    if (data == NULL || len != DECODE_BLOCK) {
         return;
     }
 
-    memcpy(in, data, DECODE_BLOCK);
-
-    for (size_t pkg = 0; pkg < PACKAGES_PER_DECODE_BLOCK; pkg++) {
-        size_t        off_in   = pkg * PKG_SIZE;
-        size_t        off_out1 = pkg * PKG_SIZE;
-        size_t        off_out2 = (pkg + PACKAGES_PER_DECODE_BLOCK) * PKG_SIZE;
-        unsigned char add1     = (unsigned char)(pkg + 1u);
-        unsigned char add2     = (unsigned char)(pkg + 5u);
-        size_t        j;
-
-        for (j = 0; j < PKG_SIZE; j++) {
-            data[off_out1 + j] = (unsigned char)(in[off_in + j] + add1);
-            data[off_out2 + j] = (unsigned char)(in[off_in + j] + add2);
-        }
+    for (byte = 0; byte < len; byte++) {
+        data[byte] = (unsigned char)(data[byte] + 1u);
     }
 }
 
 static void block_decode(const Codec *self, unsigned char *data, size_t len)
 {
+    size_t byte;
+
     (void)self;
 
-    if (len != ENCODE_BLOCK) {
+    if (data == NULL || len != DECODE_BLOCK) {
         return;
     }
 
-    for (size_t pkg = 0; pkg < PACKAGES_PER_DECODE_BLOCK; pkg++) {
-        size_t        off_enc1 = pkg * PKG_SIZE;
-        size_t        off_out  = pkg * PKG_SIZE;
-        unsigned char sub1     = (unsigned char)(pkg + 1u);
-        size_t        j;
-
-        for (j = 0; j < PKG_SIZE; j++) {
-            data[off_out + j] = (unsigned char)(data[off_enc1 + j] - sub1);
-        }
+    for (byte = 0; byte < len; byte++) {
+        data[byte] = (unsigned char)(data[byte] - 1u);
     }
 }
 
@@ -59,7 +40,7 @@ static size_t block_input_block_size(const Codec *self)
 static size_t block_output_block_size(const Codec *self)
 {
     (void)self;
-    return ENCODE_BLOCK;
+    return DECODE_BLOCK;
 }
 
 static size_t block_data_shards(const Codec *self)
@@ -71,7 +52,7 @@ static size_t block_data_shards(const Codec *self)
 static size_t block_parity_shards(const Codec *self)
 {
     (void)self;
-    return PACKAGES_PER_ENCODE_BLOCK - PACKAGES_PER_DECODE_BLOCK;
+    return 0u;
 }
 
 static int block_is_systematic(const Codec *self)

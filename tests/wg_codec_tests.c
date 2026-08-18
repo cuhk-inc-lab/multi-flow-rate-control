@@ -16,23 +16,53 @@ static CodecRecoverStatus recover_mask(const Codec *codec, unsigned char *shards
 
 static int test_copy_codec_preserves_systematic_payload(void)
 {
-    unsigned char block[ENCODE_BLOCK];
+    const Codec  *codec = CopyCodec_get();
+    unsigned char block[DECODE_BLOCK];
     unsigned char original[DECODE_BLOCK];
     size_t        byte;
 
+    if (Codec_input_block_size(codec) != DECODE_BLOCK ||
+        Codec_output_block_size(codec) != DECODE_BLOCK ||
+        Codec_data_shards(codec) != 4u || Codec_parity_shards(codec) != 0u) {
+        return -1;
+    }
     for (byte = 0; byte < DECODE_BLOCK; byte++) {
         block[byte] = (unsigned char)(byte * 17u + 3u);
     }
     memcpy(original, block, sizeof(original));
-    memset(block + DECODE_BLOCK, 0xa5, ENCODE_BLOCK - DECODE_BLOCK);
 
-    Codec_encode(CopyCodec_get(), block, sizeof(block));
-    Codec_decode(CopyCodec_get(), block, sizeof(block));
+    Codec_encode(codec, block, sizeof(block));
+    Codec_decode(codec, block, sizeof(block));
 
-    return memcmp(block, original, sizeof(original)) == 0 &&
-           memcmp(block + DECODE_BLOCK,
-                  (unsigned char[ENCODE_BLOCK - DECODE_BLOCK]){0},
-                  ENCODE_BLOCK - DECODE_BLOCK) == 0 ? 0 : -1;
+    return memcmp(block, original, sizeof(original)) == 0 ? 0 : -1;
+}
+
+static int test_block_codec_uniform_add_subtract(void)
+{
+    const Codec  *codec = BlockCodec_get();
+    unsigned char block[DECODE_BLOCK];
+    unsigned char original[DECODE_BLOCK];
+    size_t        byte;
+
+    if (Codec_input_block_size(codec) != DECODE_BLOCK ||
+        Codec_output_block_size(codec) != DECODE_BLOCK ||
+        Codec_data_shards(codec) != 4u || Codec_parity_shards(codec) != 0u ||
+        Codec_is_systematic(codec)) {
+        return -1;
+    }
+    for (byte = 0; byte < DECODE_BLOCK; byte++) {
+        block[byte] = (unsigned char)(byte * 29u + 251u);
+    }
+    memcpy(original, block, sizeof(original));
+
+    Codec_encode(codec, block, sizeof(block));
+    for (byte = 0; byte < sizeof(block); byte++) {
+        if (block[byte] != (unsigned char)(original[byte] + 1u)) {
+            return -1;
+        }
+    }
+    Codec_decode(codec, block, sizeof(block));
+    return memcmp(block, original, sizeof(original)) == 0 ? 0 : -1;
 }
 
 static int test_xor_fec_recovers_one_shard(void)
@@ -277,6 +307,10 @@ int main(void)
         fprintf(stderr, "Copy codec test failed\n");
         return 1;
     }
+    if (test_block_codec_uniform_add_subtract() != 0) {
+        fprintf(stderr, "Block codec uniform +1/-1 test failed\n");
+        return 1;
+    }
 
     if (test_xor_fec_recovers_one_shard() != 0) {
         fprintf(stderr, "XOR FEC codec test failed\n");
@@ -308,6 +342,6 @@ int main(void)
         return 1;
     }
 
-    puts("XOR, RS FEC, and rscode RS codec tests passed");
+    puts("Copy, block, XOR, RS FEC, and rscode RS codec tests passed");
     return 0;
 }

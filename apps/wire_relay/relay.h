@@ -22,7 +22,7 @@
  *           no  → TTL--
  *               → [optional] recode_fn (per-datagram; NULL = opaque)
  *               → [optional] decode_reencode_fn (Phase 3A reserved; stub OPAQUE)
- *               → EgressQueue → sendto(next-hop)
+ *               → EgressQueue → [optional] egress_fn → sendto(next-hop)
  *
  *   Local file/FIFO (optional LocalSourceConfig)
  *     → encode → fill final_dst/ttl → relay_inject_wire_datagram
@@ -99,6 +99,12 @@ typedef struct RelayConfig {
      */
     RelayRecodeFn       recode_fn;
     void               *recode_ctx;
+    /*
+     * Optional in-place transform after EgressQueue dequeue, immediately
+     * before capture/sendto. Case c uses this to undo its ingress +1.
+     */
+    RelayEgressFn       egress_fn;
+    void               *egress_ctx;
     /*
      * Reserved Phase 3A generation-level decode-and-reencode hook
      * (default NULL = not called). Stub: relay_decode_reencode_stub.

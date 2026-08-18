@@ -39,8 +39,8 @@ def codec_geometry(codec: str, data_k: int, parity_r: int) -> tuple[int, int]:
     if codec == "rs":
         return data_k + parity_r, data_k * pkg
     if codec in ("copy", "block"):
-        return 8, 4 * pkg
-    return 8, 4 * pkg
+        return 4, 4 * pkg
+    return 4, 4 * pkg
 
 
 def compute(
