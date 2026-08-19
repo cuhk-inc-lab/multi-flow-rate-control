@@ -30,7 +30,8 @@
  *     window. Also skip a missing/FAILED head or an ACTIVE head with fewer
  *     than k shards as soon as a later group is already RECOVERED, so HOL
  *     does not wait for END or a full window. Optionally write systematic
- *     data shards that arrived, then emit later RECOVERED groups in order.
+ *     (or independently invertible, e.g. block after -1) data shards that
+ *     arrived, then emit later RECOVERED groups in order.
  *     Hash is expected to FAIL; use skip/byte gap metrics.
  */
 

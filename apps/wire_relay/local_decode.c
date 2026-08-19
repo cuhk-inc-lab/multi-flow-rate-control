@@ -187,7 +187,7 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
     if (hub->codec == NULL) {
         goto fail;
     }
-    if (cfg->best_effort && !Codec_is_systematic(hub->codec)) {
+    if (cfg->best_effort && !Codec_allows_best_effort(hub->codec)) {
         goto fail;
     }
     hub->best_effort = cfg->best_effort;

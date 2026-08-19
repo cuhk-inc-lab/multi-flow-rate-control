@@ -36,6 +36,9 @@ typedef struct CodecVTable {
     size_t (*data_shards)(const Codec *self);
     size_t (*parity_shards)(const Codec *self);
     int (*is_systematic)(const Codec *self);
+    /* Optional. NULL => same as is_systematic. block sets this so +1/-1
+     * can skip HOL in --best-effort without treating wire bytes as plaintext. */
+    int (*allows_best_effort)(const Codec *self);
     CodecRecoverStatus (*recover)(const Codec *self,
                                   unsigned char *shards,
                                   const uint8_t *present_bits,
@@ -106,6 +109,7 @@ size_t Codec_output_block_size(const Codec *codec);
 size_t Codec_data_shards(const Codec *codec);
 size_t Codec_parity_shards(const Codec *codec);
 int Codec_is_systematic(const Codec *codec);
+int Codec_allows_best_effort(const Codec *codec);
 CodecRecoverStatus Codec_recover(const Codec *codec,
                                  unsigned char *shards,
                                  const uint8_t *present_bits,

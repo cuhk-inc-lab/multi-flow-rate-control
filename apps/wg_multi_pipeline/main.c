@@ -311,7 +311,8 @@ static void print_usage(const char *prog)
             "\n"
             "Wire UDP modes use group/shard headers and support cross-host transfer.\n"
             "--udp-recv defaults to --best-effort (skip unrecoverable groups).\n"
-            "Use --strict for hash/cmp-complete transfers. Non-systematic codecs stay strict.\n"
+            "Use --strict for hash/cmp-complete transfers. Codecs that do not allow\n"
+            "best-effort stay strict. block allows best-effort (decode present shards).\n"
             "Verify output: cmp <input.ts> <output.ts>\n",
             prog, prog, prog, prog, prog, prog, prog);
 }
@@ -884,9 +885,9 @@ int main(int argc, char **argv)
         if (cfg.best_effort) {
             const Codec *recv_codec = Codec_get(codec_kind);
 
-            if (recv_codec != NULL && !Codec_is_systematic(recv_codec)) {
+            if (recv_codec != NULL && !Codec_allows_best_effort(recv_codec)) {
                 fprintf(stderr,
-                        "udp-recv: best-effort needs a systematic codec; using strict\n");
+                        "udp-recv: best-effort not supported for this codec; using strict\n");
                 cfg.best_effort = 0;
             }
         }

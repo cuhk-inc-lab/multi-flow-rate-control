@@ -136,6 +136,17 @@ int Codec_is_systematic(const Codec *codec)
     return codec->vtable->is_systematic(codec);
 }
 
+int Codec_allows_best_effort(const Codec *codec)
+{
+    if (codec == NULL || codec->vtable == NULL) {
+        return 0;
+    }
+    if (codec->vtable->allows_best_effort != NULL) {
+        return codec->vtable->allows_best_effort(codec);
+    }
+    return Codec_is_systematic(codec);
+}
+
 CodecRecoverStatus Codec_recover(const Codec *codec,
                                  unsigned char *shards,
                                  const uint8_t *present_bits,

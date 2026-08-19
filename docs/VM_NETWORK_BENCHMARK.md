@@ -48,7 +48,9 @@ in the former reserved bytes. They support the following codecs:
 - `copy`: four input shards copied unchanged to four wire shards; no
   redundancy or arithmetic.
 - `block`: four input shards transformed byte-wise with uniform `+1`; decode
-  applies uniform `-1`. It has the same 4-to-4 geometry as `copy`.
+  applies uniform `-1`. Same 4-to-4 geometry as `copy`. Not systematic, but
+  `--best-effort` is allowed: skip stuck groups and write decoded present
+  shards (do not emit raw `+1` bytes).
 - `xor-fec`: four data shards plus one XOR parity shard. The receiver restores
   one missing shard; `--best-effort` writes available data shards from groups
   that still cannot be recovered after the idle timeout.

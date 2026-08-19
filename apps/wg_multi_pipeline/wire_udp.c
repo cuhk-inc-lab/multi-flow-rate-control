@@ -1170,7 +1170,7 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     if (codec == NULL) {
         goto cleanup;
     }
-    if (config->best_effort && !Codec_is_systematic(codec)) {
+    if (config->best_effort && !Codec_allows_best_effort(codec)) {
         goto cleanup;
     }
     input_size = Codec_input_block_size(codec);
