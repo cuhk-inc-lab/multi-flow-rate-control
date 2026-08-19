@@ -491,6 +491,16 @@ int RsCodec_avx2_available(void)
     return rs_gf256_avx2_available();
 }
 
+int RsCodec_ssse3_available(void)
+{
+    return rs_gf256_ssse3_available();
+}
+
+int RsCodec_simd_available(void)
+{
+    return rs_gf256_simd_available();
+}
+
 void RsCodec_set_simd_enabled_for_tests(int enabled)
 {
     rs_simd_enabled = enabled != 0;
@@ -722,9 +732,9 @@ static void rs_encode_general_table(unsigned char *data, const RsEncodePlan *pla
 }
 
 /*
- * AVX2 general path for arbitrary fixed (k,r). Source bytes are split into
- * nibbles and multiplied through 16-byte shuffle tables. The AVX2 object is
- * entered only after the runtime CPU/OS capability check succeeds.
+ * SIMD general path for arbitrary fixed (k,r). Source bytes are split into
+ * nibbles and multiplied through 16-byte shuffle tables. Dispatch prefers
+ * AVX2, then SSSE3 (i7-3770 / Ivy Bridge), then scalar.
  */
 static void rs_encode_general_simd(unsigned char *data,
                                    const RsEncodePlan *plan)
@@ -736,7 +746,7 @@ static void rs_encode_general_simd(unsigned char *data,
 
     memset(data + k * shard_bytes, 0, r * shard_bytes);
     for (column = 0; column < k; column++) {
-        rs_gf256_encode_column_avx2(
+        rs_gf256_encode_column(
             data + k * shard_bytes, shard_bytes,
             data + column * shard_bytes,
             plan->nibble_table + column * 32u, k * 32u, r, shard_bytes);
@@ -838,7 +848,7 @@ static void rs_encode(const Codec *self, unsigned char *data, size_t len)
                rs_encode_impl == RS_ENCODE_FAST_16_2;
     use_simd = !use_legacy && !use_rscode_4_2 && !use_fast &&
                rs_simd_enabled && plan->has_nibble_table &&
-               rs_gf256_avx2_available() &&
+               rs_gf256_simd_available() &&
                (rs_encode_impl == RS_ENCODE_AUTO ||
                 rs_encode_impl == RS_ENCODE_SIMD);
 

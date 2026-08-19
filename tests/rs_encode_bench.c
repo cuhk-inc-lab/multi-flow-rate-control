@@ -293,6 +293,8 @@ int main(int argc, char **argv)
 
         printf("suite=1\n");
         printf("avx2_available=%d\n", RsCodec_avx2_available());
+        printf("ssse3_available=%d\n", RsCodec_ssse3_available());
+        printf("simd_available=%d\n", RsCodec_simd_available());
         printf("metric_notes=source_MB/s is aggregate across all flows "
                "(total input bytes / wall-clock); "
                "ns_per_block_* is mean over encode_calls "
@@ -366,6 +368,8 @@ int main(int argc, char **argv)
     printf("geometry=k=%zu,r=%zu,n=%zu\n", cfg.k, cfg.r, n);
     printf("implementation=%s\n", cfg.impl_name);
     printf("avx2_available=%d\n", RsCodec_avx2_available());
+    printf("ssse3_available=%d\n", RsCodec_ssse3_available());
+    printf("simd_available=%d\n", RsCodec_simd_available());
     printf("shard_bytes=%u\n", (unsigned)PKG_SIZE);
     printf("blocks=%u\n", cfg.blocks);
     printf("flows=%u\n", cfg.flows);

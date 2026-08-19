@@ -96,21 +96,23 @@ Encode workers must start only after configuration.
 
 | Geometry | Default (`AUTO`) path |
 | --- | --- |
-| any `(k,r)` on AVX2 x86 | general AVX2 nibble-shuffle |
-| any `(k,r)` without AVX2 | optimized general scalar table |
+| any `(k,r)` on AVX2 x86 | general AVX2 nibble-shuffle (32 bytes/step) |
+| any `(k,r)` on SSSE3 x86 without AVX2 | general SSSE3 nibble-shuffle (16 bytes/step; e.g. i7-3770) |
+| any `(k,r)` without SSSE3 | optimized general scalar table |
 
 Reference / verification only (not AUTO):
 
 - `RS_ENCODE_GENERAL` — force scalar table encode for any geometry
-- `RS_ENCODE_SIMD` — request AVX2, safely falling back to scalar
+- `RS_ENCODE_SIMD` — request SIMD (AVX2, else SSSE3), safely falling back to scalar
 - `RS_ENCODE_FAST_16_2` — historical specialized scalar `16+2` path
 - `RS_ENCODE_LEGACY` — byte-wise `gmult` against plan coeffs
 - `RS_ENCODE_RSCODE` — hqm `encode_data` for `4+2` only (holds `rs_lock`)
 
 `RsCodec_set_encode_impl()` can force these paths for tests and
-`rs_encode_bench`. The AVX2 code is compiled in a separate object and entered
-only after a runtime CPU/OS capability check; the rest of the binary does not
-require AVX2.
+`rs_encode_bench`. AVX2 and SSSE3 kernels are compiled in separate objects and
+entered only after a runtime CPUID check; the rest of the binary does not
+require those instruction sets. AVX 1.0 is not used: integer 256-bit shuffle
+needs AVX2. Ivy Bridge CPUs such as i7-3770 therefore take the SSSE3 path.
 
 The SIMD kernel uses two 16-byte shuffle tables per coefficient. It does not
 use GFNI directly: this codec's GF(256) polynomial is `0x11d` (`PPOLY=0x1d`),

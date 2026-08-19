@@ -177,7 +177,7 @@ static int test_rs_fast_path_fallback_geometries(void)
         fill_prefix(block, 4u * PKG_SIZE, 0x42u);
         Codec_encode(RsCodec_get(), block, sizeof(block));
         EXPECT(RsCodec_last_encode_impl() ==
-               (RsCodec_avx2_available() ? RS_ENCODE_SIMD
+               (RsCodec_simd_available() ? RS_ENCODE_SIMD
                                          : RS_ENCODE_GENERAL));
     }
     EXPECT(roundtrip_recover(4u, 2u, (1ull << 1) | (1ull << 4)) == 0);
@@ -192,7 +192,7 @@ static int test_rs_fast_path_fallback_geometries(void)
         RsCodec_set_encode_impl(RS_ENCODE_AUTO);
         Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
         EXPECT(RsCodec_last_encode_impl() ==
-               (RsCodec_avx2_available() ? RS_ENCODE_SIMD
+               (RsCodec_simd_available() ? RS_ENCODE_SIMD
                                          : RS_ENCODE_GENERAL));
         free(block);
     }
@@ -208,7 +208,7 @@ static int test_rs_fast_path_fallback_geometries(void)
         RsCodec_set_encode_impl(RS_ENCODE_AUTO);
         Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
         EXPECT(RsCodec_last_encode_impl() ==
-               (RsCodec_avx2_available() ? RS_ENCODE_SIMD
+               (RsCodec_simd_available() ? RS_ENCODE_SIMD
                                          : RS_ENCODE_GENERAL));
         free(block);
     }

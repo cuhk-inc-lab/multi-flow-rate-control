@@ -84,12 +84,12 @@ static int test_one_geometry_bit_exact(size_t k, size_t r, unsigned seed)
 
     encode_copy(RS_ENCODE_SIMD, simd, source, block_bytes);
     EXPECT(RsCodec_last_encode_impl() ==
-           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+           (RsCodec_simd_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     EXPECT(memcmp(legacy, simd, block_bytes) == 0);
 
     encode_copy(RS_ENCODE_AUTO, auto_buf, source, block_bytes);
     EXPECT(RsCodec_last_encode_impl() ==
-           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+           (RsCodec_simd_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     EXPECT(memcmp(legacy, auto_buf, block_bytes) == 0);
 
     if (k == 4u && r == 2u) {
@@ -148,7 +148,7 @@ static int cmp_general_vs_rscode_block(const unsigned char *source,
     RsCodec_reset_encode_stats();
     encode_copy(RS_ENCODE_AUTO, auto_buf, source, block_bytes);
     EXPECT(RsCodec_last_encode_impl() ==
-           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+           (RsCodec_simd_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     EXPECT(memcmp(auto_buf, rscode, block_bytes) == 0);
     RsCodec_get_encode_stats(&stats);
     EXPECT(stats.lock_wait_ns == 0ull);
@@ -284,7 +284,7 @@ static int test_rs_4_2_general_vs_rscode_bit_exact(void)
         /* Same recover after AUTO encode (SIMD where available). */
         encode_copy(RS_ENCODE_AUTO, encoded, source, block_bytes);
         EXPECT(RsCodec_last_encode_impl() ==
-               (RsCodec_avx2_available() ? RS_ENCODE_SIMD
+               (RsCodec_simd_available() ? RS_ENCODE_SIMD
                                          : RS_ENCODE_GENERAL));
         EXPECT(recover_drop_count(encoded, k, r, 1u, 0xD303u) == 0);
         EXPECT(recover_drop_count(encoded, k, r, 2u, 0xD404u) == 0);
@@ -537,7 +537,7 @@ static int test_rs_fast_path_fallback(void)
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
     EXPECT(RsCodec_last_encode_impl() ==
-           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+           (RsCodec_simd_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     free(block);
 
     EXPECT(RsCodec_set_params(4u, 2u) == 0);
@@ -548,7 +548,7 @@ static int test_rs_fast_path_fallback(void)
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
     EXPECT(RsCodec_last_encode_impl() ==
-           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+           (RsCodec_simd_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     free(block);
 
     EXPECT(RsCodec_set_params(8u, 4u) == 0);
@@ -559,7 +559,7 @@ static int test_rs_fast_path_fallback(void)
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
     EXPECT(RsCodec_last_encode_impl() ==
-           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+           (RsCodec_simd_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     free(block);
 
     EXPECT(RsCodec_set_params(16u, 2u) == 0);

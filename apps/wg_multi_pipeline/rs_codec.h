@@ -61,10 +61,10 @@ uint64_t RsCodec_matrix_init_ns(void);
 
 /*
  * Encode implementation selection (tests / rs_encode_bench only).
- * AUTO: AVX2 nibble-shuffle for any geometry when available, otherwise
- *       optimized general scalar table plan.
+ * AUTO: SIMD nibble-shuffle for any geometry when AVX2 or SSSE3 is
+ *       available, otherwise optimized general scalar table plan.
  * GENERAL: force optimized scalar plan/table path for any geometry.
- * SIMD: use AVX2 when available, otherwise safely fall back to GENERAL.
+ * SIMD: use AVX2, else SSSE3, otherwise safely fall back to GENERAL.
  * FAST_16_2: require k=16,r=2 specialized path (else GENERAL).
  * LEGACY: reference byte-wise gmult against published plan coeffs.
  * RSCODE: explicit hqm/rscode encode_data for 4+2 only (locked; reference).
@@ -106,6 +106,8 @@ int RsCodec_encode_plan_ready(void);
 int RsCodec_encode_plan_has_mul_table(void);
 int RsCodec_encode_plan_has_nibble_table(void);
 int RsCodec_avx2_available(void);
+int RsCodec_ssse3_available(void);
+int RsCodec_simd_available(void);
 /* Test/benchmark hook; set before starting encode workers. */
 void RsCodec_set_simd_enabled_for_tests(int enabled);
 void RsCodec_get_encode_plan_geometry(size_t *k, size_t *r, size_t *n,
