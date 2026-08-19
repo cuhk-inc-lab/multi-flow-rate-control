@@ -88,25 +88,34 @@ Recover uses the process-fixed matrix for the configured `(k, r)`.
 ### Encode plan / hot path
 
 Startup (`RsCodec_set_params` / default init) publishes an immutable
-`RsEncodePlan` (generator coeffs + optional `r×k×256` mul table, capped at
-`RS_ENCODE_MUL_TABLE_MAX_BYTES`). For default `4+2`, parity coeffs are
-extracted once from hqm/rscode `encode_data` on unit vectors so the table
-path stays bit-exact with historical wire parity. Encode workers must start
-only after configuration.
+`RsEncodePlan`: generator coefficients, an optional `r×k×256` scalar
+multiplication table, and an `r×k×32` nibble table for SIMD. For default
+`4+2`, parity coefficients are extracted once from hqm/rscode `encode_data`
+on unit vectors, so every path stays bit-exact with historical wire parity.
+Encode workers must start only after configuration.
 
 | Geometry | Default (`AUTO`) path |
 | --- | --- |
-| `4+2` | optimized general table (unlocked; bit-exact vs rscode) |
-| `16+2` | specialized dual-parity table scan |
-| other `(k,r)` | optimized general table |
+| any `(k,r)` on AVX2 x86 | general AVX2 nibble-shuffle |
+| any `(k,r)` without AVX2 | optimized general scalar table |
 
 Reference / verification only (not AUTO):
 
+- `RS_ENCODE_GENERAL` — force scalar table encode for any geometry
+- `RS_ENCODE_SIMD` — request AVX2, safely falling back to scalar
+- `RS_ENCODE_FAST_16_2` — historical specialized scalar `16+2` path
 - `RS_ENCODE_LEGACY` — byte-wise `gmult` against plan coeffs
 - `RS_ENCODE_RSCODE` — hqm `encode_data` for `4+2` only (holds `rs_lock`)
 
-`RsCodec_set_encode_impl()` can force `GENERAL` / `FAST_16_2` / `LEGACY` /
-`RSCODE` for tests and `rs_encode_bench`.
+`RsCodec_set_encode_impl()` can force these paths for tests and
+`rs_encode_bench`. The AVX2 code is compiled in a separate object and entered
+only after a runtime CPU/OS capability check; the rest of the binary does not
+require AVX2.
+
+The SIMD kernel uses two 16-byte shuffle tables per coefficient. It does not
+use GFNI directly: this codec's GF(256) polynomial is `0x11d` (`PPOLY=0x1d`),
+while GFNI multiplication uses the AES `0x11b` field. Direct GFNI use would
+change parity bytes and break wire compatibility.
 
 ### CLI
 

@@ -216,6 +216,12 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--impl=general") == 0) {
             cfg.impl = RS_ENCODE_GENERAL;
             cfg.impl_name = "general";
+        } else if (strcmp(argv[i], "--impl=scalar") == 0) {
+            cfg.impl = RS_ENCODE_GENERAL;
+            cfg.impl_name = "scalar";
+        } else if (strcmp(argv[i], "--impl=simd") == 0) {
+            cfg.impl = RS_ENCODE_SIMD;
+            cfg.impl_name = "simd";
         } else if (strcmp(argv[i], "--impl=legacy") == 0) {
             cfg.impl = RS_ENCODE_LEGACY;
             cfg.impl_name = "legacy";
@@ -233,7 +239,8 @@ int main(int argc, char **argv)
         } else {
             fprintf(stderr,
                     "usage: %s [--k=16] [--r=2] [--blocks=N] [--flows=N] "
-                    "[--trials=N] [--impl=legacy|rscode|general|fast|auto] "
+                    "[--trials=N] "
+                    "[--impl=legacy|rscode|general|scalar|simd|fast|auto] "
                     "[--suite]\n"
                     "metrics: source_MB/s = aggregate across all flows "
                     "(total k*PKG_SIZE*blocks*flows / wall-clock);\n"
@@ -277,10 +284,15 @@ int main(int argc, char **argv)
             {8, 4, RS_ENCODE_LEGACY, "legacy", 1},
             {8, 4, RS_ENCODE_GENERAL, "general", 1},
             {8, 4, RS_ENCODE_GENERAL, "general", 8},
+            {16, 6, RS_ENCODE_GENERAL, "scalar", 1},
+            {16, 6, RS_ENCODE_SIMD, "simd", 1},
+            {16, 6, RS_ENCODE_AUTO, "auto", 1},
+            {16, 6, RS_ENCODE_SIMD, "simd", 8},
         };
         size_t ci;
 
         printf("suite=1\n");
+        printf("avx2_available=%d\n", RsCodec_avx2_available());
         printf("metric_notes=source_MB/s is aggregate across all flows "
                "(total input bytes / wall-clock); "
                "ns_per_block_* is mean over encode_calls "
@@ -353,6 +365,7 @@ int main(int argc, char **argv)
 
     printf("geometry=k=%zu,r=%zu,n=%zu\n", cfg.k, cfg.r, n);
     printf("implementation=%s\n", cfg.impl_name);
+    printf("avx2_available=%d\n", RsCodec_avx2_available());
     printf("shard_bytes=%u\n", (unsigned)PKG_SIZE);
     printf("blocks=%u\n", cfg.blocks);
     printf("flows=%u\n", cfg.flows);
@@ -366,7 +379,8 @@ int main(int argc, char **argv)
         printf("trial[%u]: elapsed_ms=%.3f throughput_MBps=%.2f "
                "encode_calls=%llu rebuild_calls=%llu "
                "lock_wait_ns=%llu lock_hold_ns=%llu body_ns=%llu "
-               "general_calls=%llu fast_calls=%llu legacy_calls=%llu "
+               "general_calls=%llu simd_calls=%llu fast_calls=%llu "
+               "legacy_calls=%llu "
                "last_impl=%d\n",
                t, elapsed[t], throughputs[t],
                (unsigned long long)stats[t].encode_calls,
@@ -375,6 +389,7 @@ int main(int argc, char **argv)
                (unsigned long long)stats[t].lock_hold_ns,
                (unsigned long long)stats[t].encode_body_ns,
                (unsigned long long)stats[t].general_path_calls,
+               (unsigned long long)stats[t].simd_path_calls,
                (unsigned long long)stats[t].fast_path_calls,
                (unsigned long long)stats[t].legacy_path_calls,
                (int)RsCodec_last_encode_impl());

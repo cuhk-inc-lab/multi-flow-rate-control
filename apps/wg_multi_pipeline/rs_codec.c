@@ -1,4 +1,5 @@
 #include "rs_codec.h"
+#include "rs_gf256_simd.h"
 
 #include "stream_config.h"
 
@@ -14,8 +15,8 @@
 /*
  * Column-wise systematic RS(n,k). Default RS(6,4) extracts parity coefficients
  * from hqm/rscode encode_data (unit vectors) into an immutable RsEncodePlan so
- * AUTO/GENERAL table encode stays bit-exact with historical rscode wire bytes.
- * Other (k,r) use a Cauchy generator + the same table plan.
+ * scalar and SIMD plan encoders stay bit-exact with historical rscode wire
+ * bytes. Other (k,r) use a Cauchy generator + the same immutable plan.
  *
  * Threading contract: finish RsCodec_set_params() before starting encode
  * workers. set_params must not run concurrently with encode. The published
@@ -47,7 +48,13 @@ typedef struct RsEncodePlan {
      * == gmult(coeff[k+j][i], x). NULL when r*k*256 exceeds the cap.
      */
     uint8_t *mul_table;
+    /*
+     * SIMD table: 32 bytes per coefficient. First 16 entries multiply low
+     * nibbles; the next 16 multiply high nibbles shifted by four bits.
+     */
+    uint8_t *nibble_table;
     int has_mul_table;
+    int has_nibble_table;
     int initialized;
 } RsEncodePlan;
 
@@ -65,6 +72,7 @@ static RsEncodePlan    rs_encode_plan;
 static RsEncodeImpl    rs_encode_impl = RS_ENCODE_AUTO;
 static RsEncodeImpl    rs_last_encode_impl = RS_ENCODE_GENERAL;
 static RsEncodeStats   rs_encode_stats;
+static int             rs_simd_enabled = 1;
 
 /* CLI RS(16,2): k=16 data, r=2 parity, n=18. */
 #define RS_FAST_K 16u
@@ -263,6 +271,7 @@ static void rs_encode_plan_clear(RsEncodePlan *plan)
         return;
     }
     free(plan->mul_table);
+    free(plan->nibble_table);
     memset(plan, 0, sizeof(*plan));
 }
 
@@ -289,6 +298,7 @@ static int rs_encode_plan_build(RsEncodePlan *plan, size_t k, size_t r)
 {
     size_t n = k + r;
     size_t table_bytes = 0;
+    size_t nibble_bytes;
     size_t row;
     size_t column;
     size_t x;
@@ -306,6 +316,12 @@ static int rs_encode_plan_build(RsEncodePlan *plan, size_t k, size_t r)
     memcpy(plan->coeff, rs_generator, sizeof(plan->coeff));
 
     if (rs_encode_mul_table_bytes(k, r, &table_bytes) != 0) {
+        rs_encode_plan_clear(plan);
+        return -1;
+    }
+    nibble_bytes = table_bytes / 8u;
+    plan->nibble_table = malloc(nibble_bytes);
+    if (plan->nibble_table == NULL) {
         rs_encode_plan_clear(plan);
         return -1;
     }
@@ -334,6 +350,19 @@ static int rs_encode_plan_build(RsEncodePlan *plan, size_t k, size_t r)
         plan->has_mul_table = 0;
     }
 
+    for (row = 0; row < r; row++) {
+        for (column = 0; column < k; column++) {
+            unsigned char coeff = plan->coeff[k + row][column];
+            uint8_t *slot =
+                plan->nibble_table + ((row * k + column) * 32u);
+
+            for (x = 0; x < 16u; x++) {
+                slot[x] = rs_gf_mul_table[coeff][x];
+                slot[16u + x] = rs_gf_mul_table[coeff][x << 4u];
+            }
+        }
+    }
+    plan->has_nibble_table = 1;
     plan->initialized = 1;
     return 0;
 }
@@ -388,6 +417,7 @@ uint64_t RsCodec_matrix_init_ns(void)
 void RsCodec_set_encode_impl(RsEncodeImpl impl)
 {
     if (impl == RS_ENCODE_AUTO || impl == RS_ENCODE_GENERAL ||
+        impl == RS_ENCODE_SIMD ||
         impl == RS_ENCODE_FAST_16_2 || impl == RS_ENCODE_LEGACY ||
         impl == RS_ENCODE_RSCODE) {
         rs_encode_impl = impl;
@@ -449,6 +479,21 @@ int RsCodec_encode_plan_ready(void)
 int RsCodec_encode_plan_has_mul_table(void)
 {
     return rs_encode_plan.initialized && rs_encode_plan.has_mul_table;
+}
+
+int RsCodec_encode_plan_has_nibble_table(void)
+{
+    return rs_encode_plan.initialized && rs_encode_plan.has_nibble_table;
+}
+
+int RsCodec_avx2_available(void)
+{
+    return rs_gf256_avx2_available();
+}
+
+void RsCodec_set_simd_enabled_for_tests(int enabled)
+{
+    rs_simd_enabled = enabled != 0;
 }
 
 void RsCodec_get_encode_plan_geometry(size_t *k, size_t *r, size_t *n,
@@ -676,6 +721,30 @@ static void rs_encode_general_table(unsigned char *data, const RsEncodePlan *pla
                     (uint64_t)shard_bytes * (uint64_t)k * (uint64_t)r);
 }
 
+/*
+ * AVX2 general path for arbitrary fixed (k,r). Source bytes are split into
+ * nibbles and multiplied through 16-byte shuffle tables. The AVX2 object is
+ * entered only after the runtime CPU/OS capability check succeeds.
+ */
+static void rs_encode_general_simd(unsigned char *data,
+                                   const RsEncodePlan *plan)
+{
+    size_t k = plan->k;
+    size_t r = plan->r;
+    size_t shard_bytes = plan->shard_bytes;
+    size_t column;
+
+    memset(data + k * shard_bytes, 0, r * shard_bytes);
+    for (column = 0; column < k; column++) {
+        rs_gf256_encode_column_avx2(
+            data + k * shard_bytes, shard_bytes,
+            data + column * shard_bytes,
+            plan->nibble_table + column * 32u, k * 32u, r, shard_bytes);
+    }
+    rs_stat_add_u64(&rs_encode_stats.gmul_calls,
+                    (uint64_t)shard_bytes * (uint64_t)k * (uint64_t)r);
+}
+
 static int rs_geometry_is_fast_16_2(size_t k, size_t r, size_t len)
 {
     return k == RS_FAST_K && r == RS_FAST_R && len == RS_FAST_N * PKG_SIZE &&
@@ -734,6 +803,7 @@ static void rs_encode(const Codec *self, unsigned char *data, size_t len)
     size_t n;
     int use_rscode_4_2;
     int use_fast;
+    int use_simd;
     int use_legacy;
 
     (void)self;
@@ -760,16 +830,17 @@ static void rs_encode(const Codec *self, unsigned char *data, size_t len)
     }
 
     use_legacy = (rs_encode_impl == RS_ENCODE_LEGACY);
-    /* Explicit reference only — AUTO default 4+2 uses unlocked general table. */
+    /* Explicit reference only — AUTO paths remain unlocked. */
     use_rscode_4_2 = (rs_encode_impl == RS_ENCODE_RSCODE) &&
                      (k == 4u && r == 2u && plan->shard_bytes == PKG_SIZE);
     use_fast = !use_legacy && !use_rscode_4_2 &&
                rs_geometry_is_fast_16_2(k, r, len) &&
+               rs_encode_impl == RS_ENCODE_FAST_16_2;
+    use_simd = !use_legacy && !use_rscode_4_2 && !use_fast &&
+               rs_simd_enabled && plan->has_nibble_table &&
+               rs_gf256_avx2_available() &&
                (rs_encode_impl == RS_ENCODE_AUTO ||
-                rs_encode_impl == RS_ENCODE_FAST_16_2);
-    if (rs_encode_impl == RS_ENCODE_GENERAL) {
-        use_fast = 0;
-    }
+                rs_encode_impl == RS_ENCODE_SIMD);
 
     if (use_rscode_4_2) {
         wait_start = monotonic_nanoseconds();
@@ -805,8 +876,12 @@ static void rs_encode(const Codec *self, unsigned char *data, size_t len)
         rs_encode_16_2_fast(data, plan);
         rs_last_encode_impl = RS_ENCODE_FAST_16_2;
         rs_stat_add_u64(&rs_encode_stats.fast_path_calls, 1ull);
+    } else if (use_simd) {
+        rs_encode_general_simd(data, plan);
+        rs_last_encode_impl = RS_ENCODE_SIMD;
+        rs_stat_add_u64(&rs_encode_stats.simd_path_calls, 1ull);
     } else {
-        /* AUTO (incl. default 4+2) and GENERAL — unlocked table path. */
+        /* GENERAL, or AUTO/SIMD on a CPU without AVX2. */
         rs_encode_general_table(data, plan);
         rs_last_encode_impl = RS_ENCODE_GENERAL;
         rs_stat_add_u64(&rs_encode_stats.general_path_calls, 1ull);
