@@ -55,6 +55,7 @@ static int test_one_geometry_bit_exact(size_t k, size_t r, unsigned seed)
     unsigned char *source;
     unsigned char *legacy;
     unsigned char *general;
+    unsigned char *simd;
     unsigned char *auto_buf;
     size_t pk;
     size_t pr;
@@ -69,8 +70,9 @@ static int test_one_geometry_bit_exact(size_t k, size_t r, unsigned seed)
     source = calloc(1, block_bytes);
     legacy = calloc(1, block_bytes);
     general = calloc(1, block_bytes);
+    simd = calloc(1, block_bytes);
     auto_buf = calloc(1, block_bytes);
-    EXPECT(source && legacy && general && auto_buf);
+    EXPECT(source && legacy && general && simd && auto_buf);
 
     fill_prefix(source, input_bytes, seed);
     encode_copy(RS_ENCODE_LEGACY, legacy, source, block_bytes);
@@ -80,13 +82,14 @@ static int test_one_geometry_bit_exact(size_t k, size_t r, unsigned seed)
     EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
     EXPECT(memcmp(legacy, general, block_bytes) == 0);
 
+    encode_copy(RS_ENCODE_SIMD, simd, source, block_bytes);
+    EXPECT(RsCodec_last_encode_impl() ==
+           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
+    EXPECT(memcmp(legacy, simd, block_bytes) == 0);
+
     encode_copy(RS_ENCODE_AUTO, auto_buf, source, block_bytes);
-    if (k == 16u && r == 2u) {
-        EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_FAST_16_2);
-    } else {
-        /* AUTO including default 4+2 uses unlocked general table path. */
-        EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
-    }
+    EXPECT(RsCodec_last_encode_impl() ==
+           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     EXPECT(memcmp(legacy, auto_buf, block_bytes) == 0);
 
     if (k == 4u && r == 2u) {
@@ -102,6 +105,7 @@ static int test_one_geometry_bit_exact(size_t k, size_t r, unsigned seed)
     free(source);
     free(legacy);
     free(general);
+    free(simd);
     free(auto_buf);
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     return 0;
@@ -110,9 +114,12 @@ static int test_one_geometry_bit_exact(size_t k, size_t r, unsigned seed)
 static int test_rs_general_table_path_bit_exact(void)
 {
     EXPECT(test_one_geometry_bit_exact(4u, 2u, 0x1111u) == 0);
+    EXPECT(test_one_geometry_bit_exact(4u, 1u, 0x1212u) == 0);
     EXPECT(test_one_geometry_bit_exact(8u, 2u, 0x2222u) == 0);
     EXPECT(test_one_geometry_bit_exact(16u, 2u, 0x3333u) == 0);
     EXPECT(test_one_geometry_bit_exact(8u, 4u, 0x4444u) == 0);
+    EXPECT(test_one_geometry_bit_exact(16u, 6u, 0x5555u) == 0);
+    EXPECT(test_one_geometry_bit_exact(32u, 2u, 0x6666u) == 0);
     return 0;
 }
 
@@ -137,16 +144,17 @@ static int cmp_general_vs_rscode_block(const unsigned char *source,
     EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_RSCODE);
     EXPECT(memcmp(general, rscode, block_bytes) == 0);
 
-    /* Sender-facing AUTO path must take general (no lock) and match rscode. */
+    /* Sender-facing AUTO path must remain unlocked and match rscode. */
     RsCodec_reset_encode_stats();
     encode_copy(RS_ENCODE_AUTO, auto_buf, source, block_bytes);
-    EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
+    EXPECT(RsCodec_last_encode_impl() ==
+           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     EXPECT(memcmp(auto_buf, rscode, block_bytes) == 0);
     RsCodec_get_encode_stats(&stats);
     EXPECT(stats.lock_wait_ns == 0ull);
     EXPECT(stats.lock_hold_ns == 0ull);
     EXPECT(stats.rscode_path_calls == 0ull);
-    EXPECT(stats.general_path_calls == 1ull);
+    EXPECT(stats.general_path_calls + stats.simd_path_calls == 1ull);
 
     free(general);
     free(rscode);
@@ -273,9 +281,11 @@ static int test_rs_4_2_general_vs_rscode_bit_exact(void)
         EXPECT(recover_drop_count(encoded, k, r, 1u, 0xD101u) == 0);
         EXPECT(recover_drop_count(encoded, k, r, 2u, 0xD202u) == 0);
 
-        /* Same recover after AUTO encode (must be general path). */
+        /* Same recover after AUTO encode (SIMD where available). */
         encode_copy(RS_ENCODE_AUTO, encoded, source, block_bytes);
-        EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
+        EXPECT(RsCodec_last_encode_impl() ==
+               (RsCodec_avx2_available() ? RS_ENCODE_SIMD
+                                         : RS_ENCODE_GENERAL));
         EXPECT(recover_drop_count(encoded, k, r, 1u, 0xD303u) == 0);
         EXPECT(recover_drop_count(encoded, k, r, 2u, 0xD404u) == 0);
         free(encoded);
@@ -301,7 +311,7 @@ static int recover_roundtrip(size_t k, size_t r, uint64_t drop_mask)
     EXPECT(RsCodec_set_params(k, r) == 0);
     fill_prefix(block, input_bytes, 0xA11Au + (unsigned)(k * 17u + r));
     memcpy(source, block, input_bytes);
-    RsCodec_set_encode_impl(RS_ENCODE_GENERAL);
+    RsCodec_set_encode_impl(RS_ENCODE_SIMD);
     Codec_encode(RsCodec_get(), block, block_bytes);
 
     codec_present_clear_all(bits, n);
@@ -326,6 +336,8 @@ static int test_rs_general_table_path_recovery_compatible(void)
     EXPECT(recover_roundtrip(4u, 2u, (1ull << 1) | (1ull << 5)) == 0);
     EXPECT(recover_roundtrip(8u, 2u, (1ull << 2) | (1ull << 9)) == 0);
     EXPECT(recover_roundtrip(16u, 2u, (1ull << 4) | (1ull << 17)) == 0);
+    EXPECT(recover_roundtrip(16u, 6u, (1ull << 2) | (1ull << 19) |
+                                         (1ull << 21)) == 0);
     EXPECT(recover_roundtrip(8u, 4u, (1ull << 1) | (1ull << 3) | (1ull << 10) |
                                          (1ull << 11)) == 0);
     return 0;
@@ -363,6 +375,75 @@ static int test_rs_general_table_path_short_block(void)
     return 0;
 }
 
+static int test_rs_simd_shard_byte_boundaries(void)
+{
+    static const size_t sizes[] = {
+        1u, 15u, 16u, 17u, 31u, 32u, 33u, 1300u, 1399u, 1400u, 1401u
+    };
+    size_t si;
+
+    for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
+        const size_t k = 16u;
+        const size_t r = 6u;
+        size_t block_bytes = (k + r) * sizes[si];
+        size_t input_bytes = k * sizes[si];
+        unsigned pattern;
+
+        EXPECT(RsCodec_set_params_ex(k, r, sizes[si]) == 0);
+        EXPECT(RsCodec_encode_plan_has_nibble_table());
+        for (pattern = 0; pattern < 3u; pattern++) {
+            unsigned char *source = calloc(1, block_bytes);
+            unsigned char *legacy = calloc(1, block_bytes);
+            unsigned char *simd = calloc(1, block_bytes);
+
+            EXPECT(source && legacy && simd);
+            if (pattern == 1u) {
+                memset(source, 0xff, input_bytes);
+            } else if (pattern == 2u) {
+                fill_prefix(source, input_bytes,
+                            0x160600u + (unsigned)si * 31u);
+            }
+            encode_copy(RS_ENCODE_LEGACY, legacy, source, block_bytes);
+            encode_copy(RS_ENCODE_SIMD, simd, source, block_bytes);
+            EXPECT(memcmp(legacy, simd, block_bytes) == 0);
+            free(source);
+            free(legacy);
+            free(simd);
+        }
+    }
+    EXPECT(RsCodec_set_params(4u, 2u) == 0);
+    RsCodec_set_encode_impl(RS_ENCODE_AUTO);
+    return 0;
+}
+
+static int test_rs_simd_runtime_fallback(void)
+{
+    const size_t k = 16u;
+    const size_t r = 6u;
+    size_t block_bytes = (k + r) * PKG_SIZE;
+    size_t input_bytes = k * PKG_SIZE;
+    unsigned char *source = calloc(1, block_bytes);
+    unsigned char *scalar = calloc(1, block_bytes);
+    unsigned char *fallback = calloc(1, block_bytes);
+
+    EXPECT(source && scalar && fallback);
+    EXPECT(RsCodec_set_params(k, r) == 0);
+    fill_prefix(source, input_bytes, 0xFA11BACCu);
+    encode_copy(RS_ENCODE_GENERAL, scalar, source, block_bytes);
+
+    RsCodec_set_simd_enabled_for_tests(0);
+    encode_copy(RS_ENCODE_SIMD, fallback, source, block_bytes);
+    EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
+    EXPECT(memcmp(scalar, fallback, block_bytes) == 0);
+
+    RsCodec_set_simd_enabled_for_tests(1);
+    free(source);
+    free(scalar);
+    free(fallback);
+    RsCodec_set_encode_impl(RS_ENCODE_AUTO);
+    return 0;
+}
+
 typedef struct StressArg {
     unsigned char *blocks;
     unsigned char *refs;
@@ -391,8 +472,8 @@ static void *stress_worker(void *arg)
 
 static int test_rs_general_table_path_multiflow_stress(void)
 {
-    const size_t k = 8;
-    const size_t r = 4;
+    const size_t k = 16;
+    const size_t r = 6;
     const size_t n = k + r;
     const size_t block_bytes = n * PKG_SIZE;
     const size_t input_bytes = k * PKG_SIZE;
@@ -405,7 +486,7 @@ static int test_rs_general_table_path_multiflow_stress(void)
     unsigned f;
 
     EXPECT(RsCodec_set_params(k, r) == 0);
-    RsCodec_set_encode_impl(RS_ENCODE_GENERAL);
+    RsCodec_set_encode_impl(RS_ENCODE_SIMD);
     arena = calloc((size_t)flows * blocks_each, block_bytes);
     refs = calloc((size_t)flows * blocks_each, block_bytes);
     EXPECT(arena && refs);
@@ -428,6 +509,7 @@ static int test_rs_general_table_path_multiflow_stress(void)
         }
     }
 
+    RsCodec_set_encode_impl(RS_ENCODE_SIMD);
     for (f = 0; f < flows; f++) {
         EXPECT(pthread_create(&threads[f], NULL, stress_worker, &args[f]) == 0);
     }
@@ -454,7 +536,8 @@ static int test_rs_fast_path_fallback(void)
     fill_prefix(block, 16u * PKG_SIZE, 0xABCDu);
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
-    EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_FAST_16_2);
+    EXPECT(RsCodec_last_encode_impl() ==
+           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     free(block);
 
     EXPECT(RsCodec_set_params(4u, 2u) == 0);
@@ -464,7 +547,8 @@ static int test_rs_fast_path_fallback(void)
     fill_prefix(block, 4u * PKG_SIZE, 0x4F2Au);
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
-    EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
+    EXPECT(RsCodec_last_encode_impl() ==
+           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     free(block);
 
     EXPECT(RsCodec_set_params(8u, 4u) == 0);
@@ -474,7 +558,8 @@ static int test_rs_fast_path_fallback(void)
     fill_prefix(block, 8u * PKG_SIZE, 0xBEEFu);
     RsCodec_set_encode_impl(RS_ENCODE_AUTO);
     Codec_encode(RsCodec_get(), block, n * PKG_SIZE);
-    EXPECT(RsCodec_last_encode_impl() == RS_ENCODE_GENERAL);
+    EXPECT(RsCodec_last_encode_impl() ==
+           (RsCodec_avx2_available() ? RS_ENCODE_SIMD : RS_ENCODE_GENERAL));
     free(block);
 
     EXPECT(RsCodec_set_params(16u, 2u) == 0);
@@ -501,6 +586,7 @@ static int test_rs_encode_plan_geometry_guard(void)
     EXPECT(RsCodec_set_params(16u, 2u) == 0);
     EXPECT(RsCodec_encode_plan_ready());
     EXPECT(RsCodec_encode_plan_has_mul_table());
+    EXPECT(RsCodec_encode_plan_has_nibble_table());
     RsCodec_get_encode_plan_geometry(&k, &r, &n, &shard_bytes);
     EXPECT(k == 16u && r == 2u && n == 18u && shard_bytes == PKG_SIZE);
 
@@ -508,6 +594,7 @@ static int test_rs_encode_plan_geometry_guard(void)
     RsCodec_get_encode_plan_geometry(&k, &r, &n, &shard_bytes);
     EXPECT(k == 8u && r == 4u && n == 12u);
     EXPECT(RsCodec_encode_plan_has_mul_table());
+    EXPECT(RsCodec_encode_plan_has_nibble_table());
 
     /* Reject invalid geometry without leaving a matching plan. */
     EXPECT(RsCodec_set_params(0u, 2u) != 0);
@@ -539,6 +626,14 @@ int main(void)
     }
     if (test_rs_general_table_path_short_block() != 0) {
         fputs("test_rs_general_table_path_short_block failed\n", stderr);
+        return 1;
+    }
+    if (test_rs_simd_shard_byte_boundaries() != 0) {
+        fputs("test_rs_simd_shard_byte_boundaries failed\n", stderr);
+        return 1;
+    }
+    if (test_rs_simd_runtime_fallback() != 0) {
+        fputs("test_rs_simd_runtime_fallback failed\n", stderr);
         return 1;
     }
     if (test_rs_general_table_path_multiflow_stress() != 0) {

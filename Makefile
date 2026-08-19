@@ -71,7 +71,14 @@ RSCODE_OBJS = \
 	$(OBJ_DIR)/rscode_rs.o \
 	$(OBJ_DIR)/rscode_galois.o \
 	$(OBJ_DIR)/rscode_berlekamp.o \
-	$(OBJ_DIR)/rscode_crcgen.o
+	$(OBJ_DIR)/rscode_crcgen.o \
+	$(OBJ_DIR)/wg_rs_gf256_simd.o \
+	$(OBJ_DIR)/wg_rs_gf256_avx2.o
+
+HOST_ARCH := $(shell uname -m)
+ifneq ($(filter x86_64 amd64 i386 i686,$(HOST_ARCH)),)
+RS_AVX2_CFLAGS = -mavx2
+endif
 
 WG_OBJS = \
 	$(OBJ_DIR)/wg_main.o \
@@ -266,6 +273,10 @@ $(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 $(OBJ_DIR)/wg_rs_codec.o: $(WG_DIR)/rs_codec.c $(INCLUDE_HDRS) $(WG_HDRS) \
 	$(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(RSCODE_DIR) -c $< -o $@
+
+$(OBJ_DIR)/wg_rs_gf256_avx2.o: $(WG_DIR)/rs_gf256_avx2.c \
+	$(WG_DIR)/rs_gf256_simd.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(RS_AVX2_CFLAGS) -I$(WG_DIR) -c $< -o $@
 
 $(OBJ_DIR)/rscode_%.o: $(RSCODE_DIR)/%.c $(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -I$(RSCODE_DIR) -c $< -o $@
