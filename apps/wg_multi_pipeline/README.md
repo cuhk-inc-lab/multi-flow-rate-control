@@ -68,7 +68,9 @@ mid-stream when a new block cannot enter the reorder window, after END
 for remaining holes, and when the head has fewer than k shards while a
 later group is already recovered. Unrecoverable systematic groups also output whatever
 data shards arrived and omit missing data shards (`missing_data_shards`);
-parity is not output. The file will not match the source sha256. Use `--strict`
+parity is not output. `block` is not systematic (wire bytes are `+1`) but
+allows the same best-effort skip; present shards are `-1` decoded before
+write. The file will not match the source sha256. Use `--strict`
 for hash-verified complete-file transfers.
 
 ```bash

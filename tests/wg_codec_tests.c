@@ -47,7 +47,7 @@ static int test_block_codec_uniform_add_subtract(void)
     if (Codec_input_block_size(codec) != DECODE_BLOCK ||
         Codec_output_block_size(codec) != DECODE_BLOCK ||
         Codec_data_shards(codec) != 4u || Codec_parity_shards(codec) != 0u ||
-        Codec_is_systematic(codec)) {
+        Codec_is_systematic(codec) || !Codec_allows_best_effort(codec)) {
         return -1;
     }
     for (byte = 0; byte < DECODE_BLOCK; byte++) {

@@ -61,6 +61,12 @@ static int block_is_systematic(const Codec *self)
     return 0;
 }
 
+static int block_allows_best_effort(const Codec *self)
+{
+    (void)self;
+    return 1;
+}
+
 static const CodecVTable block_codec_vtable = {
     .encode = block_encode,
     .decode = block_decode,
@@ -69,6 +75,7 @@ static const CodecVTable block_codec_vtable = {
     .data_shards = block_data_shards,
     .parity_shards = block_parity_shards,
     .is_systematic = block_is_systematic,
+    .allows_best_effort = block_allows_best_effort,
 };
 
 static const Codec block_codec = {

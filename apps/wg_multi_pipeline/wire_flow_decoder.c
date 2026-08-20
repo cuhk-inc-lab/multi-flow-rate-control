@@ -544,7 +544,7 @@ static int write_best_effort_group(WireFlowDecoder *dec, WireGroup *group)
     size_t shard;
 
     if (dec == NULL || group == NULL || dec->codec == NULL ||
-        !Codec_is_systematic(dec->codec) || group->valid_len == 0 ||
+        !Codec_allows_best_effort(dec->codec) || group->valid_len == 0 ||
         group->valid_len > Codec_input_block_size(dec->codec) ||
         dec->output_fn == NULL) {
         return -1;
@@ -554,6 +554,17 @@ static int write_best_effort_group(WireFlowDecoder *dec, WireGroup *group)
     if (data_shards == 0 || group->shard_count !=
         Codec_data_shards(dec->codec) + Codec_parity_shards(dec->codec)) {
         return -1;
+    }
+
+    /* Wire bytes are plaintext only for systematic codecs. block is +1 on the
+     * wire; invert the whole layout before copying present data shards. */
+    if (!Codec_is_systematic(dec->codec)) {
+        size_t output_size = (size_t)group->shard_count * PKG_SIZE;
+
+        if (output_size == 0 || output_size > CODEC_MAX_ENCODE_BLOCK) {
+            return -1;
+        }
+        Codec_decode(dec->codec, group->data, output_size);
     }
 
     remaining = group->valid_len;
@@ -587,7 +598,7 @@ static int skip_unrecoverable_head(WireFlowDecoder *dec, WireGroup *group)
         return -1;
     }
     if (group != NULL) {
-        if (Codec_is_systematic(dec->codec) && group->valid_len > 0 &&
+        if (Codec_allows_best_effort(dec->codec) && group->valid_len > 0 &&
             group->data != NULL && group->received_bits != NULL) {
             if (write_best_effort_group(dec, group) != 0) {
                 return -1;

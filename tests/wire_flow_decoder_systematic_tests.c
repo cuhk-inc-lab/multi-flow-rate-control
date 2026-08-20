@@ -94,8 +94,8 @@ static int encode_block(const Codec *codec, unsigned char *encoded,
     return 0;
 }
 
-static WireFlowDecoder *make_dec(const Codec *codec, uint32_t flow_id,
-                                 OutBuf *ob)
+static WireFlowDecoder *make_dec_mode(const Codec *codec, uint32_t flow_id,
+                                      OutBuf *ob, int best_effort)
 {
     WireFlowDecoderConfig cfg;
     size_t out_size;
@@ -108,7 +108,14 @@ static WireFlowDecoder *make_dec(const Codec *codec, uint32_t flow_id,
     cfg.expected_shards = (uint16_t)(out_size / PKG_SIZE);
     cfg.output_fn = outbuf_write;
     cfg.output_ctx = ob;
+    cfg.best_effort = best_effort;
     return wire_flow_decoder_create(&cfg);
+}
+
+static WireFlowDecoder *make_dec(const Codec *codec, uint32_t flow_id,
+                                 OutBuf *ob)
+{
+    return make_dec_mode(codec, flow_id, ob, 0);
 }
 
 static int ingest_shard(WireFlowDecoder *dec, uint32_t flow_id,
@@ -329,6 +336,7 @@ static void test_non_systematic_codec_unchanged(void)
 
     EXPECT(codec != NULL);
     EXPECT(!Codec_is_systematic(codec));
+    EXPECT(Codec_allows_best_effort(codec));
     EXPECT(Codec_data_shards(codec) == 4);
     EXPECT(Codec_parity_shards(codec) == 0);
 
@@ -400,6 +408,62 @@ static void test_systematic_short_final_block_valid_len(void)
     wire_flow_decoder_destroy(dec);
 }
 
+static void test_block_best_effort_decodes_present_shards_and_skips(void)
+{
+    const Codec *codec = BlockCodec_get();
+    OutBuf ob;
+    uint8_t out[8192];
+    WireFlowDecoder *dec;
+    unsigned char encoded[DECODE_BLOCK];
+    uint8_t plaintext[3000];
+    uint8_t expect_head[1600];
+    uint16_t valid_len = 0;
+    uint16_t shard_count = 0;
+    WireHeader end;
+    size_t i;
+
+    EXPECT(codec != NULL);
+    EXPECT(!Codec_is_systematic(codec));
+    EXPECT(Codec_allows_best_effort(codec));
+
+    for (i = 0; i < sizeof(plaintext); i++) {
+        plaintext[i] = (uint8_t)(i * 3u + 11u);
+    }
+    EXPECT(encode_block(codec, encoded, sizeof(encoded), plaintext,
+                        sizeof(plaintext), &valid_len, &shard_count) == 0);
+    memcpy(expect_head, plaintext, 1400);
+    memcpy(expect_head + 1400, plaintext + 2800, 200);
+
+    memset(&ob, 0, sizeof(ob));
+    ob.data = out;
+    ob.cap = sizeof(out);
+    dec = make_dec_mode(codec, 7, &ob, 1);
+    EXPECT(dec != NULL);
+
+    EXPECT(ingest_shard(dec, 7, 0, 0, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 7, 0, 2, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 7, 0, 3, shard_count, valid_len, encoded) == 0);
+    EXPECT(ob.len == 0);
+
+    EXPECT(ingest_shard(dec, 7, 1, 0, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 7, 1, 1, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 7, 1, 2, shard_count, valid_len, encoded) == 0);
+    EXPECT(ingest_shard(dec, 7, 1, 3, shard_count, valid_len, encoded) == 0);
+
+    EXPECT(ob.len == sizeof(expect_head) + sizeof(plaintext));
+    EXPECT(memcmp(out, expect_head, sizeof(expect_head)) == 0);
+    EXPECT(memcmp(out + sizeof(expect_head), plaintext, sizeof(plaintext)) == 0);
+    EXPECT(wire_flow_decoder_stats(dec)->skipped_groups == 1);
+    EXPECT(wire_flow_decoder_stats(dec)->window_overflow == 0);
+    EXPECT(out[0] == plaintext[0]);
+
+    fill_end(&end, 7, 2, shard_count);
+    EXPECT(wire_flow_decoder_ingest(dec, &end, NULL, 0) == 0);
+    EXPECT(wire_flow_decoder_is_complete(dec));
+
+    wire_flow_decoder_destroy(dec);
+}
+
 int main(void)
 {
     fprintf(stderr,
@@ -412,6 +476,7 @@ int main(void)
     test_systematic_out_of_order_blocks_stay_ordered();
     test_non_systematic_codec_unchanged();
     test_systematic_short_final_block_valid_len();
+    test_block_best_effort_decodes_present_shards_and_skips();
 
     if (g_failures != 0) {
         fprintf(stderr, "wire_flow_decoder_systematic_tests: %d failure(s)\n",
