@@ -9,7 +9,7 @@
 #include <time.h>
 
 #ifndef LOCAL_SOURCE_MAX_DATAGRAM
-#define LOCAL_SOURCE_MAX_DATAGRAM (WIRE_HEADER_SIZE + PKG_SIZE)
+#define LOCAL_SOURCE_MAX_DATAGRAM (WIRE_MAX_HEADER_SIZE + PKG_SIZE)
 #endif
 
 static double mono_seconds(void)
@@ -64,7 +64,8 @@ static int emit_one(RelayWireEmitFn emit_fn, void *emit_ctx,
                     LocalSourceStats *stats)
 {
     uint8_t datagram[LOCAL_SOURCE_MAX_DATAGRAM];
-    size_t len = WIRE_HEADER_SIZE;
+    size_t header_size;
+    size_t len;
 
     if (hdr == NULL || emit_fn == NULL) {
         return -1;
@@ -72,12 +73,18 @@ static int emit_one(RelayWireEmitFn emit_fn, void *emit_ctx,
     if (hdr->payload_len > PKG_SIZE) {
         return -1;
     }
-    wire_header_encode(datagram, hdr);
+    header_size = wire_header_size(hdr);
+    len = header_size;
+    if (hdr->version == WIRE_VERSION_V4) {
+        wire_header_encode_v4(datagram, hdr);
+    } else {
+        wire_header_encode(datagram, hdr);
+    }
     if (hdr->payload_len > 0) {
         if (payload == NULL) {
             return -1;
         }
-        memcpy(datagram + WIRE_HEADER_SIZE, payload, hdr->payload_len);
+        memcpy(datagram + header_size, payload, hdr->payload_len);
         len += hdr->payload_len;
     }
     if (emit_fn(datagram, len, emit_ctx) != 0) {
@@ -90,6 +97,98 @@ static int emit_one(RelayWireEmitFn emit_fn, void *emit_ctx,
         stats->wire_datagrams++;
     }
     return 0;
+}
+
+typedef struct LocalWirehairEmitCtx {
+    RelayWireEmitFn emit_fn;
+    void *emit_ctx;
+    LocalSourceStats *stats;
+} LocalWirehairEmitCtx;
+
+static int local_wirehair_emit(const WireHeader *header,
+                               const uint8_t *payload, size_t payload_len,
+                               void *opaque)
+{
+    LocalWirehairEmitCtx *ctx = opaque;
+
+    if (header == NULL || payload_len != header->payload_len) {
+        return -1;
+    }
+    return emit_one(ctx->emit_fn, ctx->emit_ctx, header, payload, ctx->stats);
+}
+
+static int local_wirehair_source_run(const LocalSourceConfig *config,
+                                     RelayWireEmitFn emit_fn, void *emit_ctx,
+                                     LocalSourceStats *stats)
+{
+    FILE *input = NULL;
+    uint8_t *segment = NULL;
+    uint64_t segment_id = 0;
+    double started;
+    int result = -1;
+    LocalWirehairEmitCtx wh_emit = {
+        .emit_fn = emit_fn,
+        .emit_ctx = emit_ctx,
+        .stats = stats,
+    };
+
+    if (!wirehair_segment_config_valid(&config->wirehair)) {
+        return -1;
+    }
+    input = fopen(config->input_path, "rb");
+    segment = malloc(config->wirehair.segment_bytes);
+    if (input == NULL || segment == NULL) {
+        goto out;
+    }
+    started = mono_seconds();
+    for (;;) {
+        size_t got = fread(segment, 1, config->wirehair.segment_bytes, input);
+        WirehairSegmentSendStats send_stats;
+
+        if (got == 0) {
+            if (ferror(input)) {
+                goto out;
+            }
+            break;
+        }
+        if (wirehair_segment_send(
+                &config->wirehair, config->flow_id, segment_id,
+                config->final_dst, config->ttl, segment, got,
+                local_wirehair_emit, &wh_emit, config->ack_poll,
+                config->ack_ctx,
+                &send_stats) != 0) {
+            goto out;
+        }
+        stats->blocks++;
+        stats->source_bytes += got;
+        segment_id++;
+        pace_block(started, stats->source_bytes,
+                   config->source_rate_mbps);
+    }
+    {
+        WireHeader end = {
+            .version = WIRE_VERSION_V4,
+            .type = WIRE_TYPE_END,
+            .final_dst = config->final_dst,
+            .ttl = config->ttl,
+            .flow_id = config->flow_id,
+            .block_id = segment_id,
+            .origin_node = config->wirehair.origin_node,
+            .flags = config->wirehair.ack_enabled
+                         ? WIRE_FLAG_ACK_REQUEST
+                         : 0u,
+        };
+        if (emit_one(emit_fn, emit_ctx, &end, NULL, stats) != 0) {
+            goto out;
+        }
+    }
+    result = 0;
+out:
+    if (input != NULL) {
+        fclose(input);
+    }
+    free(segment);
+    return result;
 }
 
 int local_source_run(const LocalSourceConfig *config,
@@ -113,6 +212,13 @@ int local_source_run(const LocalSourceConfig *config,
         config->final_dst == 0 || config->ttl == 0 ||
         config->source_rate_mbps < 0.0) {
         return -1;
+    }
+    if (config->codec_kind == CODEC_KIND_WIREHAIR) {
+        result = local_wirehair_source_run(config, emit_fn, emit_ctx, &stats);
+        if (stats_out != NULL) {
+            *stats_out = stats;
+        }
+        return result;
     }
 
     codec = Codec_get(config->codec_kind);

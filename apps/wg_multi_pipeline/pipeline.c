@@ -2191,6 +2191,75 @@ cleanup:
     return status;
 }
 
+typedef struct WirehairMultiSender {
+    WireUdpSendConfig config;
+    pthread_t thread;
+    int started;
+    int result;
+} WirehairMultiSender;
+
+static void *wirehair_multi_sender_thread(void *opaque)
+{
+    WirehairMultiSender *sender = opaque;
+
+    sender->result = wire_udp_send(&sender->config);
+    return NULL;
+}
+
+static WgPipelineStatus run_wirehair_multi_send(
+    const WgWireMultiSendConfig *config)
+{
+    WirehairMultiSender *senders;
+    uint32_t i;
+    WgPipelineStatus status = WG_PIPE_OK;
+
+    if (!wirehair_segment_config_valid(&config->wirehair) ||
+        (config->wirehair.ack_enabled && config->ack_port_base != 0 &&
+         (uint32_t)config->ack_port_base + config->flow_count - 1u >
+             UINT16_MAX)) {
+        return WG_PIPE_ERR;
+    }
+    senders = calloc(config->flow_count, sizeof(*senders));
+    if (senders == NULL) {
+        return WG_PIPE_ERR;
+    }
+    for (i = 0; i < config->flow_count; i++) {
+        const WgWireFlowPath *path = &config->flows[i];
+
+        senders[i].config = (WireUdpSendConfig){
+            .host = path->host,
+            .port = path->port,
+            .input_path = path->input_path,
+            .codec_kind = CODEC_KIND_WIREHAIR,
+            .source_rate_mbps = path->source_rate_mbps,
+            .flow_id = path->flow_id,
+            .final_dst = config->final_dst,
+            .ttl = config->ttl,
+            .ack_port =
+                config->ack_port_base == 0
+                    ? 0
+                    : (uint16_t)(config->ack_port_base + i),
+            .wirehair = config->wirehair,
+        };
+        if (pthread_create(&senders[i].thread, NULL,
+                           wirehair_multi_sender_thread, &senders[i]) != 0) {
+            status = WG_PIPE_ERR;
+            break;
+        }
+        senders[i].started = 1;
+    }
+    for (i = 0; i < config->flow_count; i++) {
+        if (senders[i].started) {
+            pthread_join(senders[i].thread, NULL);
+            if (senders[i].result != 0) {
+                status = WG_PIPE_ERR;
+            }
+        }
+    }
+    free(senders);
+    return status;
+}
+
 WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *config)
 {
     FlowManager       mgr;
@@ -2206,6 +2275,9 @@ WgPipelineStatus wg_pipeline_run_wire_multi_send(const WgWireMultiSendConfig *co
     if (config == NULL || config->flows == NULL || config->flow_count == 0 ||
         config->final_dst == 0 || config->ttl == 0) {
         return WG_PIPE_ERR;
+    }
+    if (config->codec_kind == CODEC_KIND_WIREHAIR) {
+        return run_wirehair_multi_send(config);
     }
 
     codec = Codec_get(config->codec_kind);

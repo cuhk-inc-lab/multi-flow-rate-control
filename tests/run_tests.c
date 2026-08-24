@@ -1442,6 +1442,7 @@ static int test_wire_header_roundtrip(void)
         .encode_end_ns = 2002,
     };
     unsigned char raw[WIRE_HEADER_SIZE];
+    unsigned char raw4[WIRE_V4_HEADER_SIZE];
     WireHeader out;
     unsigned char bad[WIRE_HEADER_SIZE];
 
@@ -1468,6 +1469,23 @@ static int test_wire_header_roundtrip(void)
     memcpy(bad, raw, sizeof(bad));
     bad[4] = 2; /* old version */
     if (wire_header_decode(&out, bad, sizeof(bad)) == 0) {
+        return 1;
+    }
+    in.version = WIRE_VERSION_V4;
+    in.type = WIRE_TYPE_ACK;
+    in.payload_len = 0;
+    in.origin_node = 7;
+    in.flags = WIRE_FLAG_RETURN_PATH;
+    in.segment_bytes = 10u * 1024u * 1024u;
+    memset(raw4, 0, sizeof(raw4));
+    wire_header_encode_v4(raw4, &in);
+    if (raw4[4] != WIRE_VERSION_V4 ||
+        wire_header_decode(&out, raw4, sizeof(raw4)) != 0 ||
+        out.version != WIRE_VERSION_V4 || out.type != WIRE_TYPE_ACK ||
+        out.origin_node != 7 || out.flags != WIRE_FLAG_RETURN_PATH ||
+        out.segment_bytes != in.segment_bytes ||
+        wire_header_size(&out) != WIRE_V4_HEADER_SIZE ||
+        wire_header_decode(&out, raw4, WIRE_HEADER_SIZE) == 0) {
         return 1;
     }
     return 0;

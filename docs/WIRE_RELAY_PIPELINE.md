@@ -1,6 +1,6 @@
 # Wire Relay Pipeline Design
 
-Application-layer **per-node** program for wire header **v3**
+Application-layer **per-node** program for wire headers **v3 and v4**
 (`final_dst` + `ttl`). Binary: `apps/wire_relay/` → `build/wire_relay`.
 Each node runs this one binary: local encode, destination check, optional
 decode, and opaque forward. Mid-hop recode / decode-reencode are reserved.
@@ -9,6 +9,19 @@ Wire v3 has **no independent coding vector** — only
 `type` / `shard_index` / `shard_count` / `valid_len` (plus routing fields).
 Generation key is `(flow_id, block_id)`. Do not invent a separate
 `generation_id` field on the wire.
+
+Wirehair alone uses wire v4. It treats `block_id` as a segment id,
+`shard_index` as a Wirehair packet id, and adds `origin_node`, flags, and
+`segment_bytes`. Defaults are 10 MiB per segment and a repair ceiling of 10%.
+`--wh-ack` requests an ACK as soon as recovery completes; otherwise the sender
+always transmits the full repair budget.
+
+ACK datagrams carry `(flow_id, segment_id)`, set `WIRE_FLAG_RETURN_PATH`, and
+are forwarded through each relay's `--return-hop HOST:PORT`. A linear path
+must configure each return hop toward the previous relay; the relay nearest
+the sender points to the sender's `--ack-port`. Wirehair v4 bypasses the
+v3-only `GenerationCache`. A receiver keeps at most four active segment
+decoders, so the default peak decode payload storage is about 40 MiB per flow.
 
 ---
 

@@ -1,7 +1,8 @@
 CC      = gcc
+CMAKE   = cmake
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -Iinclude -O2
 LDFLAGS = -pthread
-RS_LDFLAGS = -lerasurecode_rs_vand
+RS_LDFLAGS = -lerasurecode_rs_vand -lstdc++ -lm
 
 CB_DIR   = ../buffer-management-module
 CB_INC   = $(CB_DIR)/include
@@ -12,6 +13,15 @@ TEST_DIR = tests
 WG_DIR    = apps/wg_multi_pipeline
 OBJ_DIR  = build
 RSCODE_DIR = third_party/rscode
+WIREHAIR_DIR = third_party/wirehair
+WIREHAIR_BUILD_DIR = $(OBJ_DIR)/wirehair
+WIREHAIR_LIB = $(WIREHAIR_BUILD_DIR)/libwirehair.a
+WIREHAIR_SRCS := $(wildcard $(WIREHAIR_DIR)/*.cpp) \
+	$(wildcard $(WIREHAIR_DIR)/*.h) \
+	$(wildcard $(WIREHAIR_DIR)/codec/*.cpp) \
+	$(wildcard $(WIREHAIR_DIR)/codec/*.h) \
+	$(WIREHAIR_DIR)/include/wirehair/wirehair.h \
+	$(WIREHAIR_DIR)/CMakeLists.txt
 
 CFLAGS += -I$(CB_INC)
 
@@ -58,6 +68,7 @@ WG_APP_SRCS = \
 	$(WG_DIR)/xor_fec_codec.c \
 	$(WG_DIR)/rs_fec_codec.c \
 	$(WG_DIR)/rs_codec.c \
+	$(WG_DIR)/wirehair_segment.c \
 	$(WG_DIR)/wire_udp.c \
 	$(WG_DIR)/file_drain.c
 
@@ -74,7 +85,9 @@ RSCODE_OBJS = \
 	$(OBJ_DIR)/rscode_crcgen.o \
 	$(OBJ_DIR)/wg_rs_gf256_simd.o \
 	$(OBJ_DIR)/wg_rs_gf256_avx2.o \
-	$(OBJ_DIR)/wg_rs_gf256_ssse3.o
+	$(OBJ_DIR)/wg_rs_gf256_ssse3.o \
+	$(OBJ_DIR)/wg_wirehair_segment.o \
+	$(WIREHAIR_LIB)
 
 HOST_ARCH := $(shell uname -m)
 ifneq ($(filter x86_64 amd64 i386 i686,$(HOST_ARCH)),)
@@ -136,6 +149,7 @@ RELAY_DECODE_OBJS = \
 	$(RSCODE_OBJS)
 
 FEC_TRANSPORT_TEST_BIN = $(OBJ_DIR)/fec_transport_tests
+FEC_INTERLEAVE_SIM_BIN = $(OBJ_DIR)/fec_interleave_sim
 RELAY_GEN_CACHE_TEST_BIN = $(OBJ_DIR)/relay_gen_cache_tests
 RELAY_EGRESS_QUEUE_TEST_BIN = $(OBJ_DIR)/relay_egress_queue_tests
 RELAY_DEFERRED_TEST_BIN = $(OBJ_DIR)/relay_deferred_tests
@@ -145,10 +159,11 @@ WIRE_UDP_RECV_DEMUX_TEST_BIN = $(OBJ_DIR)/wire_udp_recv_demux_tests
 WIRE_FLOW_DECODER_RS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_rs_tests
 WIRE_FLOW_DECODER_SYS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_systematic_tests
 WIRE_FLOW_DECODER_REORDER_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_reorder_tests
+WIREHAIR_SEGMENT_TEST_BIN = $(OBJ_DIR)/wirehair_segment_tests
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
-.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline integration-test fec-transport fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
+.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline integration-test fec-transport fec-interleave-sim fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
 
 all: $(LIB)
 
@@ -181,6 +196,9 @@ rs-encode-bench: $(RS_ENCODE_BENCH_BIN)
 fec-transport: $(FEC_TRANSPORT_TEST_BIN)
 	./$(FEC_TRANSPORT_TEST_BIN)
 
+fec-interleave-sim: $(FEC_INTERLEAVE_SIM_BIN)
+	./$(FEC_INTERLEAVE_SIM_BIN)
+
 test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BIN) \
 	$(RELAY_DEFERRED_TEST_BIN) \
 	$(RELAY_LOCAL_DECODE_TEST_BIN) \
@@ -189,7 +207,9 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 	$(WIRE_FLOW_DECODER_SYS_TEST_BIN) $(WIRE_FLOW_DECODER_REORDER_TEST_BIN) \
 	$(RS_ENCODE_FAST_TEST_BIN) \
 	$(RS_ENCODE_GENERAL_TEST_BIN) \
-	$(FEC_TRANSPORT_TEST_BIN)
+	$(WIREHAIR_SEGMENT_TEST_BIN) \
+	$(FEC_TRANSPORT_TEST_BIN) \
+	$(FEC_INTERLEAVE_SIM_BIN)
 	./$(TEST_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
 	./$(RELAY_EGRESS_QUEUE_TEST_BIN)
@@ -202,7 +222,9 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 	./$(WIRE_FLOW_DECODER_REORDER_TEST_BIN)
 	./$(RS_ENCODE_FAST_TEST_BIN)
 	./$(RS_ENCODE_GENERAL_TEST_BIN)
+	./$(WIREHAIR_SEGMENT_TEST_BIN)
 	./$(FEC_TRANSPORT_TEST_BIN)
+	./$(FEC_INTERLEAVE_SIM_BIN)
 
 integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) \
 	$(RELAY_EGRESS_QUEUE_TEST_BIN) $(RELAY_DEFERRED_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN) \
@@ -211,11 +233,15 @@ integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(REL
 	$(WIRE_FLOW_DECODER_SYS_TEST_BIN) $(WIRE_FLOW_DECODER_REORDER_TEST_BIN) \
 	$(RS_ENCODE_FAST_TEST_BIN) \
 	$(RS_ENCODE_GENERAL_TEST_BIN) \
-	$(FEC_TRANSPORT_TEST_BIN)
+	$(WIREHAIR_SEGMENT_TEST_BIN) \
+	$(FEC_TRANSPORT_TEST_BIN) \
+	$(FEC_INTERLEAVE_SIM_BIN)
 	./$(WG_CODEC_TEST_BIN)
 	./$(RS_ENCODE_FAST_TEST_BIN)
 	./$(RS_ENCODE_GENERAL_TEST_BIN)
+	./$(WIREHAIR_SEGMENT_TEST_BIN)
 	./$(FEC_TRANSPORT_TEST_BIN)
+	./$(FEC_INTERLEAVE_SIM_BIN)
 	./$(RELAY_GEN_CACHE_TEST_BIN)
 	./$(RELAY_EGRESS_QUEUE_TEST_BIN)
 	./$(RELAY_DEFERRED_TEST_BIN)
@@ -241,6 +267,7 @@ integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(REL
 	sh $(TEST_DIR)/wire_xor_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_rs_fec_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_rs_test.sh ./$(WG_BIN) $(OBJ_DIR)
+	sh $(TEST_DIR)/wire_wirehair_test.sh ./$(WG_BIN) $(OBJ_DIR)
 	sh $(TEST_DIR)/wire_relay_loopback.sh ./$(WG_BIN) ./$(RELAY_BIN) $(OBJ_DIR)
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -271,6 +298,17 @@ $(TEST_BIN): $(TEST_DIR)/run_tests.c $(LIB) | $(OBJ_DIR)
 
 $(OBJ_DIR)/wg_%.o: $(WG_DIR)/%.c $(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -c $< -o $@
+
+$(WIREHAIR_LIB): $(WIREHAIR_SRCS) | $(OBJ_DIR)
+	$(CMAKE) -S $(WIREHAIR_DIR) -B $(WIREHAIR_BUILD_DIR) \
+		-DBUILD_TESTS=OFF -DBUILD_CODEC_V2=OFF -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build $(WIREHAIR_BUILD_DIR) --target wirehair
+
+$(OBJ_DIR)/wg_wirehair_segment.o: $(WG_DIR)/wirehair_segment.c \
+	$(WG_DIR)/wirehair_segment.h $(WG_DIR)/stream_config.h \
+	$(WIREHAIR_DIR)/include/wirehair/wirehair.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -DWIREHAIR_STATIC -I$(WG_DIR) \
+		-I$(WIREHAIR_DIR)/include -c $< -o $@
 
 $(OBJ_DIR)/wg_rs_codec.o: $(WG_DIR)/rs_codec.c $(INCLUDE_HDRS) $(WG_HDRS) \
 	$(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
@@ -424,11 +462,23 @@ $(FEC_TRANSPORT_TEST_BIN): $(TEST_DIR)/fec_transport_tests.c \
 	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
+$(FEC_INTERLEAVE_SIM_BIN): $(TEST_DIR)/fec_interleave_sim.c \
+	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
+	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
+	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
 $(FEC_TRACE_BIN): $(TEST_DIR)/fec_trace.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o \
 	$(OBJ_DIR)/wg_copy_codec.o $(OBJ_DIR)/wg_xor_fec_codec.o \
 	$(OBJ_DIR)/wg_rs_fec_codec.o | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
+$(WIREHAIR_SEGMENT_TEST_BIN): $(TEST_DIR)/wirehair_segment_tests.c \
+	$(OBJ_DIR)/wg_wirehair_segment.o $(OBJ_DIR)/wire_header.o \
+	$(WIREHAIR_LIB) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(WIREHAIR_DIR)/include $^ -o $@ \
+		$(LDFLAGS) -lstdc++ -lm
 
 clean:
 	rm -rf $(OBJ_DIR)

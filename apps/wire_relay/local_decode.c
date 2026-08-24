@@ -2,11 +2,14 @@
 
 #include "stream_config.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int local_decode_file_output(uint32_t flow_id, const uint8_t *data,
                                     size_t len, void *ctx)
@@ -24,6 +27,59 @@ static int local_decode_file_output(uint32_t flow_id, const uint8_t *data,
         return -1;
     }
     return 0;
+}
+
+static int local_decode_ack_output(const WireHeader *ack, void *ctx)
+{
+    LocalDecodeHub *hub = ctx;
+    uint8_t datagram[WIRE_V4_HEADER_SIZE];
+    ssize_t sent;
+
+    if (hub == NULL || ack == NULL || hub->ack_sock < 0 ||
+        hub->ack_target_len == 0) {
+        return -1;
+    }
+    wire_header_encode_v4(datagram, ack);
+    do {
+        sent = sendto(hub->ack_sock, datagram, sizeof(datagram), 0,
+                      (const struct sockaddr *)&hub->ack_target,
+                      hub->ack_target_len);
+    } while (sent < 0 && errno == EINTR);
+    return sent == (ssize_t)sizeof(datagram) ? 0 : -1;
+}
+
+static int open_ack_target(LocalDecodeHub *hub, const char *host,
+                           uint16_t port)
+{
+    struct addrinfo hints;
+    struct addrinfo *results = NULL;
+    struct addrinfo *entry;
+    char port_text[16];
+
+    if (hub == NULL || host == NULL || port == 0) {
+        return -1;
+    }
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    snprintf(port_text, sizeof(port_text), "%u", (unsigned)port);
+    if (getaddrinfo(host, port_text, &hints, &results) != 0) {
+        return -1;
+    }
+    for (entry = results; entry != NULL; entry = entry->ai_next) {
+        if (entry->ai_addrlen > sizeof(hub->ack_target)) {
+            continue;
+        }
+        hub->ack_sock = socket(entry->ai_family, SOCK_DGRAM, 0);
+        if (hub->ack_sock >= 0) {
+            memcpy(&hub->ack_target, entry->ai_addr, entry->ai_addrlen);
+            hub->ack_target_len = (socklen_t)entry->ai_addrlen;
+            freeaddrinfo(results);
+            return 0;
+        }
+    }
+    freeaddrinfo(results);
+    return -1;
 }
 
 static int validate_output_dir(const char *dir)
@@ -104,6 +160,13 @@ static int create_flow_decoder(LocalDecodeHub *hub, LocalDecodeFlow *flow,
 {
     WireFlowDecoderConfig cfg;
 
+    if (hub->wirehair_mode) {
+        flow->wirehair_dec = wirehair_segment_receiver_create(
+            &hub->wirehair, flow_id, local_decode_file_output, flow,
+            hub->wirehair.ack_enabled ? local_decode_ack_output : NULL,
+            hub);
+        return flow->wirehair_dec != NULL ? 0 : -1;
+    }
     memset(&cfg, 0, sizeof(cfg));
     cfg.flow_id = flow_id;
     cfg.codec = hub->codec;
@@ -170,6 +233,7 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
         return -1;
     }
     memset(hub, 0, sizeof(*hub));
+    hub->ack_sock = -1;
 
     if (cfg->mode != LOCAL_DECODE_MODE_SINGLE_FILE &&
         cfg->mode != LOCAL_DECODE_MODE_OUTPUT_DIR) {
@@ -183,6 +247,20 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
 
     hub->mode = cfg->mode;
     hub->local_node_id = cfg->local_node_id;
+    hub->wirehair_mode = cfg->codec_kind == CODEC_KIND_WIREHAIR;
+    hub->wirehair = cfg->wirehair;
+    if (hub->wirehair_mode) {
+        if (!wirehair_segment_config_valid(&hub->wirehair)) {
+            goto fail;
+        }
+        if (hub->wirehair.ack_enabled &&
+            open_ack_target(hub, cfg->return_hop_host,
+                            cfg->return_hop_port) != 0) {
+            goto fail;
+        }
+        hub->best_effort = 0;
+        goto output_setup;
+    }
     hub->codec = Codec_get(cfg->codec_kind);
     if (hub->codec == NULL) {
         goto fail;
@@ -205,6 +283,7 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
         goto fail;
     }
 
+output_setup:
     if (cfg->mode == LOCAL_DECODE_MODE_SINGLE_FILE) {
         if (cfg->output != NULL) {
             hub->single_output = cfg->output;
@@ -231,6 +310,10 @@ int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg)
     return 0;
 
 fail:
+    if (hub->ack_sock >= 0) {
+        close(hub->ack_sock);
+        hub->ack_sock = -1;
+    }
     if (hub->single_close_output && hub->single_output != NULL) {
         fclose(hub->single_output);
         hub->single_output = NULL;
@@ -266,6 +349,8 @@ void local_decode_hub_destroy(LocalDecodeHub *hub)
         }
         wire_flow_decoder_destroy(flow->dec);
         flow->dec = NULL;
+        wirehair_segment_receiver_destroy(flow->wirehair_dec);
+        flow->wirehair_dec = NULL;
         if (flow->close_output && flow->output != NULL) {
             fclose(flow->output);
         }
@@ -276,6 +361,10 @@ void local_decode_hub_destroy(LocalDecodeHub *hub)
         fclose(hub->single_output);
     }
     hub->single_output = NULL;
+    if (hub->ack_sock >= 0) {
+        close(hub->ack_sock);
+        hub->ack_sock = -1;
+    }
     if (hub->mu_inited) {
         pthread_mutex_unlock(&hub->mu);
         pthread_mutex_destroy(&hub->mu);
@@ -338,7 +427,8 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
         goto out;
     }
 
-    if (!wire_flow_decoder_shard_count_ok(hub->codec, hdr->shard_count,
+    if (!hub->wirehair_mode &&
+        !wire_flow_decoder_shard_count_ok(hub->codec, hdr->shard_count,
                                           hub->expected_shards)) {
         hub->stats.metadata_mismatch++;
         fprintf(stderr,
@@ -380,8 +470,13 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
     }
 
     if (hdr->type == WIRE_TYPE_DATA) {
-        if (len != WIRE_HEADER_SIZE + hdr->payload_len ||
-            hdr->payload_len != PKG_SIZE) {
+        size_t header_size = wire_header_size(hdr);
+
+        if (len != header_size + hdr->payload_len ||
+            (!hub->wirehair_mode && hdr->payload_len != PKG_SIZE) ||
+            (hub->wirehair_mode &&
+             (hdr->version != WIRE_VERSION_V4 ||
+              hdr->payload_len == 0 || hdr->payload_len > PKG_SIZE))) {
             hub->stats.metadata_mismatch++;
             flow->metadata_mismatch++;
             fprintf(stderr,
@@ -390,10 +485,11 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
             rc = 0;
             goto out;
         }
-        payload = datagram + WIRE_HEADER_SIZE;
+        payload = datagram + header_size;
         payload_len = hdr->payload_len;
     } else {
-        if (len != WIRE_HEADER_SIZE || hdr->payload_len != 0) {
+        if (len != wire_header_size(hdr) || hdr->payload_len != 0 ||
+            (hub->wirehair_mode && hdr->version != WIRE_VERSION_V4)) {
             hub->stats.metadata_mismatch++;
             flow->metadata_mismatch++;
             fprintf(stderr,
@@ -406,7 +502,12 @@ int local_decode_hub_delivery(const uint8_t *datagram, size_t len,
         payload_len = 0;
     }
 
-    if (wire_flow_decoder_ingest(flow->dec, hdr, payload, payload_len) != 0) {
+    if ((hub->wirehair_mode &&
+         wirehair_segment_receiver_ingest(flow->wirehair_dec, hdr, payload,
+                                           payload_len) != 0) ||
+        (!hub->wirehair_mode &&
+         wire_flow_decoder_ingest(flow->dec, hdr, payload,
+                                  payload_len) != 0)) {
         flow->ingest_error++;
         hub->stats.ingest_error++;
         rc = -1;
@@ -446,6 +547,16 @@ size_t local_decode_hub_active_count(LocalDecodeHub *hub)
     return n;
 }
 
+static int local_flow_complete(const LocalDecodeHub *hub,
+                               const LocalDecodeFlow *flow)
+{
+    if (hub->wirehair_mode) {
+        return flow->wirehair_dec != NULL &&
+               wirehair_segment_receiver_complete(flow->wirehair_dec);
+    }
+    return flow->dec != NULL && wire_flow_decoder_is_complete(flow->dec);
+}
+
 int local_decode_hub_is_complete(LocalDecodeHub *hub)
 {
     size_t i;
@@ -463,7 +574,7 @@ int local_decode_hub_is_complete(LocalDecodeHub *hub)
             continue;
         }
         active++;
-        if (flow->dec == NULL || !wire_flow_decoder_is_complete(flow->dec)) {
+        if (!local_flow_complete(hub, flow)) {
             complete = 0;
             goto out;
         }
@@ -500,7 +611,7 @@ int local_decode_hub_strict_check(LocalDecodeHub *hub)
             rc = -1;
             goto out;
         }
-        if (flow->dec == NULL || !wire_flow_decoder_is_complete(flow->dec)) {
+        if (!local_flow_complete(hub, flow)) {
             rc = -1;
             goto out;
         }

@@ -38,7 +38,7 @@
 #endif
 
 #ifndef RELAY_MAX_DATAGRAM
-#define RELAY_MAX_DATAGRAM (WIRE_HEADER_SIZE + 2048u)
+#define RELAY_MAX_DATAGRAM (WIRE_MAX_HEADER_SIZE + 2048u)
 #endif
 
 typedef enum {
@@ -85,6 +85,9 @@ typedef struct RelayFlowStats {
     uint64_t gen_admission_failed;
     uint64_t gen_metadata_mismatch;
     uint64_t gen_duplicate;
+    uint64_t forward_data;
+    uint64_t forward_ack;
+    uint64_t drop_no_return_hop;
 } RelayFlowStats;
 
 typedef struct RelayConfig {
@@ -92,6 +95,8 @@ typedef struct RelayConfig {
     uint16_t            listen_port;
     const char         *next_hop_host;
     uint16_t            next_hop_port;
+    const char         *return_hop_host;
+    uint16_t            return_hop_port;
     /*
      * Optional per-datagram mid-hop transform after TTL--
      * (default NULL = opaque forward). When set, must still produce a

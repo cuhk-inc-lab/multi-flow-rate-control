@@ -1,0 +1,376 @@
+# Precode / Dense-Matrix-Replacement Experiments
+
+This directory holds the standalone precode simulator used to evaluate
+replacements for the production dense binary rows (+ heavy rows).  Unlike
+`experiments/peeling/peel_sweep`, which models only the peel graph and reports
+residual sizes, `precode_sim` models the FULL intermediate-block linear system
+and reports real decode-failure rates:
+
+- `L = K` source columns `+ D` binary precode columns `+ H` heavy columns.
+- Constraint rows: `D` binary precode rows (scheme-dependent) and `H` heavy
+  GF(256) rows.
+- Received rows: `K + OH` packets, each with a peel degree over the `K` source
+  columns (production `GeneratePeelRowWeight` by default) plus `--mix` (default
+  3, production-like) distinct columns over the `D + H` precode columns.
+
+After peeling, the simulator replays peeled-column substitution in solve order
+to compute the exact GF(2) projection of every unused row onto the inactivated
+column set, then computes the binary residual rank.  Decode success requires
+`def = inactivated - rank <= H`.
+
+Heavy rows are modeled as a full-coverage MDS rank patch (explicit Cauchy rows
+over all GE columns).  The production heavy matrix only covers the last 18 GE
+columns, so production failure rates are an upper bound of the model's for the
+same `def` distribution.  Heavy GF(256) costs are reported separately as
+block-unit muladd counts (`heavy_muladds_mu = H*inact + H^2`, `heavy_divs_mu =
+H`); `rank_total.py` folds them into a single XOR-equivalent total using the
+measured muladd:xor ratio per block size.
+This full-coverage patch is a simulator assumption, not a guarantee of the
+legacy shipped matrix; see `../../tables/HEAVY_MATRIX.md`.
+
+`N` in other harnesses is `K` here; payload bytes scale as `K * block_bytes`.
+All cost columns are counted in block units (block-size independent); convert
+with `experiments/peeling/xor_bench` timings.
+
+## Correctness
+
+The self-test proves the projection replay correct via rank invariance: for
+thousands of random instances across all scheme kinds (including the `_s2`
+and `_n1<X>` variants), `peeled + residual_rank` must equal the brute-force GE
+rank of the entire binary system, because peeling is just a solving strategy
+and cannot change rank.  It additionally checks that the `--ge-replay`
+explicit elimination (both row orders) reproduces the rank accumulator's rank
+on every one of those instances, and that `--paired` received-row generation
+is scheme-independent (see below).  Further clauses:
+
+- `_s2` structure: the first D2 row has exactly `ceil(span/2)` columns and
+  every subsequent D2 row differs from its predecessor in EXACTLY 2 columns;
+- `_n1<X>`: every source column hits exactly X distinct staircase parities
+  (and tokens without `_n1` keep the historical X = 3);
+- degree-law chi-square: for every non-Wirehair `--rowdist`, ~200k sampled
+  degrees at K = 3200 are tested against an independently transcribed copy of
+  the analytic weight law (bins pooled to expected count >= 10; bound
+  `df + 8*sqrt(2*df) + 30` — loose against noise, far below the chi-square a
+  mis-ported spike/tau/cap produces);
+- `--max-inact`: capping below a trial's natural inactivation count must
+  flag it as a runaway failure, capping at exactly the natural count must
+  reproduce the unlimited result bit-for-bit;
+- determinism of the new kinds (Shuffle-2 D2 rows, n1 variants, robust
+  soliton rowdist), including prefix identity when an overhead sweep extends
+  the same trial's received-packet trace;
+- bounded packet-schedule exhaustion is returned as trial data rather than
+  terminating a worker process.
+
+```bash
+bash experiments/precode/build.sh
+./experiments/precode/precode_sim --self-test
+./experiments/precode/gf16_mixed
+python3 experiments/precode/rank_total.py --self-test
+```
+
+### Mixed GF(256) / GF(2^16) payload prototype
+
+`gf16_mixed` is the original self-contained experiment and independent oracle
+for the opt-in mixed WH2 completion profile now implemented in production.  It
+keeps 12 completion variables and rows, but uses 10 periodic GF(256) Cauchy
+rows followed by two rows in the quadratic extension
+`GF(256)[u]/(u^2 + u + 32)`.  The extension coordinates use pinned generator
+266 and the same 244-column coefficient period as the current heavy rows.
+Production profile identity, serialization, kernels, and end-to-end tests live
+under `codec/`; this standalone harness remains useful as an independent math
+and performance cross-check.
+
+The first prototype accepts only even block sizes: every adjacent byte pair is
+one complete extension-field element.  Its test executable exhaustively checks
+all nonzero inverses, checks random field laws, differentially compares the
+interleaved oracle with the planar constant-muladd kernel (including unaligned
+buffers and odd-length failure/no-write), roundtrips projected payload systems
+at quotient widths 1, 2, 10, and 12, rejects width 13, certifies all 244
+consecutive completion-parity corners plus 10,000 non-consecutive subsets, and
+compares direct RHS generation with the bounded 244-residue path.  The final two output lines time
+the current 12-row GF(256) kernel against the proposed 10+2 kernel at MTU and
+large block sizes; these are heavy-phase microbenchmarks, not whole-codec
+throughput.
+Pass `--test-only` to run every algebra, kernel, payload, and RHS check while
+skipping the timing loops (useful under emulation and sanitizers).
+
+## `--ge-replay`: real GE elimination replay
+
+`--ge-replay` builds the residual binary system explicitly after the rank
+analysis: rows are the unused-row projections onto the inactivated columns
+(the exact bitsets the rank accumulator consumes), columns ordered in
+INACTIVATION order.  Rows are sorted once, up front, by ascending initial
+popcount (cheapest-pivot-first, a production-like heuristic;
+`--ge-replay-reverse` flips to descending order as a sensitivity check, and
+implies `--ge-replay`).  Plain GE then runs column by column: the first
+remaining row with the column bit set becomes the pivot and is XORed into
+every remaining row holding that bit.  `--ge-pivot-window N` implies
+`--ge-replay` and changes only the replay pivot choice: it scans the next `N`
+remaining rows for the current column and chooses the candidate with the lowest
+remaining tail popcount, falling back to the first later candidate if the
+bounded window has none.  Recorded per trial:
+
+- word XORs: each elimination costs `words - col/64` 64-bit word XORs, the
+  words a triangular implementation actually touches (`ge_real_bitops_mu`);
+- row eliminations, i.e. real GE block XORs (`ge_real_rowops_mu`);
+- fill-in: the popcount growth of each pivot row above its initial weight,
+  measured at the moment it is selected as pivot (`fill_in_mu`);
+- deficient (pivotless) column positions, counted from the END of the
+  inactivation order (last inactivated column = position 0).
+
+Per trial the replay rank is asserted equal to the rank accumulator's rank.
+The deficiency-position census feeds the heavy-band question (production's
+heavy matrix covers only the last 18 GE columns):
+
+- `def_outside_w18_rate`: fraction of trials with at least one deficient
+  column at from-the-end position >= 18 (i.e. outside a width-18 band);
+- `def_band_w95` / `def_band_w99`: 95th/99th percentile (nearest-rank) over
+  trials of the band width needed to cover every deficiency, i.e. deepest
+  deficient from-the-end position + 1; trials with no deficiency count as 0.
+
+## `--paired`: common-random-number trials across schemes
+
+`--paired` generates received rows from a second RNG whose per-trial seed
+omits both the scheme token and overhead (constraint rows keep the
+scheme-dependent stream).  The scheme-specific precode seed also omits
+overhead.  Thus each overhead point extends the same precode system and
+received-packet trace, while cross-scheme fail-rate deltas at the same
+`(K, oh, trial, --seed)` are CRN-paired.  Exactly what is and is not paired:
+
+- PAIRED for any two schemes at the same `(K, oh, trial, --seed, --rowdist,
+  --mix)`: the per-row peel degree sequence and the source-column sets
+  (columns `< K`), including their draw order.
+- PAIRED only when the schemes have equal precode width `D + H`: the mix
+  columns.  Each row draws exactly `mix` raw 64-bit values from the paired
+  stream (consumed even when `D + H = 0`, keeping streams in lockstep) and
+  maps them into the scheme-local `D + H` precode space by modulo plus
+  deterministic linear probing for distinctness.  Equal widths give identical
+  mix columns; different widths necessarily give different mix columns, but
+  the RNG stream itself never diverges.
+- NOT PAIRED, by design: the binary precode constraint rows (LDPC parity
+  assignments, dense row bits), which remain a function of the scheme token.
+
+Packet-loss schedules accept `--loss` from 0 through 0.99.  Larger values are
+rejected before the CSV header because the bounded schedule generator is not
+intended to model such extreme loss.  Any unexpected exhaustion inside the
+supported range is recorded in `packet_schedule_exhausted_rate` (and the
+failure rate) instead of terminating a worker.  CSV rows also carry the full
+run-defining configuration: row distribution, packet schedule, loss,
+identity-systematic flag, mix, base seed, paired flag, inactivation/time
+bounds, requested trials, thread count, and GE replay mode/window.
+
+## `rank_total.py`: reliability-gated total-cost ranking
+
+Folds the per-scheme XOR ledger and the GF(256) heavy ledger into one
+calibrated `total_block_ops(bb)` per block size.  Every `(K, oh, bb)` report
+contains the reliability-filtered cost ranking, cost-vs-failure Pareto front,
+and winner (or an explicit `no feasible scheme`).  Rejected rows are retained
+with their gate failures, but are never labeled winners.  The legacy
+modeled-H ldpcdense/dense muladd:xor crossovers are retained as a separate
+section.
+
+`--reliability-h modeled` evaluates each row at the H that produced its cost
+ledger; an integer in `[0,128]` re-scores the empirical `def_pdf` at that
+alternative H.  Independent gates cover minimum sample size, observed failure
+rate, and the one-sided Wilson score upper confidence bound:
+
+`(p + z^2/(2n) + z*sqrt((p*(1-p) + z^2/(4n))/n)) / (1 + z^2/n)`,
+
+where `z` is the standard-normal quantile for `--confidence` (default 0.95).
+This method has defined behavior for zero observed failures and small samples;
+`--min-trials`, `--max-observed-fail`, and `--max-upper-fail` make the chosen
+policy explicit in both reports.  Their defaults are 100, 0.005, and 0.05,
+respectively, matching the bounded row-distribution screen below; pass 1 for
+all three to request the historical permissive cost-only eligibility policy.
+
+Cost defaults to the complete ledger recorded at modeled H, even when
+reliability is evaluated at another H.  `--cost-h reliability` instead
+recomputes the known heavy term as `H*inact_mu + H^2` using the modeled-H
+`inact_mu`; all other cost terms remain measured at modeled H.  Both the human
+and JSON reports label this assumption.  `--pessimistic` doubles the heavy
+term.  Old CSVs without the heavy/replay columns remain supported (heavy is
+derived and GE uses the `R^2/2` estimate).
+
+```bash
+python3 experiments/precode/rank_total.py results/hybrid_K*.csv \
+    --xor-csv experiments/peeling/results/cold_xor_calibration.csv \
+    --muladd-csv experiments/peeling/results/muladd_calibration.csv \
+    --bb 1280,102400,1048576 \
+    --min-trials 100 --max-observed-fail 0.005 \
+    --max-upper-fail 0.05 --json-out /tmp/precode-ranking.json
+```
+
+Result and calibration inputs use exact documented CSV schemas.  Every numeric
+field must be finite and in-domain.  `def_pdf` bins must be unique,
+nonnegative, and normalized within `2e-5 + bins*1e-6`, the simulator's
+six-decimal output tolerance.  Each probability must recover an integer count
+at the recorded `trials`; those exact counts drive confidence bounds.  All
+inputs are validated before output, so malformed input produces no partial
+ranking and cannot replace `--json-out`.  An omitted calibration flag or an
+unmeasured requested block size uses the positive `--assume-ratio` (default
+4.0); an explicitly named missing or malformed calibration file is an error.
+Generated report `.txt` files are not result inputs.  JSON uses the stable
+`wirehair.precode-ranking.v1` schema with sorted keys and deterministic row
+ordering.
+
+## Schemes
+
+| token | meaning |
+| --- | --- |
+| `none` | no precode (pure LT control) |
+| `dense` | `D = GetDenseCount(K)` iid p=0.5 binary rows (production idealization), H=6 |
+| `dense_d<D>` | explicit dense row count |
+| `densesparse_w<W>[_d<D>]` | fixed-weight-`W` random binary rows |
+| `ldpc[_s<S>]` | LDPC-staircase: each source column in 3 random parities, double-diagonal parity chain |
+| `ldpc2x` | staircase with `S = 2 * GetDenseCount(K)` |
+| `ldpctri[_s<S>]` | circulant triple `{a, a+b, a+2b} mod S` variant |
+| `ldpcdense_s<S>_d<D2>` | S staircase parity columns + D2 iid p=0.5 dense rows over all `K + S + D2` binary columns |
+| `ldpcdense_n1<X>_s<S>_d<D2>` | same, but each SOURCE column connects to X (2, 3 or 4) distinct staircase parities; `_n1` absent = 3 (token and RNG-stream compatible with the historical behavior) |
+| `ldpcdense...`+`_s2` | D2 rows generated Shuffle-2-style instead of iid (exact rule below); combines with `_n1<X>`, e.g. `ldpcdense_n12_s50_d12_s2` |
+| `codecport[_n1<X>][_ic]` | real codec-side V2 precode construction: `S = GetDenseCount(K)`, `D2 = 12`, H=12, default N1=2 below K=10000 and N1=3 from K=10000 upward; `_n1<X>` pins a comparison value (for example `codecport_n12`, `codecport_n13_ic`), and `_ic` is the separately reliability-certified identity-corner experiment; the shipping version-4 joint solver retains the unsuffixed full-span construction |
+| `heavyonly` | no binary precode, heavy only (default H=16) |
+| any token + `_h<H>` | override heavy row count (after `_s2` when both present: `..._s2_h<H>`) |
+
+### `_s2`: Shuffle-2 structured D2 rows (exact generation rule)
+
+This is the production-implementable form of the D2 dense rows, mirroring the
+window mechanics of `MultiplyDenseRows` (WirehairCodec.cpp:786) /
+`ShuffleDeck16` (WirehairTools.cpp:398).  The rule below is what the simulator
+certifies and what a codec implementation must reproduce bit-exactly over the
+matrix bits (`span = K + S + D2`, the full binary column space the D2 rows
+cover: source + staircase parity + dense columns):
+
+1. **Deck construction.** `deck` = permutation of the `span` column ids,
+   produced by the Sattolo-style inside-out shuffle used by `ShuffleDeck16`:
+   `deck[0] = 0; for ii in [1, span): jj = rand() % ii; deck[ii] = deck[jj];
+   deck[jj] = ii;`.  The simulator draws `jj` as an unbiased full-width
+   uniform in `[0, ii)` from the trial's constraint-row splitmix64 RNG
+   (immediately after the staircase rows are generated, so the deck stream is
+   seeded by the scheme/trial seed).  Production will instead consume a
+   `PCGRandom` seeded with the dense seed in 8-/16-bit chunks exactly as
+   `ShuffleDeck16` does — the *structure* of the rule is what the simulator
+   certifies, not the raw bit source.
+2. **First-row window.** `set_count = ceil(span/2) = (span+1) >> 1`.  The
+   first D2 row has exactly the columns `deck[0 .. set_count)` set.
+3. **Per-row flip selection.** Reshuffle the deck (same shuffle, continuing
+   the same RNG stream).  Interpret `set_half = deck[0 .. set_count)` and
+   `clear_half = deck[set_count .. span)`.  The next `floor(D2/2)` rows are
+   each `row[i+1] = row[i] XOR {set_half[ii], clear_half[ii]}` for
+   `ii = 0, 1, 2, ...` — exactly two bit flips per row; the two flipped
+   columns are always distinct because deck entries at distinct positions are
+   distinct.  Then reshuffle the deck once more and generate the remaining
+   `floor(D2/2) - 1 + (D2 & 1)` rows by the same flip rule with `ii`
+   restarting at 0.  Row count check: `1 + floor(D2/2) + floor(D2/2) - 1 +
+   (D2 & 1) = D2`, mirroring production's two half-loops around the second
+   reshuffle.
+
+Documented deviations from production `MultiplyDenseRows` (both deliberate):
+(a) ONE window spanning all `span` columns instead of production's successive
+blocks of `dense_count` columns — production XOR-accumulates every block's
+pattern into the destination rows, which destroys the global 2-flip chain;
+with a single window the "each row = previous row + 2 flips" property holds
+over the whole row, which is the structure E5 is testing; (b) no `rows`
+destination-permutation deck — rows are emitted in generation order, which
+cannot change the linear system (a codec implementation MAY reintroduce the
+rows deck for stream parity with `MultiplyDenseRows`).
+
+Value-generation cost charged to `precode_gen_xors_mu`: `set_count +
+2*(D2-1)` block XORs (first-row accumulation plus two incremental flips per
+subsequent row), vs the `2.5 * span` window estimate charged to the iid
+model.
+
+## `--rowdist`: received-row degree distributions
+
+| token | law |
+| --- | --- |
+| `wirehair` (default) | production `GeneratePeelRowWeight` |
+| `lt_m1_c64` | truncated LT (soliton-like, `w(1) = 1/K`, `w(d) = 1/(d(d-1))`), min degree 1, cap 64, renormalized |
+| `lt_m1_c16` | same LT family, min degree 1, cap 16 |
+| `lt_m2_c1024` | LT family, min degree 2, cap 1024 |
+| `rs_c001_d50_c128` | robust soliton `c = 0.01, delta = 0.50`, min degree 1, cap 128 |
+
+`rs_c001_d50_c128` mirrors `peel_sweep`'s `robust_soliton_weight` exactly:
+`R = max(1, c*ln(K/delta)*sqrt(K))`, `spike = clamp(floor(K/R), 1, K)`,
+`w(d) = lt(d) + tau(d)` with `tau(d) = R/(d*K)` for `d < spike`,
+`R*ln(R/delta)/K` at `d == spike`, 0 above; the cap truncates the law (at
+K = 3200 the spike sits at d = 645, above the 128 cap, so only the `R/(d*K)`
+shoulder survives) and the cumulative sum renormalizes.  All non-Wirehair
+laws are chi-square-validated against an independent transcription in the
+self-test.
+
+## `--max-inact <count>`: runaway guard
+
+Retuned low-cap rowdists (especially `lt_m1_c16` at large K) can drive the
+peeler into pathological inactivation counts, making the residual-rank step
+quadratically expensive.  `--max-inact N` aborts a trial as soon as the
+inactivated column count EXCEEDS N (0 = unlimited, the default).  Aborted
+trials are recorded as *runaways*: they count as decode failures in
+`fail_rate` / `fail_rate_noheavy`, are reported in the `runaway_rate` column
+(appended at the end of the CSV), and are EXCLUDED from every def/inact/cost
+mean (those statistics do not exist for an abandoned solve, and a partial
+inactivation count would bias the means of the surviving trials).  In
+`def_pdf` runaways appear as a sentinel `999999:<rate>` bucket so the pdf
+stays normalized over all trials and re-scoring it at any H still reproduces
+the fail rate exactly (`rank_total.py` asserts this).  A nonzero
+`runaway_rate` is signal, not an error — it certifies that the
+(rowdist, scheme, K) cell blows past the bound.
+
+## `--max-row-seconds <seconds>`: bounded aggregate rows
+
+`--max-row-seconds S` bounds each output CSV row.  Worker threads stop
+launching new trials after roughly `S` seconds for that `(K, scheme, oh)` cell,
+finish any in-flight trials, and still emit the aggregate row with the actual
+completed `trials` count.  This is intended for very large K certification
+probes where a full row may otherwise run for a long time without producing
+usable output.  Because the cutoff is wall-clock and scheduler dependent, use
+unbounded fixed-trial runs for final certification.  `0` (the default) disables
+the bound.
+
+## Example
+
+```bash
+./experiments/precode/precode_sim --K 3200 --schemes dense,ldpc,dense_d31_h12 \
+    --oh 0,1,2,5 --trials 4000 --threads 120
+```
+
+Sweep driver used for `results/sweep_K*.csv`: see git history (`/tmp/precode_sweep.sh`
+pattern): K in {1000, 3200, 10000, 32000, 64000}, 14 schemes, OH in {0,1,2,5}.
+
+## Output columns
+
+- `fail_rate`: P(def > H) — decode failure under the MDS heavy-patch model.
+- `fail_rate_noheavy`: P(def > 0). With H heavy columns and OH < H this is 1 by
+  construction (binary rows minus unknowns = OH - H), so it is only meaningful
+  for `none`.
+- `def_pdf`: empirical def distribution (`value:probability`), enough to
+  re-evaluate any alternative heavy-row count after the fact.  Normalized
+  over ALL trials; `--max-inact` runaways show up as a `999999:<rate>`
+  sentinel bucket and bounded packet-schedule exhaustion as `999998:<rate>`.
+  Both fail at every H and are excluded from completed-trial means, keeping
+  `P(def > H) == fail_rate`.
+- `inact_*`: inactivated column count (GE width).
+- `backsub_xors_mu`: sum of popcount(projection) over peeled columns — the
+  block-XOR cost of pushing inactivated solutions back into peeled columns;
+  this is the dominant block-op term and scales with `inact`.
+- `sparse_solve_xors_mu`: peel-side block-XOR proxy (degree-1 per used row).
+- `precode_gen_xors_mu`: encoder-side precode value generation block XORs
+  (dense uses the Shuffle-2 incremental estimate `2.5 * (K + D)`).
+- `ge_block_xors_mu`, `ge_bitops_mu`: `R^2/2` and `rows * R^2 / 64` estimates.
+- `heavy_muladds_mu`: mean `H*inact + H^2` block-unit GF(256) muladds (heavy
+  value substitution + heavy GE elimination); `heavy_divs_mu`: `H` block-unit
+  GF(256) divides.
+- With `--ge-replay` only (columns appended after the above):
+  `ge_real_bitops_mu` (measured 64-bit word XORs), `ge_real_rowops_mu`
+  (measured row eliminations = real GE block XORs), `fill_in_mu`,
+  `def_outside_w18_rate`, `def_band_w95`, `def_band_w99` (see above).
+- `runaway_rate` (always present): fraction of trials aborted by
+  `--max-inact` (0 when the guard is off).  Runaway trials are inside
+  `fail_rate`/`fail_rate_noheavy` but outside every mean column, whose
+  denominators are the completed trials only.
+- `packet_schedule_exhausted_rate` and the run-defining metadata described
+  above follow `runaway_rate`.
+
+Existing column order is unchanged; new columns are appended at the end so
+positional readers keep their historical indices.  The repository's strict
+`validate_results.py` and `rank_total.py` readers accept both old and new
+schemas.
