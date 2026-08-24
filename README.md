@@ -91,6 +91,8 @@ Script catalog (purpose + usage + key env):
 **[docs/SCRIPTS.md](docs/SCRIPTS.md)**.
 RS codec (architecture, API, runtime profiles):
 **[docs/RS_CODEC.md](docs/RS_CODEC.md)**.
+FEC transport library (RS groups + Wirehair v4 with optional ACK):
+**[docs/FEC_TRANSPORT.md](docs/FEC_TRANSPORT.md)**.
 Per-node wire hop:
 **[apps/wire_relay/README.md](apps/wire_relay/README.md)**,
 **[docs/WIRE_RELAY_PIPELINE.md](docs/WIRE_RELAY_PIPELINE.md)**.
@@ -115,6 +117,7 @@ Details: [`apps/wg_multi_pipeline/README.md`](apps/wg_multi_pipeline/README.md).
 ```bash
 make                  # libmulti_flow.a
 make test             # unit tests (run_tests.c)
+make fec-transport    # fec_transport RS + Wirehair tests
 make integration-test # multi-file + wire + wire_relay loopback
 make wg-demo          # build wg_multi_pipeline
 make wire-relay       # build apps/wire_relay (per-node encode/forward/decode)
@@ -151,7 +154,8 @@ See [`apps/wire_relay/README.md`](apps/wire_relay/README.md) and
 | `fd_sink` | write() with partial retry |
 | `flow_peer_map` | UDP 5-tuple → internal flow slot |
 | `ingress_push` | Upstream bytes → `flow_manager_push` |
-| `wire_header` | Shared WGP1 wire header encode/decode (v3) |
+| `wire_header` | Shared WGP1 wire header encode/decode (v3 / v4) |
+| `fec_transport` | Socket-free RS / Wirehair encoder+decoder (`docs/FEC_TRANSPORT.md`) |
 
 ## Pacing
 

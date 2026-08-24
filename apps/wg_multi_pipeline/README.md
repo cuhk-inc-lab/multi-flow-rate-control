@@ -32,6 +32,7 @@ cmp c.ts  out_c.ts
 | `--codec rs-fec` | Systematic Reed-Solomon FEC via liberasurecode: 4 data + 2 parity shards |
 | `--codec rs` | Systematic Reed-Solomon FEC via vendored hqm/rscode (column-wise RS 4+2); GPL |
 | `--codec none` / `--no-codec` | Local relay: skip coding; pointer-only post-worker queue. In wire UDP modes, `none` sends raw single-shard blocks |
+| `--codec wirehair` | Fountain segments on wire **v4**. Defaults: 10 MiB / 10% repair / ACK off. See [docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md) |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
@@ -113,6 +114,27 @@ Sender and receiver must use the **same fixed** `(k, parity)`. Wire
 retune the process RS profile. Concurrent wire flows in one process share that
 geometry. Working size follows your `(k,r)`; the GF(256) ceiling is
 `k+r ≤ 255` (presence uses a bit array, not a 32-bit mask).
+
+### Wirehair (`--codec wirehair`)
+
+Fountain coding on wire v4 (not compatible with v3 RS/`copy` receivers).
+Library embedding (no sockets): **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md)**.
+
+```bash
+./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
+  --wh-segment-mib=1 --wh-repair-pct=10 \
+  --final-dst 4 --ttl 8 --udp-send 10.10.12.2 9000 input.bin
+
+./build/wg_multi_pipeline --codec wirehair --wh-ack \
+  --udp-recv 9000 out.bin --local-node-id 4 --idle-sec 5 --strict
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--wh-segment-mib=N` | Segment size in MiB (default 10) |
+| `--wh-repair-pct=P` | Extra packets as % of source packets (default 10) |
+| `--wh-ack` / `--no-wh-ack` | Request ACK to stop leftover repair (default off) |
+| `--ack-port=N` | Sender bind port for incoming ACK datagrams |
 
 ## Per-block latency and jitter
 

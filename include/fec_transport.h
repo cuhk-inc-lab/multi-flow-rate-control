@@ -42,7 +42,8 @@ typedef enum {
 } FecOutputStatus;
 
 typedef enum {
-    FEC_CODEC_RS = 0
+    FEC_CODEC_RS = 0,
+    FEC_CODEC_WIREHAIR = 1
 } FecCodecKind;
 
 typedef FecOutputStatus (*FecOutputFn)(void *ctx,
@@ -51,6 +52,8 @@ typedef FecOutputStatus (*FecOutputFn)(void *ctx,
 
 typedef struct {
     FecOutputFn output;
+    /* Optional. Wirehair decoder emits v4 ACK datagrams here. */
+    FecOutputFn ack_output;
     void *ctx;
 } FecCallbacks;
 
@@ -65,6 +68,15 @@ typedef struct {
     size_t output_queue_bytes;
     uint64_t wire_rate_bps;
     uint64_t wire_burst_bytes;
+    /* Wirehair-only. Zero means library defaults in create(). */
+    uint32_t segment_bytes;
+    uint8_t repair_percent;
+    uint8_t ack_enabled;
+    uint8_t origin_node;
+    uint8_t final_dst;
+    uint8_t ttl;
+    uint8_t ack_ttl;
+    uint32_t flow_id;
 } FecTransportConfig;
 
 typedef struct {
@@ -111,6 +123,10 @@ FecStatus fec_encoder_drain(FecEncoder *encoder, size_t budget);
 int fec_encoder_has_pending(const FecEncoder *encoder);
 uint64_t fec_encoder_next_update_ns(const FecEncoder *encoder);
 void fec_encoder_get_stats(const FecEncoder *encoder, FecStats *stats);
+/* Wirehair: feed a v4 ACK datagram so remaining repair can stop. */
+FecStatus fec_encoder_input_ack(FecEncoder *encoder,
+                                const void *datagram,
+                                size_t length);
 
 FecDecoder *fec_decoder_create(const FecTransportConfig *config,
                                const FecCallbacks *callbacks);

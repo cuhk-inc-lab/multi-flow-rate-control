@@ -452,15 +452,18 @@ $(RS_ENCODE_GENERAL_TEST_BIN): $(TEST_DIR)/rs_encode_general_tests.c \
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(OBJ_DIR)/fec_transport.o: $(SRC_DIR)/fec_transport.c include/fec_transport.h \
-	$(INCLUDE_HDRS) $(WG_HDRS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(RSCODE_DIR) -c $< -o $@
+	$(INCLUDE_HDRS) $(WG_HDRS) $(WG_DIR)/wirehair_segment.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -DWIREHAIR_STATIC -I$(WG_DIR) -I$(RSCODE_DIR) \
+		-I$(WIREHAIR_DIR)/include -c $< -o $@
 
 $(FEC_TRANSPORT_TEST_BIN): $(TEST_DIR)/fec_transport_tests.c \
 	$(OBJ_DIR)/fec_transport.o $(OBJ_DIR)/wire_header.o \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
-	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
+	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) \
+	$(OBJ_DIR)/wg_wirehair_segment.o $(WIREHAIR_LIB) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(WIREHAIR_DIR)/include $^ -o $@ \
+		$(LDFLAGS) $(RS_LDFLAGS)
 
 $(FEC_INTERLEAVE_SIM_BIN): $(TEST_DIR)/fec_interleave_sim.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \

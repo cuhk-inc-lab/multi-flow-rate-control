@@ -23,6 +23,9 @@ the sender points to the sender's `--ack-port`. Wirehair v4 bypasses the
 v3-only `GenerationCache`. A receiver keeps at most four active segment
 decoders, so the default peak decode payload storage is about 40 MiB per flow.
 
+Embedding the same Wirehair+ACK path without sockets:
+[`docs/FEC_TRANSPORT.md`](FEC_TRANSPORT.md).
+
 ---
 
 ## Unified per-node pipeline

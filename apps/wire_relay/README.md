@@ -81,8 +81,10 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
   [--max-cache-bytes N] \
   [--transit-hook identity|plus-minus] \
   [--decode-reencode-stub] \
-  [--local-decode --codec copy|xor-fec|rs-fec|rs|none \
+  [--local-decode --codec copy|xor-fec|rs-fec|rs|wirehair|none \
       (--output FILE | --output-dir DIR)] \
+  [--return-hop HOST:PORT] \
+  [--wh-segment-mib=N --wh-repair-pct=P --wh-ack|--no-wh-ack] \
   [--source FILE --final-dst N --ttl N --codec ... \
       [--flow-id N] [--rate-mbps N]]
 ```
@@ -113,6 +115,15 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--flow-id` / `--rate-mbps` | Optional source pacing |
 | `--output` | L1 single-flow output file |
 | `--output-dir` | L2 multi-flow output directory |
+| `--return-hop` | Where to send Wirehair ACK (`WIRE_FLAG_RETURN_PATH`) |
+| `--wh-segment-mib` / `--wh-repair-pct` | Wirehair segment size / repair ceiling |
+| `--wh-ack` / `--no-wh-ack` | Destination emits ACK; source stops leftover repair |
+
+Wirehair (`--codec wirehair`) uses wire **v4**. ACK is optional (`--wh-ack`)
+and must be routed back with `--return-hop` on each hop toward the source.
+Library API (same v4, no sockets):
+**[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md)**.
+Pipeline notes: **[docs/WIRE_RELAY_PIPELINE.md](../../docs/WIRE_RELAY_PIPELINE.md)**.
 
 ### Relay benchmark cases
 
