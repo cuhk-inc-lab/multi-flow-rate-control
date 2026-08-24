@@ -2,6 +2,7 @@
 #define WIRE_RELAY_LOCAL_SOURCE_H
 
 #include "codec.h"
+#include "wirehair_segment.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -27,6 +28,9 @@ typedef struct LocalSourceConfig {
     uint8_t     ttl;
     /* 0 => unpaced; otherwise source/payload Mbps pacing between blocks. */
     double      source_rate_mbps;
+    WirehairSegmentConfig wirehair;
+    WirehairSegmentAckPollFn ack_poll;
+    void       *ack_ctx;
 } LocalSourceConfig;
 
 typedef struct LocalSourceStats {

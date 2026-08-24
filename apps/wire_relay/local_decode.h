@@ -4,11 +4,13 @@
 #include "codec.h"
 #include "relay.h"
 #include "wire_flow_decoder.h"
+#include "wirehair_segment.h"
 
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #ifndef LOCAL_DECODE_PATH_MAX
 #ifdef PATH_MAX
@@ -36,6 +38,7 @@ typedef struct LocalDecodeFlow {
     FILE            *output;
     int              close_output; /* 1 => hub owns FILE* */
     WireFlowDecoder *dec;
+    WirehairSegmentReceiver *wirehair_dec;
     uint64_t         delivered;
     uint64_t         metadata_mismatch;
     uint64_t         ingest_error;
@@ -47,6 +50,11 @@ typedef struct LocalDecodeHub {
     uint16_t            expected_shards;
     size_t              input_size;
     int                 best_effort;
+    int                 wirehair_mode;
+    WirehairSegmentConfig wirehair;
+    int                 ack_sock;
+    struct sockaddr_storage ack_target;
+    socklen_t           ack_target_len;
 
     LocalDecodeMode     mode;
     char                output_dir[LOCAL_DECODE_PATH_MAX];
@@ -73,6 +81,9 @@ typedef struct LocalDecodeHubConfig {
     FILE            *output;      /* optional pre-opened SINGLE_FILE; not owned */
     int              best_effort; /* default 0 = strict */
     uint8_t          local_node_id;
+    WirehairSegmentConfig wirehair;
+    const char        *return_hop_host;
+    uint16_t           return_hop_port;
 } LocalDecodeHubConfig;
 
 int local_decode_hub_init(LocalDecodeHub *hub, const LocalDecodeHubConfig *cfg);

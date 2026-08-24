@@ -19,8 +19,9 @@ static uint64_t be64_to_host(uint64_t value)
     return ((uint64_t)high << 32) | low;
 }
 
-void wire_header_encode(unsigned char out[WIRE_HEADER_SIZE],
-                        const WireHeader *header)
+static void wire_header_encode_base(unsigned char *out,
+                                    const WireHeader *header,
+                                    uint8_t version)
 {
     uint32_t value32;
     uint64_t value64;
@@ -32,7 +33,7 @@ void wire_header_encode(unsigned char out[WIRE_HEADER_SIZE],
 
     value32 = htonl(WIRE_MAGIC);
     memcpy(out, &value32, sizeof(value32));
-    out[4] = WIRE_VERSION;
+    out[4] = version;
     out[5] = header->type;
     out[6] = header->final_dst;
     out[7] = header->ttl;
@@ -55,6 +56,36 @@ void wire_header_encode(unsigned char out[WIRE_HEADER_SIZE],
     memcpy(out + 36, &value64, sizeof(value64));
 }
 
+void wire_header_encode(unsigned char out[WIRE_HEADER_SIZE],
+                        const WireHeader *header)
+{
+    wire_header_encode_base(out, header, WIRE_VERSION_V3);
+}
+
+void wire_header_encode_v4(unsigned char out[WIRE_V4_HEADER_SIZE],
+                           const WireHeader *header)
+{
+    uint32_t value32;
+    uint16_t reserved = 0;
+
+    if (out == NULL || header == NULL) {
+        return;
+    }
+    wire_header_encode_base(out, header, WIRE_VERSION_V4);
+    out[44] = header->origin_node;
+    out[45] = header->flags;
+    memcpy(out + 46, &reserved, sizeof(reserved));
+    value32 = htonl(header->segment_bytes);
+    memcpy(out + 48, &value32, sizeof(value32));
+}
+
+size_t wire_header_size(const WireHeader *header)
+{
+    return header != NULL && header->version == WIRE_VERSION_V4
+               ? WIRE_V4_HEADER_SIZE
+               : WIRE_HEADER_SIZE;
+}
+
 int wire_header_decode(WireHeader *header,
                        const unsigned char *data,
                        size_t len)
@@ -63,15 +94,22 @@ int wire_header_decode(WireHeader *header,
     uint64_t value64;
     uint16_t value16;
 
+    uint8_t version;
+
     if (header == NULL || data == NULL || len < WIRE_HEADER_SIZE) {
         return -1;
     }
 
     memcpy(&value32, data, sizeof(value32));
-    if (ntohl(value32) != WIRE_MAGIC || data[4] != WIRE_VERSION) {
+    version = data[4];
+    if (ntohl(value32) != WIRE_MAGIC ||
+        (version != WIRE_VERSION_V3 && version != WIRE_VERSION_V4) ||
+        (version == WIRE_VERSION_V4 && len < WIRE_V4_HEADER_SIZE)) {
         return -1;
     }
 
+    memset(header, 0, sizeof(*header));
+    header->version = version;
     header->type = data[5];
     header->final_dst = data[6];
     header->ttl = data[7];
@@ -91,6 +129,12 @@ int wire_header_decode(WireHeader *header,
     header->encode_begin_ns = be64_to_host(value64);
     memcpy(&value64, data + 36, sizeof(value64));
     header->encode_end_ns = be64_to_host(value64);
+    if (version == WIRE_VERSION_V4) {
+        header->origin_node = data[44];
+        header->flags = data[45];
+        memcpy(&value32, data + 48, sizeof(value32));
+        header->segment_bytes = ntohl(value32);
+    }
     return 0;
 }
 

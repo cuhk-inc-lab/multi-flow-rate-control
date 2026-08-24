@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
@@ -36,6 +37,16 @@
  */
 #define WIRE_SHARD_PACE_SLEEP_SEC 0.0001
 #define WIRE_SHARD_PACE_MIN_SEC   0.000005
+#define WIRE_RECV_POLL_MS         100
+
+static int open_receiver_socket(uint16_t port);
+static int wire_flow_output_path(const char *prefix,
+                                 const struct sockaddr_storage *peer,
+                                 socklen_t peer_len, uint32_t flow_id,
+                                 const char *suffix, char *out,
+                                 size_t out_len);
+static const char *wire_recv_suffix_for_flow(
+    const WireUdpRecvConfig *config, uint32_t wire_flow_id);
 
 static const char *wire_codec_kind_name(CodecKind kind)
 {
@@ -50,6 +61,8 @@ static const char *wire_codec_kind_name(CodecKind kind)
         return "rs-fec";
     case CODEC_KIND_RS:
         return "rs";
+    case CODEC_KIND_WIREHAIR:
+        return "wirehair";
     case CODEC_KIND_NONE:
     default:
         return "none";
@@ -176,8 +189,9 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
                               socklen_t address_len, const WireHeader *header,
                               const unsigned char *payload)
 {
-    unsigned char datagram[WIRE_HEADER_SIZE + PKG_SIZE];
-    size_t length = WIRE_HEADER_SIZE + header->payload_len;
+    unsigned char datagram[WIRE_MAX_HEADER_SIZE + PKG_SIZE];
+    size_t header_size = wire_header_size(header);
+    size_t length = header_size + header->payload_len;
     ssize_t sent;
     int retries = 0;
 
@@ -185,9 +199,13 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
         return -1;
     }
 
-    wire_header_encode(datagram, header);
+    if (header->version == WIRE_VERSION_V4) {
+        wire_header_encode_v4(datagram, header);
+    } else {
+        wire_header_encode(datagram, header);
+    }
     if (header->payload_len > 0 && payload != NULL) {
-        memcpy(datagram + WIRE_HEADER_SIZE, payload, header->payload_len);
+        memcpy(datagram + header_size, payload, header->payload_len);
     }
 
     for (;;) {
@@ -445,6 +463,422 @@ int wire_udp_tx_send_end(WireUdpTx *tx, const Codec *codec)
                               tx->address_len, &end, NULL);
 }
 
+typedef struct WirehairUdpSendCtx {
+    int sock;
+    const struct sockaddr *address;
+    socklen_t address_len;
+    uint64_t wire_bytes;
+    double started;
+    double rate_mbps;
+} WirehairUdpSendCtx;
+
+typedef struct WirehairUdpAckCtx {
+    int sock;
+} WirehairUdpAckCtx;
+
+typedef struct WirehairUdpRecvCtx {
+    int sock;
+    FILE *output;
+    struct sockaddr_storage peer;
+    socklen_t peer_len;
+    int have_peer;
+} WirehairUdpRecvCtx;
+
+typedef struct WirehairUdpRecvFlow {
+    int active;
+    uint32_t flow_id;
+    WirehairSegmentReceiver *receiver;
+    WirehairUdpRecvCtx io;
+} WirehairUdpRecvFlow;
+
+static int bind_sender_port(int sock, int family, uint16_t port)
+{
+    if (port == 0) {
+        return 0;
+    }
+    if (family == AF_INET) {
+        struct sockaddr_in address;
+
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        address.sin_port = htons(port);
+        return bind(sock, (const struct sockaddr *)&address,
+                    sizeof(address)) == 0 ? 0 : -1;
+    }
+    if (family == AF_INET6) {
+        struct sockaddr_in6 address;
+
+        memset(&address, 0, sizeof(address));
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_any;
+        address.sin6_port = htons(port);
+        return bind(sock, (const struct sockaddr *)&address,
+                    sizeof(address)) == 0 ? 0 : -1;
+    }
+    return -1;
+}
+
+static int wirehair_udp_emit(const WireHeader *header,
+                             const uint8_t *payload, size_t payload_len,
+                             void *opaque)
+{
+    WirehairUdpSendCtx *ctx = opaque;
+
+    if (ctx == NULL || header == NULL || payload_len != header->payload_len ||
+        send_wire_datagram(ctx->sock, ctx->address, ctx->address_len,
+                           header, payload) != 0) {
+        return -1;
+    }
+    ctx->wire_bytes += wire_header_size(header) + payload_len;
+    pace_to_source_rate(ctx->started, ctx->wire_bytes, ctx->rate_mbps);
+    return 0;
+}
+
+static int wirehair_udp_ack_poll(uint32_t flow_id, uint64_t segment_id,
+                                 unsigned wait_ms, void *opaque)
+{
+    WirehairUdpAckCtx *ctx = opaque;
+    struct pollfd pfd;
+    int polled;
+
+    if (ctx == NULL || ctx->sock < 0) {
+        return -1;
+    }
+    pfd = (struct pollfd){.fd = ctx->sock, .events = POLLIN};
+    do {
+        polled = poll(&pfd, 1, (int)wait_ms);
+    } while (polled < 0 && errno == EINTR);
+    if (polled < 0) {
+        return -1;
+    }
+    if (polled == 0 || (pfd.revents & POLLIN) == 0) {
+        return 0;
+    }
+    for (;;) {
+        uint8_t datagram[WIRE_MAX_HEADER_SIZE + PKG_SIZE];
+        WireHeader header;
+        ssize_t received = recvfrom(ctx->sock, datagram, sizeof(datagram),
+                                    MSG_DONTWAIT, NULL, NULL);
+
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received < 0) {
+            return -1;
+        }
+        if (wire_header_decode(&header, datagram, (size_t)received) == 0 &&
+            header.version == WIRE_VERSION_V4 &&
+            header.type == WIRE_TYPE_ACK &&
+            header.flow_id == flow_id && header.block_id == segment_id) {
+            return 1;
+        }
+    }
+}
+
+static int wirehair_udp_output(uint32_t flow_id, const uint8_t *data,
+                               size_t len, void *opaque)
+{
+    WirehairUdpRecvCtx *ctx = opaque;
+
+    (void)flow_id;
+    return ctx != NULL && ctx->output != NULL &&
+                   fwrite(data, 1, len, ctx->output) == len
+               ? 0
+               : -1;
+}
+
+static int wirehair_udp_ack_emit(const WireHeader *ack, void *opaque)
+{
+    WirehairUdpRecvCtx *ctx = opaque;
+
+    if (ctx == NULL || !ctx->have_peer) {
+        return -1;
+    }
+    return send_wire_datagram(ctx->sock,
+                              (const struct sockaddr *)&ctx->peer,
+                              ctx->peer_len, ack, NULL);
+}
+
+static int wirehair_udp_send_file(const WireUdpSendConfig *config)
+{
+    struct sockaddr_storage address;
+    socklen_t address_len = 0;
+    WirehairUdpSendCtx emit_ctx;
+    WirehairUdpAckCtx ack_ctx;
+    uint8_t *segment = NULL;
+    FILE *input = NULL;
+    uint64_t segment_id = 0;
+    uint64_t source_bytes = 0;
+    uint64_t repair_sent = 0;
+    int sock = -1;
+    int result = -1;
+    double started;
+
+    if (config == NULL ||
+        !wirehair_segment_config_valid(&config->wirehair)) {
+        return -1;
+    }
+    sock = open_sender_socket(config->host, config->port, &address,
+                              &address_len);
+    if (sock < 0 ||
+        bind_sender_port(sock, address.ss_family, config->ack_port) != 0) {
+        goto out;
+    }
+    input = fopen(config->input_path, "rb");
+    segment = malloc(config->wirehair.segment_bytes);
+    if (input == NULL || segment == NULL) {
+        goto out;
+    }
+    emit_ctx = (WirehairUdpSendCtx){
+        .sock = sock,
+        .address = (const struct sockaddr *)&address,
+        .address_len = address_len,
+        .started = 0.0,
+        .rate_mbps = config->source_rate_mbps,
+    };
+    ack_ctx.sock = sock;
+    started = monotonic_seconds();
+    emit_ctx.started = started;
+
+    for (;;) {
+        size_t n = fread(segment, 1, config->wirehair.segment_bytes, input);
+        WirehairSegmentSendStats stats;
+
+        if (n == 0) {
+            if (ferror(input)) {
+                goto out;
+            }
+            break;
+        }
+        if (wirehair_segment_send(
+                &config->wirehair, config->flow_id, segment_id,
+                config->final_dst, config->ttl, segment, n,
+                wirehair_udp_emit, &emit_ctx,
+                config->wirehair.ack_enabled ? wirehair_udp_ack_poll : NULL,
+                &ack_ctx, &stats) != 0) {
+            goto out;
+        }
+        source_bytes += n;
+        repair_sent += stats.repair_sent;
+        segment_id++;
+        pace_to_source_rate(started, source_bytes,
+                            config->source_rate_mbps);
+    }
+
+    {
+        WireHeader end = {
+            .version = WIRE_VERSION_V4,
+            .type = WIRE_TYPE_END,
+            .final_dst = config->final_dst,
+            .ttl = config->ttl,
+            .flow_id = config->flow_id,
+            .block_id = segment_id,
+            .origin_node = config->wirehair.origin_node,
+            .flags = config->wirehair.ack_enabled
+                         ? WIRE_FLAG_ACK_REQUEST
+                         : 0u,
+        };
+        if (wirehair_udp_emit(&end, NULL, 0, &emit_ctx) != 0) {
+            goto out;
+        }
+    }
+    fprintf(stderr,
+            "wirehair-send: source_bytes=%llu segments=%llu repair_sent=%llu "
+            "wire_bytes=%llu ack=%s\n",
+            (unsigned long long)source_bytes,
+            (unsigned long long)segment_id,
+            (unsigned long long)repair_sent,
+            (unsigned long long)emit_ctx.wire_bytes,
+            config->wirehair.ack_enabled ? "on" : "off");
+    result = 0;
+out:
+    if (input != NULL) {
+        fclose(input);
+    }
+    free(segment);
+    if (sock >= 0) {
+        close(sock);
+    }
+    return result;
+}
+
+static int wirehair_udp_recv_file(const WireUdpRecvConfig *config)
+{
+    uint8_t datagram[WIRE_MAX_HEADER_SIZE + PKG_SIZE];
+    WirehairUdpRecvFlow *flows = NULL;
+    size_t max_flows;
+    size_t active_flows = 0;
+    int sock = -1;
+    int result = -1;
+    double last_receive;
+    size_t i;
+
+    if (config == NULL || config->output_path == NULL ||
+        !wirehair_segment_config_valid(&config->wirehair)) {
+        return -1;
+    }
+    max_flows = config->max_flows == 0 ? 1u : config->max_flows;
+    if (max_flows > MF_MAX_FLOWS) {
+        return -1;
+    }
+    flows = calloc(max_flows, sizeof(*flows));
+    if (flows == NULL) {
+        return -1;
+    }
+    sock = open_receiver_socket(config->port);
+    if (sock < 0) {
+        goto out;
+    }
+    fprintf(stderr,
+            "wirehair-recv: listening on UDP port %u segment_bytes=%u "
+            "repair_pct=%u ack=%s\n",
+            (unsigned)config->port, config->wirehair.segment_bytes,
+            config->wirehair.repair_percent,
+            config->wirehair.ack_enabled ? "on" : "off");
+    last_receive = monotonic_seconds();
+
+    for (;;) {
+        struct pollfd pfd = {.fd = sock, .events = POLLIN};
+        int polled = poll(&pfd, 1, WIRE_RECV_POLL_MS);
+        int all_complete = active_flows == max_flows;
+
+        for (i = 0; i < max_flows; i++) {
+            if (flows[i].active &&
+                !wirehair_segment_receiver_complete(flows[i].receiver)) {
+                all_complete = 0;
+                break;
+            }
+        }
+        if (all_complete) {
+            break;
+        }
+
+        if (polled < 0 && errno == EINTR) {
+            continue;
+        }
+        if (polled < 0) {
+            goto out;
+        }
+        if (polled == 0) {
+            if (monotonic_seconds() - last_receive >=
+                (double)config->idle_sec) {
+                goto out;
+            }
+            continue;
+        }
+        if ((pfd.revents & POLLIN) != 0) {
+            WireHeader header;
+            ssize_t received;
+            size_t header_size;
+            struct sockaddr_storage peer;
+            socklen_t peer_len = sizeof(peer);
+            WirehairUdpRecvFlow *flow = NULL;
+
+            received = recvfrom(sock, datagram, sizeof(datagram), 0,
+                                (struct sockaddr *)&peer, &peer_len);
+            if (received < 0 && errno == EINTR) {
+                continue;
+            }
+            if (received < 0 ||
+                wire_header_decode(&header, datagram,
+                                   (size_t)received) != 0 ||
+                header.version != WIRE_VERSION_V4 ||
+                (config->local_node_id != 0 &&
+                 !wire_header_is_local(&header,
+                                       config->local_node_id))) {
+                continue;
+            }
+            header_size = wire_header_size(&header);
+            if ((size_t)received != header_size + header.payload_len) {
+                continue;
+            }
+            for (i = 0; i < max_flows; i++) {
+                if (flows[i].active && flows[i].flow_id == header.flow_id) {
+                    flow = &flows[i];
+                    break;
+                }
+            }
+            if (flow == NULL) {
+                char output_path[PATH_MAX];
+
+                for (i = 0; i < max_flows; i++) {
+                    if (!flows[i].active) {
+                        flow = &flows[i];
+                        break;
+                    }
+                }
+                if (flow == NULL) {
+                    continue;
+                }
+                if (max_flows == 1) {
+                    if (snprintf(output_path, sizeof(output_path), "%s",
+                                 config->output_path) < 0 ||
+                        strlen(output_path) >= sizeof(output_path)) {
+                        goto out;
+                    }
+                } else if (wire_flow_output_path(
+                               config->output_path, &peer, peer_len,
+                               header.flow_id,
+                               wire_recv_suffix_for_flow(config,
+                                                         header.flow_id),
+                               output_path, sizeof(output_path)) != 0) {
+                    goto out;
+                }
+                flow->io.sock = sock;
+                flow->io.output = fopen(output_path, "wb");
+                if (flow->io.output == NULL) {
+                    goto out;
+                }
+                flow->receiver = wirehair_segment_receiver_create(
+                    &config->wirehair, header.flow_id, wirehair_udp_output,
+                    &flow->io,
+                    config->wirehair.ack_enabled
+                        ? wirehair_udp_ack_emit
+                        : NULL,
+                    &flow->io);
+                if (flow->receiver == NULL) {
+                    goto out;
+                }
+                flow->active = 1;
+                flow->flow_id = header.flow_id;
+                active_flows++;
+            }
+            flow->io.peer = peer;
+            flow->io.peer_len = peer_len;
+            flow->io.have_peer = 1;
+            last_receive = monotonic_seconds();
+            if (wirehair_segment_receiver_ingest(
+                    flow->receiver, &header,
+                    header.payload_len > 0 ? datagram + header_size : NULL,
+                    header.payload_len) != 0) {
+                goto out;
+            }
+        }
+    }
+    for (i = 0; i < max_flows; i++) {
+        if (flows[i].active && fflush(flows[i].io.output) != 0) {
+            goto out;
+        }
+    }
+    result = 0;
+out:
+    for (i = 0; i < max_flows; i++) {
+        wirehair_segment_receiver_destroy(flows[i].receiver);
+        if (flows[i].io.output != NULL) {
+            fclose(flows[i].io.output);
+        }
+    }
+    free(flows);
+    if (sock >= 0) {
+        close(sock);
+    }
+    return result;
+}
+
 int wire_udp_send(const WireUdpSendConfig *config)
 {
     const Codec *codec;
@@ -466,6 +900,9 @@ int wire_udp_send(const WireUdpSendConfig *config)
     if (config == NULL || config->host == NULL || config->input_path == NULL ||
         config->port == 0 || config->final_dst == 0 || config->ttl == 0) {
         return -1;
+    }
+    if (config->codec_kind == CODEC_KIND_WIREHAIR) {
+        return wirehair_udp_send_file(config);
     }
 
     codec = Codec_get(config->codec_kind);
@@ -496,9 +933,9 @@ int wire_udp_send(const WireUdpSendConfig *config)
     started = monotonic_seconds();
     for (;;) {
         WireHeader header;
+        size_t n = fread(block, 1, input_size, input);
         uint64_t encode_begin_ns;
         uint64_t encode_end_ns;
-        size_t n = fread(block, 1, input_size, input);
         uint16_t shard;
 
         if (n == 0) {
@@ -526,15 +963,17 @@ int wire_udp_send(const WireUdpSendConfig *config)
                 .encode_begin_ns = encode_begin_ns,
                 .encode_end_ns = encode_end_ns,
             };
-            if (send_wire_datagram(sock, (struct sockaddr *)&address, address_len,
-                                   &header, block + (size_t)shard * PKG_SIZE) != 0) {
+            if (send_wire_datagram(sock, (struct sockaddr *)&address,
+                                   address_len, &header,
+                                   block + (size_t)shard * PKG_SIZE) != 0) {
                 goto cleanup;
             }
             wire_bytes += WIRE_HEADER_SIZE + PKG_SIZE;
         }
         source_bytes += n;
         block_id++;
-        pace_to_source_rate(started, source_bytes, config->source_rate_mbps);
+        pace_to_source_rate(started, source_bytes,
+                            config->source_rate_mbps);
     }
 
     {
@@ -615,7 +1054,6 @@ static int wire_udp_file_output(uint32_t flow_id, const uint8_t *data, size_t le
 
 #define WIRE_MAX_FLOWS MF_MAX_FLOWS
 #define WIRE_DECODE_QUEUE_CAP 2048u
-#define WIRE_RECV_POLL_MS     100
 
 typedef struct WireDecodeJob {
     WireHeader header;
@@ -1147,6 +1585,9 @@ int wire_udp_recv(const WireUdpRecvConfig *config)
     if (config == NULL || config->output_path == NULL || config->port == 0 ||
         config->idle_sec == 0) {
         return -1;
+    }
+    if (config->codec_kind == CODEC_KIND_WIREHAIR) {
+        return wirehair_udp_recv_file(config);
     }
 
     max_flows = config->max_flows;

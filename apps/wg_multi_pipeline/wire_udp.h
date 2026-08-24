@@ -3,6 +3,7 @@
 
 #include "codec.h"
 #include "wire_header.h"
+#include "wirehair_segment.h"
 
 #include <stdbool.h>
 #include <sys/socket.h>
@@ -17,6 +18,8 @@ typedef struct WireUdpSendConfig {
     uint32_t    flow_id;
     uint8_t     final_dst;
     uint8_t     ttl;
+    uint16_t    ack_port;
+    WirehairSegmentConfig wirehair;
 } WireUdpSendConfig;
 
 typedef struct WireUdpRecvConfig {
@@ -31,6 +34,7 @@ typedef struct WireUdpRecvConfig {
     int         decode_mark;
     /* Drop datagrams whose header.final_dst does not match (0 disables check). */
     uint8_t     local_node_id;
+    WirehairSegmentConfig wirehair;
     /*
      * Optional per wire-flow_id output suffix (includes leading '.').
      * When out_suffix_set[id] is set, use out_suffix_by_flow[id] (may be empty).

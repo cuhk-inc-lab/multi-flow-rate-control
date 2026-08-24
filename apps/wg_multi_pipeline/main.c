@@ -284,12 +284,12 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|none] <input.ts> <output.ts>\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
-            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
-            "  %s [--codec block|copy|xor-fec|rs-fec|rs|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort|--strict] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|wirehair|none] <input.ts> <output.ts>\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|wirehair|none] --multi <in0.ts> <out0.ts> [<in1.ts> <out1.ts> ...]\n"
+            "  %s [--no-pace] [--codec block|copy|xor-fec|rs-fec|rs|wirehair] --udp <port> <out_prefix> [--max-flows N] [--idle-sec N]\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|wirehair|none] [--rate-mbps N] [--flow-id N] [--final-dst N] [--ttl N] --udp-send <host> <port> <input.ts>\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|wirehair|none] [--final-dst N] [--ttl N] --udp-send-multi --flow <[id:]host:port:input[:rate-mbps]|tuple:...> ...\n"
+            "  %s [--codec block|copy|xor-fec|rs-fec|rs|wirehair|none] [--rs-k=N] [--rs-parity=M] [--rs-profile=K+R] --udp-recv <port> <output.ts|prefix> [--local-node-id N] [--idle-sec N] [--best-effort|--strict] [--max-flows N<=8] [--decode-mark] [--out-suffix <flow_id>:<ext> ...]\n"
             "  %s [--lock-memory] <any mode above>\n"
             "\n"
             "Wire v3: header carries final_dst + ttl (defaults final-dst=4, ttl=8).\n"
@@ -301,10 +301,15 @@ static void print_usage(const char *prog)
             "\n"
             "Codecs: block (default, 4-shard uniform +1/-1), copy (4-shard identity),\n"
             "        xor-fec (4 data + 1 XOR parity), rs-fec (liberasurecode RS 4+2),\n"
-            "        rs (column-wise RS(n,k); default RS(6,4)), none (file/FIFO relay; --no-codec)\n"
+            "        rs (column-wise RS(n,k); default RS(6,4)), wirehair (wire v4 segments),\n"
+            "        none (file/FIFO relay; --no-codec)\n"
             "RS params: --rs-k=N --rs-parity=M  or  --rs-profile=K+R  (e.g. 16+2); default 4+2.\n"
             "           Sender and receiver must use the same fixed (k, parity); wire\n"
             "           shard_count must equal k+parity (not a remote profile command).\n"
+            "Wirehair: --wh-segment-mib=N --wh-repair-pct=P "
+            "[--wh-ack|--no-wh-ack]\n"
+            "          defaults: 10 MiB, 10%% repair, ACK disabled; "
+            "--ack-port=N binds sender ACK input.\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
             "     Per-flow idle timeout (default 3 s) flushes a segment; server stays running.\n"
@@ -326,11 +331,14 @@ int main(int argc, char **argv)
     uint8_t final_dst = WIRE_DEFAULT_FINAL_DST;
     uint8_t ttl = WIRE_DEFAULT_TTL;
     uint8_t local_node_id = WIRE_DEFAULT_FINAL_DST;
+    WirehairSegmentConfig wirehair_config;
+    uint16_t ack_port = 0;
     int lock_memory = 0;
     int argi = 1;
 
     /* Closing one ffplay must not kill the whole multi-flow process. */
     signal(SIGPIPE, SIG_IGN);
+    wirehair_segment_config_defaults(&wirehair_config);
 
     if (argc < 3) {
         print_usage(argv[0]);
@@ -417,6 +425,45 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             argi++;
+        } else if (strncmp(argv[argi], "--wh-segment-mib=", 17) == 0) {
+            char *end = NULL;
+            unsigned long mib = strtoul(argv[argi] + 17, &end, 10);
+
+            if (end == argv[argi] + 17 || *end != '\0' || mib == 0 ||
+                mib > UINT32_MAX / (1024u * 1024u)) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            wirehair_config.segment_bytes =
+                (uint32_t)mib * 1024u * 1024u;
+            argi++;
+        } else if (strncmp(argv[argi], "--wh-repair-pct=", 16) == 0) {
+            char *end = NULL;
+            unsigned long pct = strtoul(argv[argi] + 16, &end, 10);
+
+            if (end == argv[argi] + 16 || *end != '\0' || pct > 100u) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            wirehair_config.repair_percent = (uint8_t)pct;
+            argi++;
+        } else if (strcmp(argv[argi], "--wh-ack") == 0) {
+            wirehair_config.ack_enabled = true;
+            argi++;
+        } else if (strcmp(argv[argi], "--no-wh-ack") == 0) {
+            wirehair_config.ack_enabled = false;
+            argi++;
+        } else if (strncmp(argv[argi], "--ack-port=", 11) == 0) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(argv[argi] + 11, &end, 10);
+
+            if (end == argv[argi] + 11 || *end != '\0' || parsed == 0 ||
+                parsed > UINT16_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            ack_port = (uint16_t)parsed;
+            argi++;
         } else if (strcmp(argv[argi], "--codec") == 0) {
             if (argi + 1 >= argc) {
                 print_usage(argv[0]);
@@ -432,6 +479,8 @@ int main(int argc, char **argv)
                 codec_kind = CODEC_KIND_RS_FEC;
             } else if (strcmp(argv[argi + 1], "rs") == 0) {
                 codec_kind = CODEC_KIND_RS;
+            } else if (strcmp(argv[argi + 1], "wirehair") == 0) {
+                codec_kind = CODEC_KIND_WIREHAIR;
             } else if (strcmp(argv[argi + 1], "none") == 0) {
                 codec_kind = CODEC_KIND_NONE;
             } else {
@@ -526,6 +575,12 @@ int main(int argc, char **argv)
     if (lock_memory && lock_process_memory() != 0) {
         return EXIT_FAILURE;
     }
+    wirehair_config.origin_node = local_node_id;
+    wirehair_config.ack_ttl = ttl;
+    if (!wirehair_segment_config_valid(&wirehair_config)) {
+        fprintf(stderr, "invalid Wirehair segment configuration\n");
+        return EXIT_FAILURE;
+    }
 
     if (argi < argc && strcmp(argv[argi], "--udp-send") == 0) {
         WireUdpSendConfig cfg;
@@ -550,6 +605,8 @@ int main(int argc, char **argv)
             .flow_id = flow_id,
             .final_dst = final_dst,
             .ttl = ttl,
+            .ack_port = ack_port,
+            .wirehair = wirehair_config,
         };
         return wire_udp_send(&cfg) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -715,6 +772,8 @@ int main(int argc, char **argv)
                 .codec_kind = codec_kind,
                 .final_dst = final_dst,
                 .ttl = ttl,
+                .ack_port_base = ack_port,
+                .wirehair = wirehair_config,
                 .peer_map = peer_map,
             });
         flow_peer_map_destroy(peer_map);
@@ -772,6 +831,7 @@ int main(int argc, char **argv)
             .max_flows = max_flows,
             .decode_mark = decode_mark,
             .local_node_id = local_node_id,
+            .wirehair = wirehair_config,
         };
         while (argi < argc) {
             if (strcmp(argv[argi], "--local-node-id") == 0) {

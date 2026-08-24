@@ -13,7 +13,8 @@ typedef enum CodecKind {
     CODEC_KIND_COPY,
     CODEC_KIND_XOR_FEC,
     CODEC_KIND_RS_FEC,
-    CODEC_KIND_RS
+    CODEC_KIND_RS,
+    CODEC_KIND_WIREHAIR
 } CodecKind;
 
 typedef enum CodecRecoverStatus {

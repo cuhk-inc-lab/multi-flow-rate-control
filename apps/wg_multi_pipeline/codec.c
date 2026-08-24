@@ -175,6 +175,9 @@ const Codec *Codec_get(CodecKind kind)
         return RsFecCodec_get();
     case CODEC_KIND_RS:
         return RsCodec_get();
+    case CODEC_KIND_WIREHAIR:
+        /* Wirehair is the independent wire-v4 segment state machine. */
+        return NULL;
     default:
         return NULL;
     }

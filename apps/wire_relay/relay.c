@@ -53,10 +53,16 @@ struct RelayCtx {
     int                         send_sock;
     struct sockaddr_storage     next_hop;
     socklen_t                   next_hop_len;
+    struct sockaddr_storage     return_hop;
+    socklen_t                   return_hop_len;
+    int                         have_return_hop;
     RelayTxCaptureFn            tx_capture_fn;
     void                       *tx_capture_ctx;
     RelayFlowStats              per_flow[RELAY_MAX_FLOWS];
     RelayFlowStats              total;
+    uint32_t                    source_ack_flow;
+    uint64_t                    source_ack_segment;
+    int                         source_ack_valid;
     volatile sig_atomic_t       stop;
 };
 
@@ -484,7 +490,27 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
         return RELAY_INGRESS_OK;
     }
 
-    if (wire_header_is_local(&header, ctx->config.local_node_id)) {
+    if (header.version == WIRE_VERSION_V4 &&
+        header.type == WIRE_TYPE_ACK &&
+        (header.flags & WIRE_FLAG_RETURN_PATH) != 0 &&
+        wire_header_is_local(&header, ctx->config.local_node_id) &&
+        ctx->config.local_source != NULL &&
+        ctx->config.local_source->codec_kind == CODEC_KIND_WIREHAIR &&
+        ctx->config.local_source->wirehair.ack_enabled &&
+        header.flow_id == ctx->config.local_source->flow_id) {
+        ctx->source_ack_flow = header.flow_id;
+        ctx->source_ack_segment = header.block_id;
+        ctx->source_ack_valid = 1;
+        slot->local_deliver++;
+        ctx->total.local_deliver++;
+        free(datagram);
+        return RELAY_INGRESS_OK;
+    }
+
+    if (wire_header_is_local(&header, ctx->config.local_node_id) &&
+        !(header.version == WIRE_VERSION_V4 &&
+          (header.flags & WIRE_FLAG_RETURN_PATH) != 0 &&
+          ctx->have_return_hop)) {
         slot->local_deliver++;
         ctx->total.local_deliver++;
         /*
@@ -513,10 +539,15 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
 
     /* TTL rewrite must land in the on-wire datagram bytes. */
     header.ttl = (uint8_t)(header.ttl - 1u);
-    wire_header_encode(datagram, &header);
+    if (header.version == WIRE_VERSION_V4) {
+        wire_header_encode_v4(datagram, &header);
+    } else {
+        wire_header_encode(datagram, &header);
+    }
 
     out_len = len;
-    if (ctx->config.recode_fn != NULL) {
+    if (ctx->config.recode_fn != NULL &&
+        header.version == WIRE_VERSION_V3) {
         recode_out = malloc(RELAY_MAX_DATAGRAM);
         if (recode_out == NULL) {
             free(datagram);
@@ -560,7 +591,7 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
     }
 
     /* DATA path */
-    if (ctx->cache_enabled) {
+    if (ctx->cache_enabled && header.version == WIRE_VERSION_V3) {
         insert_st = generation_cache_insert(&ctx->gen_cache, &header, datagram,
                                             out_len, now_ns, &gen);
         sync_cache_stats_to_total(ctx);
@@ -858,6 +889,10 @@ static void *tx_worker_main(void *arg)
         EgressStatus st;
         ssize_t sent;
         RelayFlowStats *slot;
+        WireHeader header;
+        const struct sockaddr *target;
+        socklen_t target_len;
+        int return_path;
 
         st = egress_queue_dequeue(&ctx->egress, &pkt);
         if (st == EGRESS_ERR_SHUTDOWN) {
@@ -871,11 +906,26 @@ static void *tx_worker_main(void *arg)
         tx_test_hold(ctx);
 
         slot = flow_stats_slot(ctx, pkt.flow_id);
+        if (wire_header_decode(&header, pkt.datagram, pkt.len) != 0) {
+            slot->drop_malformed++;
+            ctx->total.drop_malformed++;
+            free(pkt.datagram);
+            continue;
+        }
+        return_path = header.version == WIRE_VERSION_V4 &&
+                      (header.flags & WIRE_FLAG_RETURN_PATH) != 0;
+        if (return_path && !ctx->have_return_hop) {
+            slot->drop_no_return_hop++;
+            ctx->total.drop_no_return_hop++;
+            free(pkt.datagram);
+            continue;
+        }
+        target = return_path
+                     ? (const struct sockaddr *)&ctx->return_hop
+                     : (const struct sockaddr *)&ctx->next_hop;
+        target_len = return_path ? ctx->return_hop_len : ctx->next_hop_len;
         if (ctx->config.egress_fn != NULL) {
-            WireHeader header;
-
-            if (wire_header_decode(&header, pkt.datagram, pkt.len) != 0 ||
-                ctx->config.egress_fn(pkt.datagram, pkt.len, &header,
+            if (ctx->config.egress_fn(pkt.datagram, pkt.len, &header,
                                       ctx->config.egress_ctx) != 0) {
                 slot->drop_malformed++;
                 ctx->total.drop_malformed++;
@@ -888,14 +938,24 @@ static void *tx_worker_main(void *arg)
             ctx->tx_capture_fn(pkt.datagram, pkt.len, ctx->tx_capture_ctx);
             slot->forward++;
             ctx->total.forward++;
+            if (header.type == WIRE_TYPE_ACK) {
+                slot->forward_ack++;
+                ctx->total.forward_ack++;
+            } else {
+                slot->forward_data++;
+                ctx->total.forward_data++;
+            }
             free(pkt.datagram);
             continue;
         }
 
         do {
-            sent = sendto(ctx->send_sock, pkt.datagram, pkt.len, 0,
-                          (const struct sockaddr *)&ctx->next_hop,
-                          ctx->next_hop_len);
+            /*
+             * Use the listening socket so downstream ACK replies naturally
+             * return to this relay's configured listen port.
+             */
+            sent = sendto(ctx->listen_sock, pkt.datagram, pkt.len, 0,
+                          target, target_len);
         } while (sent < 0 && errno == EINTR);
 
         if (sent < 0 || (size_t)sent != pkt.len) {
@@ -904,6 +964,13 @@ static void *tx_worker_main(void *arg)
         } else {
             slot->forward++;
             ctx->total.forward++;
+            if (header.type == WIRE_TYPE_ACK) {
+                slot->forward_ack++;
+                ctx->total.forward_ack++;
+            } else {
+                slot->forward_data++;
+                ctx->total.forward_data++;
+            }
         }
         free(pkt.datagram);
     }
@@ -1074,6 +1141,17 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
             relay_ctx_cleanup(ctx);
             return -1;
         }
+        if (config->return_hop_host != NULL &&
+            config->return_hop_port != 0) {
+            if (resolve_next_hop(config->return_hop_host,
+                                 config->return_hop_port,
+                                 &ctx->return_hop,
+                                 &ctx->return_hop_len) != 0) {
+                relay_ctx_cleanup(ctx);
+                return -1;
+            }
+            ctx->have_return_hop = 1;
+        }
         ctx->listen_sock = open_listen_socket(config->listen_port);
         if (ctx->listen_sock < 0) {
             relay_ctx_cleanup(ctx);
@@ -1220,14 +1298,46 @@ static int local_source_emit_inject(const uint8_t *datagram, size_t len,
     return st == RELAY_INGRESS_OK ? 0 : -1;
 }
 
+static int relay_local_source_ack_poll(uint32_t flow_id, uint64_t segment_id,
+                                       unsigned wait_ms, void *opaque)
+{
+    RelayCtx *ctx = opaque;
+    unsigned waited = 0;
+
+    for (;;) {
+        int matched;
+
+        pthread_mutex_lock(&ctx->ingress_mu);
+        matched = ctx->source_ack_valid &&
+                  ctx->source_ack_flow == flow_id &&
+                  ctx->source_ack_segment == segment_id;
+        if (matched) {
+            ctx->source_ack_valid = 0;
+        }
+        pthread_mutex_unlock(&ctx->ingress_mu);
+        if (matched || waited >= wait_ms) {
+            return matched;
+        }
+        usleep(1000u);
+        waited++;
+    }
+}
+
 static void *local_source_thread_main(void *arg)
 {
     RelayCtx *ctx = arg;
+    LocalSourceConfig source_config;
     LocalSourceStats stats;
     int rc;
 
     memset(&stats, 0, sizeof(stats));
-    rc = local_source_run(ctx->config.local_source, local_source_emit_inject,
+    source_config = *ctx->config.local_source;
+    if (source_config.codec_kind == CODEC_KIND_WIREHAIR &&
+        source_config.wirehair.ack_enabled) {
+        source_config.ack_poll = relay_local_source_ack_poll;
+        source_config.ack_ctx = ctx;
+    }
+    rc = local_source_run(&source_config, local_source_emit_inject,
                           ctx, &stats);
     ctx->source_stats = stats;
     ctx->source_result = rc;

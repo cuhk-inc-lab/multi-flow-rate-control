@@ -1,0 +1,98 @@
+# Windows image file caches
+Thumbs.db
+ehthumbs.db
+
+# Folder config file
+Desktop.ini
+
+# Recycle Bin used on file shares
+$RECYCLE.BIN/
+
+# Windows Installer files
+*.cab
+*.msi
+*.msm
+*.msp
+
+# Windows shortcuts
+*.lnk
+
+# MSVC temp files
+*.obj
+*.log
+*.ilk
+*.pdb
+*.tlog
+*.idb
+*.opensdf
+*.sdf
+*.user
+*.suo
+
+# =========================
+# Operating System Files
+# =========================
+
+# OSX
+# =========================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Files that might appear on external disk
+.Spotlight-V100
+.Trashes
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+*.db
+*.opendb
+
+# PyCharm private dir ide
+.idea
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+#Build cmake dir
+build
+
+# Local benchmark harness build outputs
+bench/obj/
+bench/whx
+bench/whx.*
+!bench/whx.cpp
+bench/results/*.err
+bench/results/*.out
+bench/results/*.txt
+bench/results/*.sh
+bench/results/*.md
+!bench/results/*.log
+!bench/results/*.sh
+!bench/results/FINDINGS.md
+bench/results/Wirehair*Fixups.inc
+
+# Local experiment harness build outputs
+experiments/peeling/peel_sweep
+experiments/peeling/results/fresh_*/
+tables/results/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
+experiments/precode/precode_sim
+experiments/precode/precode_sim.ic
+experiments/peeling/xor_bench
+experiments/precode/results/*.err
+!experiments/precode/results/*.err
+.claude/worktrees/
+experiments/tiling/rowop_tiling

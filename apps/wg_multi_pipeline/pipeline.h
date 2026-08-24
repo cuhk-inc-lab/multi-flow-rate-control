@@ -3,6 +3,7 @@
 
 #include "codec.h"
 #include "flow_peer_map.h"
+#include "wirehair_segment.h"
 
 #include <stdint.h>
 
@@ -51,6 +52,8 @@ typedef struct WgWireMultiSendConfig {
     CodecKind             codec_kind;
     uint8_t               final_dst;
     uint8_t               ttl;
+    uint16_t              ack_port_base;
+    WirehairSegmentConfig wirehair;
     /* Shared map for tuple-mode flows; NULL when no flow uses a fake 5-tuple. */
     FlowPeerMap          *peer_map;
 } WgWireMultiSendConfig;

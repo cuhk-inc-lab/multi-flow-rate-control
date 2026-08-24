@@ -13,6 +13,7 @@ static void print_usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s --local-node-id N --listen PORT --next-hop HOST:PORT\n"
+            "     [--return-hop HOST:PORT]\n"
             "     [--idle-exit-sec N] [--egress-capacity N] [--egress-wait-ms N]\n"
             "     [--deferred-per-flow N] [--deferred-total N]\n"
             "     [--max-active-flows N]\n"
@@ -22,10 +23,12 @@ static void print_usage(const char *prog)
             "     [--transit-hook identity|plus-minus]\n"
             "       identity: ingress copy only; plus-minus: ingress +1, egress -1\n"
             "     [--decode-reencode-stub]    (reserve Phase 3A hook; always OPAQUE)\n"
-            "     [--local-decode --codec copy|xor-fec|rs-fec|rs|none\n"
+            "     [--local-decode --codec copy|xor-fec|rs-fec|rs|wirehair|none\n"
             "         (--output FILE | --output-dir DIR)]\n"
             "     [--source FILE --final-dst N --ttl N --codec ...\n"
             "         [--flow-id N] [--rate-mbps N]]\n"
+            "     [--wh-segment-mib=N --wh-repair-pct=P "
+            "--wh-ack|--no-wh-ack]\n"
             "     [--test-tx-hold-us N]   (TEST ONLY; default 0)\n"
             "\n"
             "Unified per-node wire v3 pipeline:\n"
@@ -107,6 +110,10 @@ static int parse_codec_kind(const char *text, CodecKind *out)
         *out = CODEC_KIND_RS;
         return 0;
     }
+    if (strcmp(text, "wirehair") == 0) {
+        *out = CODEC_KIND_WIREHAIR;
+        return 0;
+    }
     return -1;
 }
 
@@ -117,9 +124,11 @@ int main(int argc, char **argv)
     LocalDecodeHubConfig hub_cfg;
     LocalSourceConfig source_cfg;
     char next_hop_host[256];
+    char return_hop_host[256];
     uint8_t local_node_id = 0;
     uint16_t listen_port = 0;
     uint16_t next_hop_port = 0;
+    uint16_t return_hop_port = 0;
     unsigned idle_exit_sec = 0;
     size_t egress_capacity = RELAY_DEFAULT_EGRESS_CAPACITY;
     uint32_t egress_wait_ms = 0;
@@ -148,6 +157,7 @@ int main(int argc, char **argv)
     uint8_t source_ttl = 0;
     uint32_t source_flow_id = 0;
     double source_rate_mbps = 0.0;
+    WirehairSegmentConfig wirehair_config;
     int hub_inited = 0;
     RelayStatus st;
 
@@ -155,6 +165,8 @@ int main(int argc, char **argv)
     memset(&hub, 0, sizeof(hub));
     memset(&source_cfg, 0, sizeof(source_cfg));
     memset(next_hop_host, 0, sizeof(next_hop_host));
+    memset(return_hop_host, 0, sizeof(return_hop_host));
+    wirehair_segment_config_defaults(&wirehair_config);
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -193,6 +205,43 @@ int main(int argc, char **argv)
             }
             have_next_hop = 1;
             argi += 2;
+        } else if (strcmp(argv[argi], "--return-hop") == 0) {
+            if (argi + 1 >= argc ||
+                parse_host_port(argv[argi + 1], return_hop_host,
+                                sizeof(return_hop_host),
+                                &return_hop_port) != 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            argi += 2;
+        } else if (strncmp(argv[argi], "--wh-segment-mib=", 17) == 0) {
+            char *end = NULL;
+            unsigned long mib = strtoul(argv[argi] + 17, &end, 10);
+
+            if (end == argv[argi] + 17 || *end != '\0' || mib == 0 ||
+                mib > UINT32_MAX / (1024u * 1024u)) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            wirehair_config.segment_bytes =
+                (uint32_t)mib * 1024u * 1024u;
+            argi++;
+        } else if (strncmp(argv[argi], "--wh-repair-pct=", 16) == 0) {
+            char *end = NULL;
+            unsigned long pct = strtoul(argv[argi] + 16, &end, 10);
+
+            if (end == argv[argi] + 16 || *end != '\0' || pct > 100u) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            wirehair_config.repair_percent = (uint8_t)pct;
+            argi++;
+        } else if (strcmp(argv[argi], "--wh-ack") == 0) {
+            wirehair_config.ack_enabled = true;
+            argi++;
+        } else if (strcmp(argv[argi], "--no-wh-ack") == 0) {
+            wirehair_config.ack_enabled = false;
+            argi++;
         } else if (strcmp(argv[argi], "--idle-exit-sec") == 0) {
             unsigned long parsed;
 
@@ -470,9 +519,17 @@ int main(int argc, char **argv)
     }
 
     cfg.local_node_id = local_node_id;
+    wirehair_config.origin_node = local_node_id;
+    if (!wirehair_segment_config_valid(&wirehair_config)) {
+        fprintf(stderr, "wire-relay: invalid Wirehair configuration\n");
+        return EXIT_FAILURE;
+    }
     cfg.listen_port = listen_port;
     cfg.next_hop_host = next_hop_host;
     cfg.next_hop_port = next_hop_port;
+    cfg.return_hop_host =
+        return_hop_port != 0 ? return_hop_host : NULL;
+    cfg.return_hop_port = return_hop_port;
     cfg.recode_fn =
         transit_plus_minus ? relay_recode_payload_add1 :
         transit_identity ? relay_recode_identity : NULL;
@@ -506,6 +563,10 @@ int main(int argc, char **argv)
         hub_cfg.codec_kind = codec_kind;
         hub_cfg.best_effort = 0;
         hub_cfg.local_node_id = local_node_id;
+        hub_cfg.wirehair = wirehair_config;
+        hub_cfg.return_hop_host =
+            return_hop_port != 0 ? return_hop_host : NULL;
+        hub_cfg.return_hop_port = return_hop_port;
         if (output_dir != NULL) {
             hub_cfg.mode = LOCAL_DECODE_MODE_OUTPUT_DIR;
             hub_cfg.output_dir = output_dir;
@@ -531,6 +592,7 @@ int main(int argc, char **argv)
         source_cfg.final_dst = source_final_dst;
         source_cfg.ttl = source_ttl;
         source_cfg.source_rate_mbps = source_rate_mbps;
+        source_cfg.wirehair = wirehair_config;
         cfg.local_source = &source_cfg;
         if (source_final_dst == local_node_id) {
             /* Source targeting self must be able to local-deliver. */
