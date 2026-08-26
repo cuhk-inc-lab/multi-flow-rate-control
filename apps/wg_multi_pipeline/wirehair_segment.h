@@ -9,11 +9,23 @@
 
 #define WH_SEGMENT_DEFAULT_BYTES (10u * 1024u * 1024u)
 #define WH_SEGMENT_DEFAULT_REPAIR_PCT 10u
-#define WH_SEGMENT_WINDOW 4u
+/* Default / max in-flight unrecovered segments at the receiver. */
+#define WH_SEGMENT_WINDOW_DEFAULT 8u
+#define WH_SEGMENT_WINDOW_MAX 16u
+/* Legacy alias used by older call sites; prefer config.window. */
+#define WH_SEGMENT_WINDOW WH_SEGMENT_WINDOW_DEFAULT
+/*
+ * Packet payload sized for MTU 1450 without IP fragmentation:
+ * 1450 - 20 (IPv4) - 8 (UDP) - 52 (wire v4) = 1370.
+ */
+#define WH_PACKET_SIZE 1370u
+/* When repair_percent > 0, never advertise fewer than this many repair pkts. */
+#define WH_REPAIR_MIN_PACKETS 2u
 
 typedef struct WirehairSegmentConfig {
     uint32_t segment_bytes;
     uint8_t repair_percent;
+    uint8_t window; /* 1..WH_SEGMENT_WINDOW_MAX; 0 => default */
     bool ack_enabled;
     uint8_t origin_node;
     uint8_t ack_ttl;
@@ -40,9 +52,16 @@ typedef struct WirehairSegmentReceiver WirehairSegmentReceiver;
 
 void wirehair_segment_config_defaults(WirehairSegmentConfig *config);
 int wirehair_segment_config_valid(const WirehairSegmentConfig *config);
+uint8_t wirehair_segment_window(const WirehairSegmentConfig *config);
 uint32_t wirehair_segment_source_packets(uint32_t segment_bytes);
 uint32_t wirehair_segment_repair_packets(uint32_t source_packets,
                                           uint8_t repair_percent);
+/* On-wire repair ceiling. Without ACK this equals repair_packets (the
+ * budget). With ACK it is a safety cap of 100% of source so the sender
+ * can spray until ACK instead of a fixed redundancy. */
+uint32_t wirehair_segment_repair_ceiling(uint32_t source_packets,
+                                          uint8_t repair_percent,
+                                          bool ack_enabled);
 
 int wirehair_segment_send(const WirehairSegmentConfig *config,
                           uint32_t flow_id, uint64_t segment_id,

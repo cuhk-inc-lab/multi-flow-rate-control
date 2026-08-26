@@ -84,7 +84,7 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
   [--local-decode --codec copy|xor-fec|rs-fec|rs|wirehair|none \
       (--output FILE | --output-dir DIR)] \
   [--return-hop HOST:PORT] \
-  [--wh-segment-mib=N --wh-repair-pct=P --wh-ack|--no-wh-ack] \
+  [--wh-segment-mib=N --wh-repair-pct=P --wh-window=N --wh-ack|--no-wh-ack] \
   [--source FILE --final-dst N --ttl N --codec ... \
       [--flow-id N] [--rate-mbps N]]
 ```
@@ -95,10 +95,10 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--listen` | UDP bind port |
 | `--next-hop` | `HOST:PORT` for non-local forward |
 | `--idle-exit-sec` | Optional; exit after N seconds with no UDP/source activity (tests) |
-| `--egress-capacity` | Global EgressQueue slots (default 4096) |
+| `--egress-capacity` | Global EgressQueue slots (default 16384) |
 | `--egress-wait-ms` | Max wait when egress full (default **0** = try-drop); `>0` blocks processing worker only, never UDP RX |
-| `--deferred-per-flow` | Per-flow RX deferred datagram cap (default 128) |
-| `--deferred-total` | Global RX deferred datagram cap (default 1024) |
+| `--deferred-per-flow` | Per-flow RX deferred datagram cap (default 4096) |
+| `--deferred-total` | Global RX deferred datagram cap (default 32768) |
 | `--max-active-flows` | Max concurrent wire flow_id slots in deferred hub (1..64, default 64) |
 | `--process` | `forward` (default) or `cache` |
 | `--gen-timeout-ms` | Cache idle timeout (default 500) |
@@ -116,7 +116,8 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--output` | L1 single-flow output file |
 | `--output-dir` | L2 multi-flow output directory |
 | `--return-hop` | Where to send Wirehair ACK (`WIRE_FLAG_RETURN_PATH`) |
-| `--wh-segment-mib` / `--wh-repair-pct` | Wirehair segment size / repair ceiling |
+| `--wh-segment-mib` / `--wh-repair-pct` | Segment size; no-ACK repair budget (ACK sprays until ACK, cap 100% source) |
+| `--wh-window` | Receiver segment window (default 8, max 16) |
 | `--wh-ack` / `--no-wh-ack` | Destination emits ACK; source stops leftover repair |
 
 Wirehair (`--codec wirehair`) uses wire **v4**. ACK is optional (`--wh-ack`)

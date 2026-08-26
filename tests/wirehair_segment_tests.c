@@ -12,6 +12,17 @@ typedef struct TestCtx {
     unsigned ack_count;
 } TestCtx;
 
+typedef struct PacketCopy {
+    WireHeader header;
+    uint8_t payload[WH_PACKET_SIZE];
+    size_t payload_len;
+} PacketCopy;
+
+typedef struct PacketStore {
+    PacketCopy packets[64];
+    size_t count;
+} PacketStore;
+
 static int collect_output(uint32_t flow_id, const uint8_t *data, size_t len,
                           void *opaque)
 {
@@ -62,6 +73,25 @@ static int loopback_ack_poll(uint32_t flow_id, uint64_t segment_id,
     (void)segment_id;
     (void)wait_ms;
     return ctx->ack_count > 0 ? 1 : 0;
+}
+
+static int store_emit(const WireHeader *header, const uint8_t *payload,
+                      size_t payload_len, void *opaque)
+{
+    PacketStore *store = opaque;
+
+    if (store == NULL || store->count >=
+                             sizeof(store->packets) / sizeof(store->packets[0]) ||
+        payload_len > WH_PACKET_SIZE) {
+        return -1;
+    }
+    store->packets[store->count].header = *header;
+    if (payload != NULL && payload_len > 0) {
+        memcpy(store->packets[store->count].payload, payload, payload_len);
+    }
+    store->packets[store->count].payload_len = payload_len;
+    store->count++;
+    return 0;
 }
 
 static int run_roundtrip(size_t bytes, int ack_enabled)
@@ -115,7 +145,7 @@ static int run_roundtrip(size_t bytes, int ack_enabled)
     if (!wirehair_segment_receiver_complete(ctx.receiver) ||
         ctx.output_size != bytes || memcmp(input, ctx.output, bytes) != 0 ||
         (ack_enabled &&
-         (ctx.ack_count != 1u || !stats.stopped_by_ack ||
+         (ctx.ack_count < 1u || !stats.stopped_by_ack ||
           stats.repair_sent != 0u))) {
         fprintf(stderr,
                 "roundtrip mismatch bytes=%zu complete=%d output=%zu ack=%u\n",
@@ -131,18 +161,152 @@ out:
     return result;
 }
 
+static int test_outof_window_drop(void)
+{
+    WirehairSegmentConfig config;
+    TestCtx ctx;
+    PacketStore store;
+    WirehairSegmentSendStats stats;
+    uint8_t input[4096];
+    size_t i;
+    WireHeader ahead;
+    int result = -1;
+
+    wirehair_segment_config_defaults(&config);
+    config.segment_bytes = 8192u;
+    config.window = 2u;
+    config.ack_enabled = false;
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&store, 0, sizeof(store));
+    for (i = 0; i < sizeof(input); i++) {
+        input[i] = (uint8_t)(i + 3u);
+    }
+    ctx.output = malloc(sizeof(input));
+    ctx.output_capacity = sizeof(input);
+    if (ctx.output == NULL) {
+        return -1;
+    }
+    ctx.receiver = wirehair_segment_receiver_create(
+        &config, 3u, collect_output, &ctx, NULL, NULL);
+    if (ctx.receiver == NULL) {
+        goto out;
+    }
+    if (wirehair_segment_send(&config, 3u, 0u, 4u, 8u, input, sizeof(input),
+                              store_emit, &store, NULL, NULL, &stats) != 0 ||
+        store.count == 0) {
+        goto out;
+    }
+    /* Fabricate a packet for segment_id far ahead of the window. */
+    ahead = store.packets[0].header;
+    ahead.block_id = 10u;
+    if (wirehair_segment_receiver_ingest(ctx.receiver, &ahead,
+                                         store.packets[0].payload,
+                                         store.packets[0].payload_len) != 0) {
+        fprintf(stderr, "out-of-window ingest should soft-drop\n");
+        goto out;
+    }
+    /* In-window packets must still be accepted afterward. */
+    for (i = 0; i < store.count; i++) {
+        if (wirehair_segment_receiver_ingest(
+                ctx.receiver, &store.packets[i].header,
+                store.packets[i].payload, store.packets[i].payload_len) != 0) {
+            fprintf(stderr, "in-window ingest failed after ahead drop\n");
+            goto out;
+        }
+    }
+    result = 0;
+out:
+    wirehair_segment_receiver_destroy(ctx.receiver);
+    free(ctx.output);
+    return result;
+}
+
+static int test_ack_repeat_after_recover(void)
+{
+    WirehairSegmentConfig config;
+    TestCtx ctx;
+    PacketStore store;
+    WirehairSegmentSendStats stats;
+    uint8_t input[4096];
+    size_t i;
+    int result = -1;
+
+    wirehair_segment_config_defaults(&config);
+    config.segment_bytes = 8192u;
+    config.ack_enabled = true;
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&store, 0, sizeof(store));
+    for (i = 0; i < sizeof(input); i++) {
+        input[i] = (uint8_t)(i + 11u);
+    }
+    ctx.output = malloc(sizeof(input));
+    ctx.output_capacity = sizeof(input);
+    if (ctx.output == NULL) {
+        return -1;
+    }
+    ctx.receiver = wirehair_segment_receiver_create(
+        &config, 5u, collect_output, &ctx, collect_ack, &ctx);
+    if (ctx.receiver == NULL) {
+        goto out;
+    }
+    /* No ack_poll: send up to the ACK safety cap so leftover repair exists. */
+    if (wirehair_segment_send(&config, 5u, 0u, 4u, 8u, input, sizeof(input),
+                              store_emit, &store, NULL, NULL, &stats) != 0 ||
+        store.count < 3) {
+        goto out;
+    }
+    for (i = 0; i < store.count; i++) {
+        if (wirehair_segment_receiver_ingest(
+                ctx.receiver, &store.packets[i].header,
+                store.packets[i].payload, store.packets[i].payload_len) != 0) {
+            goto out;
+        }
+        if (ctx.ack_count >= 1u && i + 1u < store.count) {
+            if (wirehair_segment_receiver_ingest(
+                    ctx.receiver, &store.packets[i + 1u].header,
+                    store.packets[i + 1u].payload,
+                    store.packets[i + 1u].payload_len) != 0) {
+                goto out;
+            }
+            if (ctx.ack_count < 2u) {
+                fprintf(stderr, "late packet did not re-ACK\n");
+                goto out;
+            }
+            result = 0;
+            goto out;
+        }
+    }
+    fprintf(stderr, "did not recover/re-ACK ack=%u packets=%zu\n",
+            ctx.ack_count, store.count);
+out:
+    wirehair_segment_receiver_destroy(ctx.receiver);
+    free(ctx.output);
+    return result;
+}
+
 int main(void)
 {
     WirehairSegmentConfig config;
+    uint32_t ten_mib_packets;
 
     wirehair_segment_config_defaults(&config);
+    ten_mib_packets =
+        (10u * 1024u * 1024u + WH_PACKET_SIZE - 1u) / WH_PACKET_SIZE;
     if (!wirehair_segment_config_valid(&config) ||
-        wirehair_segment_source_packets(10u * 1024u * 1024u) != 7490u ||
+        wirehair_segment_window(&config) != WH_SEGMENT_WINDOW_DEFAULT ||
+        wirehair_segment_source_packets(10u * 1024u * 1024u) !=
+            ten_mib_packets ||
         wirehair_segment_repair_packets(7490u, 10u) != 749u ||
         wirehair_segment_repair_packets(7490u, 0u) != 0u ||
         wirehair_segment_repair_packets(3u, 100u) != 3u ||
+        wirehair_segment_repair_packets(3u, 10u) != WH_REPAIR_MIN_PACKETS ||
+        wirehair_segment_repair_ceiling(100u, 10u, true) != 100u ||
+        wirehair_segment_repair_ceiling(100u, 10u, false) != 10u ||
+        wirehair_segment_repair_ceiling(3u, 10u, true) != 3u ||
         run_roundtrip(28000u, 0) != 0 ||
-        run_roundtrip(731u, 1) != 0) {
+        run_roundtrip(731u, 1) != 0 ||
+        test_outof_window_drop() != 0 ||
+        test_ack_repeat_after_recover() != 0) {
         fprintf(stderr, "wirehair segment tests failed\n");
         return 1;
     }

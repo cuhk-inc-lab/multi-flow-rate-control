@@ -81,6 +81,7 @@ struct FecEncoder {
     uint32_t wh_codec_bytes;
     uint32_t wh_source_packets;
     uint32_t wh_repair_budget;
+    uint32_t wh_packet_limit;
     uint32_t wh_next_id;
     uint32_t wh_segment_bytes;
     uint64_t wh_segment_id;
@@ -168,11 +169,12 @@ static int config_complete(const FecTransportConfig *in,
         if (out->output_queue_bytes == 0u) {
             out->output_queue_bytes =
                 out->output_queue_packets *
-                (WIRE_V4_HEADER_SIZE + (size_t)PKG_SIZE);
+                (WIRE_V4_HEADER_SIZE + (size_t)WH_PACKET_SIZE);
         }
         wirehair_segment_config_defaults(&wh);
         wh.segment_bytes = out->segment_bytes;
         wh.repair_percent = out->repair_percent;
+        wh.window = out->window;
         wh.ack_enabled = out->ack_enabled != 0u;
         wh.origin_node = out->origin_node;
         wh.ack_ttl = out->ack_ttl;
@@ -296,6 +298,7 @@ static WirehairSegmentConfig encoder_wh_config(const FecEncoder *encoder)
     wirehair_segment_config_defaults(&config);
     config.segment_bytes = encoder->config.segment_bytes;
     config.repair_percent = encoder->config.repair_percent;
+    config.window = encoder->config.window;
     config.ack_enabled = encoder->config.ack_enabled != 0u;
     config.origin_node = encoder->config.origin_node;
     config.ack_ttl = encoder->config.ack_ttl;
@@ -313,9 +316,10 @@ static void wirehair_close_session(FecEncoder *encoder)
     encoder->wh_codec_bytes = 0;
     encoder->wh_source_packets = 0;
     encoder->wh_repair_budget = 0;
+    encoder->wh_packet_limit = 0;
     encoder->wh_next_id = 0;
     encoder->wh_segment_bytes = 0;
-    encoder->wh_acked = 0;
+    /* Keep wh_segment_id / wh_acked so late ACKs can still drop queued repair. */
     encoder->wh_len = 0;
 }
 
@@ -371,8 +375,8 @@ static FecStatus wirehair_start_session(FecEncoder *encoder)
     }
     codec_bytes = (uint32_t)encoder->wh_len;
     message = encoder->wh_buf;
-    if (codec_bytes < 2u * PKG_SIZE) {
-        codec_bytes = 2u * PKG_SIZE;
+    if (codec_bytes < 2u * WH_PACKET_SIZE) {
+        codec_bytes = 2u * WH_PACKET_SIZE;
         encoder->wh_padded = calloc(1, codec_bytes);
         if (encoder->wh_padded == NULL) {
             return FEC_ERR_NOMEM;
@@ -381,7 +385,7 @@ static FecStatus wirehair_start_session(FecEncoder *encoder)
         message = encoder->wh_padded;
     }
     encoder->wh_codec = wirehair_encoder_create(NULL, message, codec_bytes,
-                                                PKG_SIZE);
+                                                WH_PACKET_SIZE);
     if (encoder->wh_codec == NULL) {
         free(encoder->wh_padded);
         encoder->wh_padded = NULL;
@@ -393,6 +397,11 @@ static FecStatus wirehair_start_session(FecEncoder *encoder)
         wirehair_segment_source_packets(encoder->wh_segment_bytes);
     encoder->wh_repair_budget = wirehair_segment_repair_packets(
         encoder->wh_source_packets, config.repair_percent);
+    encoder->wh_packet_limit =
+        encoder->wh_source_packets +
+        wirehair_segment_repair_ceiling(encoder->wh_source_packets,
+                                        config.repair_percent,
+                                        config.ack_enabled);
     encoder->wh_next_id = 0;
     encoder->wh_acked = 0;
     encoder->wh_segment_id = ((uint64_t)encoder->epoch << 32) |
@@ -407,7 +416,7 @@ static FecStatus wirehair_start_session(FecEncoder *encoder)
 
 static FecStatus wirehair_enqueue_next_packet(FecEncoder *encoder)
 {
-    uint8_t payload[PKG_SIZE];
+    uint8_t payload[WH_PACKET_SIZE];
     uint32_t written = 0;
     WirehairResult encode_result;
     WireHeader header;
@@ -418,7 +427,10 @@ static FecStatus wirehair_enqueue_next_packet(FecEncoder *encoder)
     if (encoder->wh_codec == NULL) {
         return FEC_OK;
     }
-    packet_limit = encoder->wh_source_packets + encoder->wh_repair_budget;
+    packet_limit = encoder->wh_packet_limit;
+    if (packet_limit == 0u) {
+        packet_limit = encoder->wh_source_packets + encoder->wh_repair_budget;
+    }
     if (encoder->wh_acked &&
         encoder->wh_next_id >= encoder->wh_source_packets) {
         wirehair_close_session(encoder);
@@ -557,6 +569,7 @@ static WirehairSegmentReceiver *wirehair_make_receiver(FecDecoder *decoder)
     wirehair_segment_config_defaults(&config);
     config.segment_bytes = decoder->config.segment_bytes;
     config.repair_percent = decoder->config.repair_percent;
+    config.window = decoder->config.window;
     config.ack_enabled = decoder->config.ack_enabled != 0u;
     config.origin_node = decoder->config.origin_node;
     config.ack_ttl = decoder->config.ack_ttl;
@@ -753,7 +766,7 @@ FecEncoder *fec_encoder_create(const FecTransportConfig *config,
         return NULL;
     }
     max_datagram = resolved.codec == FEC_CODEC_WIREHAIR ?
-                       (WIRE_V4_HEADER_SIZE + (size_t)PKG_SIZE) :
+                       (WIRE_V4_HEADER_SIZE + (size_t)WH_PACKET_SIZE) :
                        (WIRE_HEADER_SIZE + (size_t)resolved.shard_size);
     stride = align8(offsetof(FecQueueItem, datagram) + max_datagram);
     encoder = calloc(1, sizeof(*encoder));
@@ -902,9 +915,8 @@ FecStatus fec_encoder_flush(FecEncoder *encoder)
         return FEC_ERR_INVAL;
     }
     if (encoder_is_wirehair(encoder)) {
-        if (encoder->wh_len == 0u && encoder->wh_codec == NULL) {
-            encoder->wh_send_end = 1;
-        }
+        /* Flush always finishes the current segment (if any) and sends END. */
+        encoder->wh_send_end = 1;
         return wirehair_fill_queue(encoder);
     }
     return encode_and_enqueue_tails(encoder);
@@ -1142,7 +1154,11 @@ FecStatus fec_encoder_input_ack(FecEncoder *encoder,
     if (header.flow_id != encoder->config.flow_id) {
         return FEC_OK;
     }
-    if (encoder->wh_codec != NULL && header.block_id == encoder->wh_segment_id) {
+    /*
+     * The fountain session may already be closed after its datagrams were
+     * queued; still accept the ACK so remaining queued repair is dropped.
+     */
+    if (header.block_id == encoder->wh_segment_id) {
         encoder->wh_acked = 1;
         encoder->stats.recovered_groups++;
     }

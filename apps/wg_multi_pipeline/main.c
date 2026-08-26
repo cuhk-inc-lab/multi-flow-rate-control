@@ -307,8 +307,8 @@ static void print_usage(const char *prog)
             "           Sender and receiver must use the same fixed (k, parity); wire\n"
             "           shard_count must equal k+parity (not a remote profile command).\n"
             "Wirehair: --wh-segment-mib=N --wh-repair-pct=P "
-            "[--wh-ack|--no-wh-ack]\n"
-            "          defaults: 10 MiB, 10%% repair, ACK disabled; "
+            "[--wh-window=N] [--wh-ack|--no-wh-ack]\n"
+            "          defaults: 10 MiB, 10%% repair, window 8, ACK disabled; "
             "--ack-port=N binds sender ACK input.\n"
             "\n"
             "UDP: ingress_push_tuple via recvfrom; outputs <out_prefix>flow0_segment0.bin, ...\n"
@@ -446,6 +446,17 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             wirehair_config.repair_percent = (uint8_t)pct;
+            argi++;
+        } else if (strncmp(argv[argi], "--wh-window=", 12) == 0) {
+            char *end = NULL;
+            unsigned long win = strtoul(argv[argi] + 12, &end, 10);
+
+            if (end == argv[argi] + 12 || *end != '\0' || win == 0 ||
+                win > WH_SEGMENT_WINDOW_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            wirehair_config.window = (uint8_t)win;
             argi++;
         } else if (strcmp(argv[argi], "--wh-ack") == 0) {
             wirehair_config.ack_enabled = true;

@@ -27,7 +27,7 @@ static void print_usage(const char *prog)
             "         (--output FILE | --output-dir DIR)]\n"
             "     [--source FILE --final-dst N --ttl N --codec ...\n"
             "         [--flow-id N] [--rate-mbps N]]\n"
-            "     [--wh-segment-mib=N --wh-repair-pct=P "
+            "     [--wh-segment-mib=N --wh-repair-pct=P --wh-window=N "
             "--wh-ack|--no-wh-ack]\n"
             "     [--test-tx-hold-us N]   (TEST ONLY; default 0)\n"
             "\n"
@@ -235,6 +235,17 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             wirehair_config.repair_percent = (uint8_t)pct;
+            argi++;
+        } else if (strncmp(argv[argi], "--wh-window=", 12) == 0) {
+            char *end = NULL;
+            unsigned long win = strtoul(argv[argi] + 12, &end, 10);
+
+            if (end == argv[argi] + 12 || *end != '\0' || win == 0 ||
+                win > WH_SEGMENT_WINDOW_MAX) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            wirehair_config.window = (uint8_t)win;
             argi++;
         } else if (strcmp(argv[argi], "--wh-ack") == 0) {
             wirehair_config.ack_enabled = true;

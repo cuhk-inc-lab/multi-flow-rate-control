@@ -132,7 +132,8 @@ Library embedding (no sockets): **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPO
 | Flag | Meaning |
 |------|---------|
 | `--wh-segment-mib=N` | Segment size in MiB (default 10) |
-| `--wh-repair-pct=P` | Extra packets as % of source packets (default 10) |
+| `--wh-repair-pct=P` | No ACK: send this much repair. ACK: unused as a target; safety cap is 100% of source |
+| `--wh-window=N` | Receiver in-flight segment window (default 8, max 16) |
 | `--wh-ack` / `--no-wh-ack` | Request ACK to stop leftover repair (default off) |
 | `--ack-port=N` | Sender bind port for incoming ACK datagrams |
 

@@ -12,16 +12,24 @@ Generation key is `(flow_id, block_id)`. Do not invent a separate
 
 Wirehair alone uses wire v4. It treats `block_id` as a segment id,
 `shard_index` as a Wirehair packet id, and adds `origin_node`, flags, and
-`segment_bytes`. Defaults are 10 MiB per segment and a repair ceiling of 10%.
-`--wh-ack` requests an ACK as soon as recovery completes; otherwise the sender
-always transmits the full repair budget.
+`segment_bytes`. Defaults are 10 MiB per segment, a repair floor of 2 packets
+(or 10% of source, whichever is larger), an 8-segment receive window, and a
+1370-byte packet payload chosen to stay under a 1450-byte path MTU without IP
+fragmentation. `--wh-ack` requests an ACK as soon as recovery completes; the
+sender polls ACK while sending (including source packets) and stops leftover
+repair immediately. Repair is not a fixed percent: the sender sprays at line
+rate until ACK, with a safety cap of 100% of source packets so a lost ACK
+cannot run forever. Without ACK the sender transmits the configured
+`--wh-repair-pct` budget. After a segment is recovered, extra packets
+re-send ACK so a dropped ACK can still halt the sender.
 
 ACK datagrams carry `(flow_id, segment_id)`, set `WIRE_FLAG_RETURN_PATH`, and
 are forwarded through each relay's `--return-hop HOST:PORT`. A linear path
 must configure each return hop toward the previous relay; the relay nearest
 the sender points to the sender's `--ack-port`. Wirehair v4 bypasses the
-v3-only `GenerationCache`. A receiver keeps at most four active segment
-decoders, so the default peak decode payload storage is about 40 MiB per flow.
+v3-only `GenerationCache`. A receiver keeps at most `window` active segment decoders (default 8, max 16),
+so the default peak decode payload storage is about 80 MiB per flow at 10 MiB
+segments. Packets ahead of the window are dropped without failing the flow.
 
 Embedding the same Wirehair+ACK path without sockets:
 [`docs/FEC_TRANSPORT.md`](FEC_TRANSPORT.md).
@@ -139,7 +147,9 @@ Defaults:
 - `--process forward` — no cache (Phase 1 behavior).
 - `--process cache` — observe/store only; **still opaque-forward** every packet.
 - `--egress-wait-ms 0` — try-drop baseline; `>0` timed wait on **processing worker only**.
-- `--deferred-per-flow 128`, `--deferred-total 1024`, `--max-active-flows 64`.
+- `--deferred-per-flow 4096`, `--deferred-total 32768`, `--max-active-flows 64`
+  (sized for ~1 Gbps opaque-forward bursts; override downward to save memory).
+- `--egress-capacity 16384`.
 - Limits: `gen_timeout_ms=500`, `max_gens=256`, `max_gens_per_flow=32`,
   `max_cache_bytes=32MiB`.
 

@@ -81,7 +81,8 @@ Call `fec_transport_config_init()` first, then set:
 | --- | --- | --- |
 | `codec` | Must be `FEC_CODEC_WIREHAIR` | — |
 | `segment_bytes` | Bytes gathered before a fountain session | 10 MiB |
-| `repair_percent` | Extra packets as % of source packets | 10 |
+| `repair_percent` | No ACK: extra packets as % of source (floor 2). ACK: not the target; safety cap is 100% of source | 10 |
+| `window` | Receiver in-flight segment slots | 8 |
 | `ack_enabled` | Request ACK; encoder stops leftover repair | **off** (must set `1`) |
 | `origin_node` | v4 `origin_node` | 1 |
 | `final_dst` | Ultimate delivery node | wire default (4) |

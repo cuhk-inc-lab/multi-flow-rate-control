@@ -34,7 +34,7 @@
 #endif
 
 #ifndef RELAY_DEFAULT_EGRESS_CAPACITY
-#define RELAY_DEFAULT_EGRESS_CAPACITY 4096u
+#define RELAY_DEFAULT_EGRESS_CAPACITY 16384u
 #endif
 
 #ifndef RELAY_MAX_DATAGRAM
@@ -131,7 +131,7 @@ typedef struct RelayConfig {
     void               *process_ctx;
     /* 0 => run until SIGINT/SIGTERM; otherwise exit after idle seconds. */
     unsigned            idle_exit_sec;
-    /* Packet slots in the global EgressQueue (default 4096). */
+    /* Packet slots in the global EgressQueue (default 16384). */
     size_t              egress_capacity;
     /*
      * Max wait when EgressQueue is full (milliseconds). 0 = try-drop only
@@ -141,7 +141,7 @@ typedef struct RelayConfig {
     uint32_t            egress_wait_ms;
     /*
      * RX deferred hub (packet-level). 0 => library defaults:
-     *   per_flow=128, total=1024, max_active_flows=64 (must be 1..64).
+     *   per_flow=4096, total=32768, max_active_flows=64 (must be 1..64).
      */
     size_t              deferred_per_flow;
     size_t              deferred_total;

@@ -1,5 +1,6 @@
 #include "fec_transport.h"
 #include "wire_header.h"
+#include "wirehair_segment.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -756,15 +757,17 @@ static int test_wirehair_ack_stops_repair(void)
         .ctx = &dual};
     FecEncoder *encoder;
     FecDecoder *decoder;
-    uint8_t payload[2500];
+    uint8_t payload[8000];
     size_t i;
     size_t ack_seen = 0;
+    uint32_t source_packets;
     FecStats stats;
 
     for (i = 0; i < sizeof(payload); i++) {
         payload[i] = (uint8_t)(i + 9u);
     }
     wirehair_cfg(&config);
+    config.segment_bytes = 16384u;
     encoder = fec_encoder_create(&config, &enc_cb);
     decoder = fec_decoder_create(&config, &dec_cb);
     EXPECT(encoder && decoder);
@@ -791,8 +794,10 @@ static int test_wirehair_ack_stops_repair(void)
     EXPECT(app.len[0] == sizeof(payload));
     EXPECT(memcmp(app.buf[0], payload, sizeof(payload)) == 0);
     EXPECT(acks.count >= 1);
+    source_packets = wirehair_segment_source_packets((uint32_t)sizeof(payload));
     fec_encoder_get_stats(encoder, &stats);
-    EXPECT(stats.parity_datagrams_tx < 2);
+    /* ACK stops leftover repair as soon as recover+ACK is fed back. */
+    EXPECT(stats.parity_datagrams_tx < source_packets / 2u);
     fec_encoder_destroy(encoder);
     fec_decoder_destroy(decoder);
     return 0;

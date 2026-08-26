@@ -71,6 +71,7 @@ typedef struct {
     /* Wirehair-only. Zero means library defaults in create(). */
     uint32_t segment_bytes;
     uint8_t repair_percent;
+    uint8_t window; /* 1..WH_SEGMENT_WINDOW_MAX; 0 => default */
     uint8_t ack_enabled;
     uint8_t origin_node;
     uint8_t final_dst;
