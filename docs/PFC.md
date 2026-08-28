@@ -1,294 +1,215 @@
-# PFC — Piecewise Fountain Code
+# PFC（Piecewise Fountain Code）使用说明
 
-**PFC** is this project's application-layer reliable transport built on top of
-[Wirehair](https://github.com/catid/wirehair) fountain coding. A file (or byte
-stream) is split into **segments** (pieces); each segment is encoded as an
-independent fountain session. Segments are numbered, windowed, and optionally
-acknowledged so the sender can stop repair early and keep multiple segments in
-flight.
+CLI 名称：`--codec wirehair`  
+线格式：wire header **v4**  
+底层编解码：`third_party/wirehair`
 
-In code and CLI the same mechanism is exposed as `--codec wirehair` and wire
-header **v4**. This document uses **PFC** as the system name and **Wirehair**
-when referring to the underlying codec library.
+本文档说明 **系统结构、运行逻辑、配置与用法**。读完应能独立部署直连 / relay / 多流场景。
 
 ---
 
-## Table of contents
+## 目录
 
-1. [Why piecewise?](#1-why-piecewise)
-2. [System placement](#2-system-placement)
-3. [Topology](#3-topology)
-4. [Wire format (v4)](#4-wire-format-v4)
-5. [Segment geometry](#5-segment-geometry)
-6. [Sender behavior](#6-sender-behavior)
-7. [Receiver behavior](#7-receiver-behavior)
-8. [ACK and repair](#8-ack-and-repair)
-9. [Sliding window](#9-sliding-window)
-10. [Multi-flow](#10-multi-flow)
-11. [Relay path](#11-relay-path)
-12. [Rate limiting and pacing](#12-rate-limiting-and-pacing)
-13. [Receive pipeline](#13-receive-pipeline)
-14. [Metrics and logging](#14-metrics-and-logging)
-15. [CLI reference](#15-cli-reference)
-16. [Code map](#16-code-map)
-17. [Library embedding (`fec_transport`)](#17-library-embedding-fec_transport)
-18. [Host tuning](#18-host-tuning)
-19. [Testing](#19-testing)
-20. [Troubleshooting](#20-troubleshooting)
-21. [Design limits](#21-design-limits)
-22. [Related docs](#22-related-docs)
+1. [整体结构](#1-整体结构)
+2. [数据单元](#2-数据单元)
+3. [线格式 v4](#3-线格式-v4)
+4. [发送端逻辑](#4-发送端逻辑)
+5. [接收端逻辑](#5-接收端逻辑)
+6. [ACK 与补包](#6-ack-与补包)
+7. [滑动窗口](#7-滑动窗口)
+8. [部署拓扑](#8-部署拓扑)
+9. [多流](#9-多流)
+10. [Relay 行为](#10-relay-行为)
+11. [限速](#11-限速)
+12. [日志与指标](#12-日志与指标)
+13. [命令行参数](#13-命令行参数)
+14. [代码文件](#14-代码文件)
+15. [测试](#15-测试)
+16. [约束](#16-约束)
 
 ---
 
-## 1. Why piecewise?
+## 1. 整体结构
 
-A naïve end-to-end fountain over an entire file has two problems on a multi-hop
-UDP path:
-
-1. **Head-of-line blocking** — the receiver cannot emit bytes until the whole
-   object recovers.
-2. **Unbounded repair** — without per-piece feedback, the sender must spray
-   repair for the entire file before knowing what arrived.
-
-PFC solves this by **piecewise** sessions:
+### 1.1 分层
 
 ```text
-file bytes
-  → segment 0 (fountain encode → UDP packets → fountain decode → write)
-  → segment 1
-  → segment 2
-  → …
-  → END
-```
-
-Each segment is a self-contained Wirehair object (typically up to 10 MiB).
-Optional **segment-level ACK** lets the sender stop repair for a recovered
-piece while other pieces continue. A **bounded sliding window** keeps up to
-`window` segments in flight so ACK waits do not serialize the whole transfer.
-
----
-
-## 2. System placement
-
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Application                                                    │
-│  wg_multi_pipeline  (--udp-send / --udp-recv / --udp-send-multi)│
-│  wire_relay         (--source / --local-decode, opaque forward)│
-└────────────┬───────────────────────────────┬────────────────────┘
-             │                               │
-┌────────────▼────────────┐     ┌────────────▼────────────┐
-│  wire_udp.c             │     │  relay.c                │
-│  UDP I/O, pacing,       │     │  TTL/forward, ACK lane, │
-│  sliding window,        │     │  per-flow return route  │
-│  recvmmsg batch RX      │     │                         │
-└────────────┬────────────┘     └────────────┬────────────┘
-             │                               │
-┌────────────▼───────────────────────────────▼────────────┐
-│  wirehair_segment.c                                     │
-│  Per-segment encode/decode, ACK emit, window slots      │
-└────────────┬────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  可执行程序                                                 │
+│  wg_multi_pipeline   sender / receiver                   │
+│  wire_relay          中转 / 本地 source / 本地 decode      │
+└────────────┬─────────────────────────┬───────────────────┘
+             │                         │
+┌────────────▼────────────┐ ┌──────────▼──────────┐
+│  wire_udp.c             │ │  relay.c            │
+│  UDP 收发、限速、滑动窗口   │ │  转发、ACK 回程、双队列  │
+│  recvmmsg、decode 线程    │ │  per-flow 路由学习    │
+└────────────┬────────────┘ └──────────┬──────────┘
+             │                         │
+┌────────────▼─────────────────────────▼──────────┐
+│  wirehair_segment.c                              │
+│  分段、编码/解码、窗口槽位、ACK 生成               │
+└────────────┬────────────────────────────────────┘
              │
 ┌────────────▼────────────┐
 │  third_party/wirehair   │
-│  Fountain codec (C API) │
+│  单段喷泉编解码           │
 └─────────────────────────┘
 ```
 
-| Layer | Responsibility |
+### 1.2 传输流程（单文件）
+
+```text
+文件
+  → 按 segment_bytes 切段（segment 0, 1, 2, …）
+  → 每段独立 Wirehair 编码 → 多个 UDP DATA 包
+  → 接收端解码恢复 → 按 segment id 顺序写文件
+  → 最后发 END（block_id = 总段数）
+```
+
+### 1.3 两个程序入口
+
+| 程序 | 角色 |
 | --- | --- |
-| **Wirehair** | Generate / consume fountain packets for one segment |
-| **wirehair_segment** | Segment boundaries, window, ACK, repair policy |
-| **wire_udp** | Sockets, pacing, multi-flow demux, decode workers |
-| **wire_relay** | Multi-hop forward, ACK return path, fair egress |
+| `wg_multi_pipeline` | 端到端 sender（`--udp-send`）/ receiver（`--udp-recv`）/ 多流（`--udp-send-multi`） |
+| `wire_relay` | 中间跳透明转发；也可作 `--source` 发送端或 `--local-decode` 接收端 |
 
-PFC is **not** compatible with wire v3 systematic codecs (`copy`, `xor-fec`,
-`rs-fec`, `rs`). Receivers reject v3 traffic when configured for Wirehair.
+与 v3 编解码器（`copy` / `xor-fec` / `rs` 等）**不兼容**，收发必须同为 `--codec wirehair`。
 
 ---
 
-## 3. Topology
+## 2. 数据单元
 
-### Direct (single hop)
+### 2.1 段（Segment）
 
-```text
-Node1  wg_multi_pipeline --udp-send
-         │  DATA / repair / END  (v4)
-         ▼
-Node2  wg_multi_pipeline --udp-recv
+| 项 | 说明 |
+| --- | --- |
+| 默认大小 | 10 MiB（`--wh-segment-mib`） |
+| 编号 | `block_id`，从 0 递增 |
+| 编码 | 每段一个独立 Wirehair session |
+| 最小填充 | 不足 `2 × 1370` 字节会 pad 到该长度再编码 |
 
-ACK (if enabled):
-Node2  ──ACK──►  Node1 --ack-port
-```
+### 2.2 包（Packet）
 
-### Relay (multi-hop)
+| 项 | 值 |
+| --- | --- |
+| 载荷上限 | 1370 字节（`WH_PACKET_SIZE`） |
+| 段内编号 | `shard_index` = Wirehair packet id |
+| 类型 | source 包（id < source_packets）或 repair 包（id ≥ source_packets） |
 
-```text
-Node1 sender
-  → Node2 relay (opaque forward, learn return route per flow_id)
-  → Node3 receiver (--local-decode or wg_multi_pipeline --udp-recv)
-
-ACK:
-Node3 → relay3 → relay2 → Node1 --ack-port
-```
-
-Relay mid-hops are **opaque**: they do not decode PFC payload. They classify
-v4 `RETURN_PATH` ACK packets into a dedicated egress lane and forward them to
-the UDP endpoint learned from forward DATA for that `flow_id`.
-
-`--return-hop HOST:PORT` on each relay is only a **fallback** when no route has
-been learned yet (e.g. ACK arrives before the first DATA for that flow).
-
-### Lab VM layout (matrix tests)
-
-| Node | Role | Interface |
-| --- | --- | --- |
-| Node1 (`10.10.10.161`) | Sender | `station0` → `10.10.12.1` |
-| Node2 (`10.10.10.162`) | Direct sink or relay hop | `ap0` → `10.10.12.2` |
-| Node3 (`10.10.10.163`) | Relay sink | `10.10.23.2` |
-
-Direct matrix: Node1 → Node2.  
-Relay matrix: Node1 → Node2 `wire_relay` → Node3.
-
----
-
-## 4. Wire format (v4)
-
-Defined in `include/wire_header.h`. Magic `WGP1`, version `4`.
-
-### Header layout (52 bytes)
-
-| Offset | Field | PFC meaning |
-| --- | --- | --- |
-| 0–3 | magic | `0x57475031` (WGP1) |
-| 4 | version | `4` |
-| 5 | type | `DATA`, `END`, or `ACK` |
-| 6 | final_dst | Ultimate delivery node id |
-| 7 | ttl | Hop budget (decremented per relay) |
-| 8–11 | flow_id | Stream id (demux key on receiver) |
-| 12–19 | block_id | **Segment id** |
-| 20–21 | shard_index | **Wirehair packet id** within segment |
-| 22–23 | shard_count | Advertised packet id ceiling for segment |
-| 24–25 | valid_len | Reserved / legacy |
-| 26–27 | payload_len | Fountain payload bytes |
-| 28–43 | encode timestamps | Sender `CLOCK_REALTIME` (optional telemetry) |
-| 44 | origin_node | Source node id (ACK `final_dst` target) |
-| 45 | flags | `ACK_REQUEST`, `RETURN_PATH` |
-| 46–47 | reserved | Zero |
-| 48–51 | segment_bytes | Original segment payload size |
-
-### Packet types
-
-| Type | Payload | Purpose |
-| --- | --- | --- |
-| `DATA` | ≤ 1370 B fountain symbol | Source or repair packet |
-| `END` | empty | `block_id` = total segment count |
-| `ACK` | empty | `(flow_id, segment_id)` recovery complete |
-
-### Flags
-
-| Flag | Set by | Meaning |
-| --- | --- | --- |
-| `WIRE_FLAG_ACK_REQUEST` | Sender | Receiver should emit ACK on recovery |
-| `WIRE_FLAG_RETURN_PATH` | Receiver / relay | ACK datagram; forward toward `origin_node` |
-
-Routing uses **`final_dst` + `ttl`**, not UDP destination IP. Send to the
-**next hop** address while setting `final_dst` to the ultimate sink node.
-
----
-
-## 5. Segment geometry
-
-Constants in `apps/wg_multi_pipeline/wirehair_segment.h`:
-
-| Constant | Value | Meaning |
-| --- | --- | --- |
-| `WH_SEGMENT_DEFAULT_BYTES` | 10 MiB | Default segment size |
-| `WH_PACKET_SIZE` | 1370 | Per-packet payload (MTU 1450 − IP/UDP/header) |
-| `WH_SEGMENT_WINDOW_DEFAULT` | 8 | Default in-flight segment window |
-| `WH_SEGMENT_WINDOW_MAX` | 16 | Hard max window |
-| `WH_SEGMENT_DEFAULT_REPAIR_PCT` | 10 | Default repair budget (no-ACK mode) |
-| `WH_REPAIR_MIN_PACKETS` | 2 | Floor on repair packet count |
-| `WH_ACK_REPAIR_ROUND_PCT` | 5 | ACK micro-round size (% of source pkts) |
-| `WH_ACK_INITIAL_WAIT_MS` | 50 | Wait after source before first repair round |
-| `WH_ACK_REPAIR_WAIT_MS` | 100 | Wait between repair micro-rounds |
-| `WH_ACK_POLL_SLICE_MS` | 10 | ACK socket poll slice |
-
-### Packet counts
-
-For segment payload size `S` bytes:
+### 2.3 包数量计算
 
 ```text
-source_packets = ceil(S / 1370), minimum 2
+source_packets = max(2, ceil(segment_bytes / 1370))
 repair_packets = max(2, ceil(source_packets × repair_pct / 100))
 ```
 
-**No ACK:** sender transmits `source_packets + repair_packets` then advances.
+| 模式 | 发送总量 |
+| --- | --- |
+| 无 ACK | `source_packets + repair_packets`，发完即进下一段 |
+| 有 ACK | 先发完 source；repair 按 5% 微轮追加，直到收到 ACK 或达到 `source_packets` 上限 |
 
-**ACK on:** `repair_pct` does **not** set the target redundancy. It only
-influences geometry validation. The sender emits source once, then 5%
-micro-rounds until ACK or the **safety cap** of `source_packets` repair packets
-(100% of source). Hitting the cap without ACK is a hard segment failure
-(`ack_timeout`).
+### 2.4 默认常量（`wirehair_segment.h`）
 
-Small segments are padded to at least `2 × WH_PACKET_SIZE` for the Wirehair
-codec (minimum block size).
+| 常量 | 值 |
+| --- | --- |
+| `WH_SEGMENT_WINDOW_DEFAULT` | 8 |
+| `WH_SEGMENT_WINDOW_MAX` | 16 |
+| `WH_ACK_REPAIR_ROUND_PCT` | 5（ACK 每轮补包比例） |
+| `WH_ACK_INITIAL_WAIT_MS` | 50 |
+| `WH_ACK_REPAIR_WAIT_MS` | 100 |
 
 ---
 
-## 6. Sender behavior
+## 3. 线格式 v4
 
-Implementation: `wirehair_udp_send_file()` in `wire_udp.c`, segment logic in
-`wirehair_segment.c`.
+定义：`include/wire_header.h`
 
-### High-level loop
+### 3.1 头字段（52 字节）
+
+| 字段 | PFC 含义 |
+| --- | --- |
+| `version` | 4 |
+| `type` | `DATA` / `END` / `ACK` |
+| `final_dst` | 最终目的节点 id |
+| `ttl` | 剩余跳数（relay 每跳减 1） |
+| `flow_id` | 流 id（接收端解复用键） |
+| `block_id` | **段 id** |
+| `shard_index` | **段内包 id** |
+| `shard_count` | 本段 advertised 包 id 上限 |
+| `payload_len` | 载荷长度 |
+| `origin_node` | 源节点 id（ACK 的 `final_dst`） |
+| `flags` | `ACK_REQUEST` / `RETURN_PATH` |
+| `segment_bytes` | 本段原始字节数 |
+
+路由看 **`final_dst` + `ttl`**，不看 UDP 目的 IP。UDP 发往**下一跳**地址，`final_dst` 填最终 sink。
+
+### 3.2 报文类型
+
+| type | 载荷 | 作用 |
+| --- | --- | --- |
+| `DATA` | ≤1370 B | source 或 repair |
+| `END` | 无 | `block_id` = 段总数 |
+| `ACK` | 无 | 通知 `(flow_id, segment_id)` 已恢复 |
+
+### 3.3 标志位
+
+| flag | 谁设置 | 作用 |
+| --- | --- | --- |
+| `WIRE_FLAG_ACK_REQUEST` | 发送端 | 接收端恢复后发 ACK |
+| `WIRE_FLAG_RETURN_PATH` | 接收端 / relay | 标记 ACK，沿回程转发 |
+
+---
+
+## 4. 发送端逻辑
+
+实现：`wire_udp.c` → `wirehair_udp_send_file()`，段状态：`wirehair_segment.c` → `WirehairSegmentTx`
+
+### 4.1 主循环
 
 ```text
-read up to segment_bytes from file
-  → create WirehairSegmentTx (encoder)
-  → emit source packets (batched)
-  → [ACK mode] wait / repair micro-rounds until ACK or cap
-  → advance segment id
-send END (block_id = total segments)
+while 有数据或窗口内还有未 ACK 段:
+  轮询 ACK
+  释放已 ACK 的 base_segment 槽位
+  若窗口未满 → 读下一段、创建 WirehairSegmentTx
+  对每个活跃槽位:
+    source 未发完 → 批量发 source（每批最多 32 包）
+    source 已发完且到 repair_due → 发一轮 5% repair
+send END
 ```
 
-### No-ACK mode
+### 4.2 无 ACK 模式
 
-Serial per segment:
-
-1. Emit all source packet ids `0 .. source_packets-1`.
-2. Emit repair ids `source_packets .. source_packets+repair_budget-1`.
-3. Move to next segment immediately.
-
-Repair is **finite** and predetermined by `--wh-repair-pct`.
-
-### ACK mode (sliding window)
-
-The sender keeps a ring of up to `window` active `WirehairUdpSendSlot` entries:
+每段串行：
 
 ```text
-admit segment id only if  id ∈ [base_segment, base_segment + window)
-
-for each active unacked slot (round-robin):
-  if source incomplete → emit up to 32 source packets
-  else if repair_due    → emit one 5% repair micro-round
-  else                  → wait
-
-on ACK for segment id:
-  mark slot acked
-
-when slot at base_segment is acked:
-  release slot, base_segment++, free window credit
+发 source_packets 个包
+  → 发 repair_packets 个包
+  → 下一段
 ```
 
-Key properties:
+repair 总量由 `--wh-repair-pct` 决定，发完即结束。
 
-- Multiple segments can be in flight; ACK wait is **not** serial.
-- Out-of-order and duplicate ACKs are recorded in an ACK registry
-  (`wirehair_udp_ack_mark` / `_drain`).
-- Shared pacer also enforces `max_inflight == window` across multi-flow sends.
+### 4.3 有 ACK 模式（滑动窗口）
 
-### Send summary line
+```text
+允许在途段: [base_segment, base_segment + window)
+
+槽位 ring: slots[segment_id % window]
+
+每槽位状态机:
+  创建 tx → 发 source → 等待 50ms → [无 ACK] 发 5% repair 轮 → 等待 100ms → 重复
+  收到 ACK → 标记 acked
+  base_segment 槽位 acked → 释放、base_segment++
+
+repair 总量达到 source_packets 仍无 ACK → ack_timeout，发送失败
+```
+
+ACK 登记：`wirehair_udp_ack_mark` / `wirehair_udp_ack_drain`，支持乱序、重复 ACK。
+
+多流时共享 pacer 的 `max_inflight == window`，全进程在途段总数 ≤ window。
+
+### 4.4 发送端输出
 
 ```text
 wirehair-send: source_bytes=… segments=… repair_sent=… wire_bytes=…
@@ -297,127 +218,164 @@ wirehair-send: source_bytes=… segments=… repair_sent=… wire_bytes=…
 
 ---
 
-## 7. Receiver behavior
+## 5. 接收端逻辑
 
-Implementation: `wirehair_segment_receiver_*` + `wirehair_udp_recv_file()`.
+实现：`wirehair_udp_recv_file()` + `wirehair_segment_receiver_*`
 
-### Per-flow state
-
-Each `flow_id` gets:
-
-- `WirehairSegmentReceiver` with `window` decode slots
-- `next_emit_segment` — lowest segment not yet written to disk
-- Rolling window: accepts segments in
-  `[next_emit_segment, next_emit_segment + window)`
-
-### Ingest rules
-
-| Condition | Action |
-| --- | --- |
-| `segment_id < next_emit_segment` (late DATA) | Re-ACK if ACK requested (covers dropped ACK) |
-| `segment_id ≥ next_emit_segment + window` | Drop, increment `ahead_window_drops` |
-| New segment in window | Allocate decoder slot, `wirehair_decode()` |
-| Enough symbols received | `wirehair_recover()`, emit ACK, try in-order write |
-| `END` | Set expected segment count; complete when all emitted |
-
-Segments are written **in order** by `segment_id` even if they recover out of
-order (buffered in slots until the head is ready).
-
-### Receive architecture
+### 5.1 线程结构
 
 ```text
-RX thread (poll + recvmmsg batch, up to 64 datagrams)
-  → validate header, demux by flow_id
-  → enqueue to per-flow bounded queue
+主线程（RX）
+  poll + recvmmsg（每批最多 64 个 UDP 包）
+  → 校验 v4 头
+  → 按 flow_id 入队
 
-Per-flow decode worker thread
+每 flow 一个 decode worker 线程
   → wirehair_segment_receiver_ingest()
-  → fwrite recovered segment
-  → send ACK to learned peer address
+  → 恢复成功 → 写文件 + 发 ACK（到数据包来源地址）
 ```
 
-Decoupling RX from decode prevents bursty WiFi/UDP delivery from stalling the
-socket while Wirehair recovery runs.
+### 5.2 每 flow 状态
+
+| 状态 | 含义 |
+| --- | --- |
+| `next_emit_segment` | 下一个待写入磁盘的段 id |
+| `slots[window]` | 最多 window 个并行解码槽 |
+| `ahead_window_drops` | 超出窗口的包丢弃计数 |
+
+### 5.3 收包处理表
+
+| 条件 | 动作 |
+| --- | --- |
+| `segment_id < next_emit_segment` | 若带 `ACK_REQUEST` → 重发 ACK |
+| `segment_id ≥ next_emit_segment + window` | 丢弃，`ahead_window_drops++` |
+| 窗口内新段 | 分配 decoder，`wirehair_decode()` |
+| 凑够符号 | `wirehair_recover()` → ACK → 尝试顺序写出 |
+| 收到 `END` | 记录总段数；`next_emit_segment` 追平后完成 |
+
+段可乱序恢复，但**按 segment id 顺序写文件**。
 
 ---
 
-## 8. ACK and repair
+## 6. ACK 与补包
 
-### ACK datagram
-
-```text
-type        = ACK
-final_dst   = origin_node (from DATA header)
-flags       = RETURN_PATH
-flow_id     = stream id
-block_id    = segment id
-segment_bytes = recovered segment size
-(payload empty)
-```
-
-### Sender ACK socket
-
-Sender binds `--ack-port` (default: ephemeral) and polls for ACKs while
-transmitting. In multi-flow mode each flow may use a distinct source port;
-relay learns the correct return path per `flow_id`.
-
-### Repair timeline (ACK mode, one segment)
+### 6.1 ACK 报文内容
 
 ```text
-t=0     emit all source packets (possibly batched with other segments)
-t+50ms  if no ACK → repair micro-round 1 (5% of source_packets fresh ids)
-t+150ms if no ACK → repair micro-round 2
-…       until ACK or repair_sent == source_packets (100% cap) → fail
+type         = ACK
+final_dst    = origin_node（来自 DATA 头）
+flags        = RETURN_PATH
+flow_id      = 流 id
+block_id     = 段 id
+segment_bytes = 恢复的字节数
 ```
 
-### Why `repair_sent = 0` on clean paths
+### 6.2 发送端 ACK 接收
 
-`repair_sent` counts **repair packet ids actually transmitted**. On a path
-with negligible UDP loss, segments recover from source packets alone before
-the first repair micro-round fires, so `repair_sent` stays 0. This does **not**
-mean the network is lossless — only that loss did not require repair.
+- 绑定 `--ack-port`（默认系统分配）
+- 发送过程中轮询 ACK socket
+- 多流时各 flow 可有不同源端口；relay 按 `flow_id` 记回程
 
-Under induced loss (`tc netem`), `repair_sent` becomes non-zero while files
-still verify.
+### 6.3 单段时序（ACK 模式）
 
-### Per-round repair size
+```text
+发完该段全部 source 包
+  → 等 50ms
+  → 无 ACK：发 5% repair 轮（repair_rounds++）
+  → 等 100ms
+  → 重复，直到 ACK 或 repair 达 source_packets 上限
+```
 
-ACK micro-rounds always use `WH_ACK_REPAIR_ROUND_PCT` (5%), **not**
-`--wh-repair-pct`. The CLI repair percent mainly affects:
+| 参数 | ACK 模式作用 |
+| --- | --- |
+| `--wh-repair-pct` | 无 ACK 时的 repair 预算；ACK 模式仅参与 `shard_count` 校验与 100% 上限 |
+| 5% 微轮 | 固定用 `WH_ACK_REPAIR_ROUND_PCT`，与 `--wh-repair-pct` 无关 |
 
-- No-ACK mode budget
-- Header `shard_count` ceiling validation
-- ACK mode safety cap calculation (100% of source)
+### 6.4 `repair_sent` 含义
+
+只统计 **repair 包 id** 的实际发送数（不含 source 包）。路径无丢包时常为 0。
 
 ---
 
-## 9. Sliding window
+## 7. 滑动窗口
 
-Sender and receiver share the same `window` (default 8, max 16).
+发送端与接收端共用 `--wh-window`（默认 8，最大 16）。
 
 ```text
-Receiver accept range:  [next_emit, next_emit + window)
-Sender admit range:     [base_segment, base_segment + window)
+发送端准入: segment_id ∈ [base_segment, base_segment + window)
+接收端接受: segment_id ∈ [next_emit_segment, next_emit_segment + window)
 ```
 
-| Scenario | Sender | Receiver |
+| 事件 | 发送端 | 接收端 |
 | --- | --- | --- |
-| Window full, waiting for ACK | Stops admitting new segments | — |
-| Sender too far ahead | — | Drops packets, `ahead_window_drops++` |
-| ACK for segment beyond base | Recorded, applied when slot opens | — |
-| Segment hits repair cap | `ack_timeout`, send fails | May stall if sender wrongly advanced (prevented) |
+| 窗口满 | 停止读新段 | — |
+| 超前发包 | — | 丢弃，`ahead_window_drops++` |
+| repair 耗尽无 ACK | `ack_timeout`，失败退出 | — |
 
-**Memory (receiver, per flow):** up to `window × segment_bytes` decode
-buffers. Default 8 × 10 MiB ≈ 80 MiB peak per flow.
-
-**Metric `send_window_hwm`:** high-water mark of concurrent in-flight segments
-on the sender (should stay ≤ `window`).
+接收端每 flow 峰值内存约 `window × segment_bytes`（默认约 80 MiB）。
 
 ---
 
-## 10. Multi-flow
+## 8. 部署拓扑
 
-### Sending
+### 8.1 直连
+
+```bash
+# Node2 接收
+./build/wg_multi_pipeline --codec wirehair --wh-ack \
+  --udp-recv 9000 /tmp/out.bin --local-node-id 4 --idle-sec 5 --strict
+
+# Node1 发送
+./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
+  --wh-segment-mib=2 --wh-repair-pct=20 --wh-window=8 \
+  --final-dst 4 --ttl 8 --rate-mbps 1000 \
+  --udp-send 10.10.12.2 9000 input.bin
+```
+
+```text
+Node1 --udp-send--> Node2 --udp-recv
+Node2 --ACK--------> Node1 --ack-port
+```
+
+### 8.2 Relay 三跳
+
+```text
+Node1 sender
+  → Node2 relay（opaque，学 per-flow 回程）
+  → Node3 receiver
+
+ACK: Node3 → relay → Node1 --ack-port
+```
+
+```bash
+# Node2 中转
+./build/wire_relay --local-node-id 2 --listen 9000 \
+  --next-hop 10.10.23.2:9000
+
+# Node3 接收
+./build/wg_multi_pipeline --codec wirehair --wh-ack \
+  --udp-recv 9000 /tmp/out.bin --local-node-id 4 --strict
+
+# Node1 发送
+./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
+  --final-dst 4 --ttl 8 --udp-send 10.10.12.2 9000 input.bin
+```
+
+`--return-hop` 仅在 relay **尚未学到** 该 `flow_id` 回程地址时使用。
+
+### 8.3 实验 VM（矩阵脚本）
+
+| 节点 | SSH | 数据网 |
+| --- | --- | --- |
+| Node1 | `fyp1@10.10.10.161` | `10.10.12.1` |
+| Node2 | `fyp1@10.10.10.162` | `10.10.12.2` |
+| Node3 | `fyp1@10.10.10.163` | `10.10.23.2` |
+
+---
+
+## 9. 多流
+
+### 9.1 发送
 
 ```bash
 ./build/wg_multi_pipeline --codec wirehair --wh-ack --udp-send-multi \
@@ -425,248 +383,186 @@ on the sender (should stay ≤ `window`).
   --flow "1:10.10.12.2:9000:input1.bin:500"
 ```
 
-- Each flow has its own `flow_id` in the wire header.
-- Rate-limited multi-flow shares one **aggregate wire-byte pacer**:
-  limit = sum of per-flow `rate_mbps`. This spaces packets across flows
-  instead of synchronized bursts.
-- Shared window: total in-flight segments across all flows ≤ `window`.
+- `flow_id` 写在 wire 头里
+- 限速：各 flow `rate_mbps` **相加**为聚合线速上限
+- 在途段：全进程共享 window
 
-### Receiving
+### 9.2 接收
 
 ```bash
 ./build/wg_multi_pipeline --codec wirehair --wh-ack \
   --udp-recv 9000 /tmp/out_ --max-flows 4 --local-node-id 4
 ```
 
-Demux is **only** by `WireHeader.flow_id`, not UDP 5-tuple. After relay, all
-flows may share the same UDP source port — `flow_id` is the authoritative key.
+- 解复用只看 `flow_id`，不看 UDP 五元组
+- 输出文件：`{prefix}src_{ip}_p{port}_flow_{id}.{suffix}`
 
-Output naming:
+---
+
+## 10. Relay 行为
+
+### 10.1 转发路径
 
 ```text
-{prefix}src_{sender_ip}_p{sender_port}_flow_{flow_id}.{suffix}
+UDP 入 → ttl==0 丢弃
+      → final_dst==local → local-decode / local-source ACK 投递
+      → 否则 TTL-- → DATA 入 data egress → sendto(next-hop)
 ```
 
----
+DATA / repair / END：**不解码**，透明转发。
 
-## 11. Relay path
-
-See also [`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md) and
-[`apps/wire_relay/README.md`](../apps/wire_relay/README.md).
-
-### Forward path
-
-DATA / repair / END: opaque copy, TTL decrement, enqueue to DATA egress lane.
-
-### ACK return path
-
-1. Receiver emits ACK to its immediate previous hop (UDP `sendto` peer).
-2. Each relay classifies `ACK + RETURN_PATH`:
-   - If local `--source` is waiting for this ACK → deliver to encoder thread.
-   - Else lookup per-`flow_id` learned return route → ACK egress lane.
-3. TX worker: prefer ACK lane, but after 8 consecutive ACKs send 1 DATA
-   packet if waiting (fairness).
-
-### Relay + sliding window
-
-Relay `source_ack_valid[]` mirrors sender window capacity
-(`RELAY_SOURCE_ACK_CAPACITY = WH_SEGMENT_WINDOW_MAX`) so multiple in-flight
-ACKs toward a local `--source` encoder are not overwritten.
-
-### Direct vs relay (behavior)
-
-| Aspect | Same? |
-| --- | --- |
-| Segment / window / ACK semantics | Yes |
-| `repair_sent`, `send_window_hwm` meaning | Yes |
-| Peak throughput | No — relay adds hop latency and queueing |
-| ACK routing | Relay learns per-flow; direct is one UDP hop |
-
----
-
-## 12. Rate limiting and pacing
-
-`pace_to_source_rate()` sleeps so **wire bytes** (headers + payload) track the
-configured Mbps. Pacing is based on monotonic time from send start.
-
-| Mode | Pacing |
-| --- | --- |
-| Single `--udp-send --rate-mbps N` | Per-flow wire-byte pace |
-| `--udp-send-multi` | Shared pacer, aggregate = sum of flow rates |
-| `--no-pace` | No sleep between packets (benchmark / test) |
-
-Pacing applies to repair packets too (they count toward `wire_bytes`).
-
----
-
-## 13. Receive pipeline
-
-### Socket buffer
-
-Receiver requests 64 MiB `SO_RCVBUF` and logs:
+### 10.2 ACK 回程
 
 ```text
-udp-recv: socket_rcvbuf=<granted> requested=67108864
+ACK + RETURN_PATH 入 ack egress（容量 1024）
+  → 查 per-flow 学到的上一跳 UDP 地址
+  → sendto 回程
+  → 若无路由，用 --return-hop
 ```
 
-If granted ≪ requested, raise `net.core.rmem_max` (see [Host tuning](#18-host-tuning)).
+TX 调度：优先 ACK；连续 8 个 ACK 后若 DATA 在等，发 1 个 DATA。
 
-### Batch receive
+### 10.3 Relay 作 source
 
-`recvmmsg()` reads up to `WIREHAIR_RECV_BATCH` (64) datagrams per syscall.
-
-### Per-flow queue + worker
-
-Each flow has a bounded queue between RX and decode threads. The worker
-retains the source `sockaddr` of each datagram so ACKs return to the correct
-previous hop (critical for relay).
+`--source` 本地编码注入，ACK 到达本地时写入 `source_ack_valid[segment_id % 16]`，供编码线程查询。
 
 ---
 
-## 14. Metrics and logging
+## 11. 限速
 
-### Sender (`wirehair-send:` summary)
+`pace_to_source_rate()` 按 **wire 字节**（头+载荷）限速。
 
-| Field | Definition |
+| 场景 | 行为 |
 | --- | --- |
-| `source_bytes` | Application payload bytes read from file |
-| `segments` | Segment count sent |
-| `repair_sent` | Fountain repair packet ids transmitted (not source ids) |
-| `wire_bytes` | Total on-wire bytes including headers (all packets) |
-| `repair_rounds` | ACK repair micro-rounds executed |
-| `send_window_hwm` | Max concurrent in-flight segments |
-| `ack=on/off` | Whether ACK mode was enabled |
-| `status=ok/failed` | Overall send result |
-
-### Derived (benchmark scripts)
-
-| Metric | Formula |
-| --- | --- |
-| **goodput** | `source_bytes × 8 / wall_s / 1e6` Mbps |
-| **wire** | `wire_bytes × 8 / wall_s / 1e6` Mbps |
-| **overhead** | `(wire − goodput) / wire` |
-
-`wall_s` comes from the pipeline wall-clock timer around the send path.
-
-### Receiver
-
-| Field | Meaning |
-| --- | --- |
-| `ahead_window_drops` | Packets dropped because `segment_id` was beyond window |
-| `socket_rcvbuf` | Kernel-granted receive buffer |
-| `flow N worker started` | Per-flow decode worker and queue capacity |
-
-### Failure indicators
-
-| Log | Meaning |
-| --- | --- |
-| `ack_timeout=yes` | Segment exhausted 100% repair cap without ACK |
-| `status=failed` | Send aborted (timeout, I/O, or pacing error) |
-| `SEND_FAIL` (matrix) | Sender exited non-zero |
-
-### Relay egress (summary)
-
-`ack_egress_*` and `data_egress_*` queue high-water marks, wait times, and
-enqueue counts — useful when ACK traffic competes with bulk DATA at high rate.
+| `--udp-send --rate-mbps N` | 单流线速 ≤ N Mbps |
+| `--udp-send-multi` | 聚合线速 ≤ 各 flow rate 之和 |
+| `--no-pace` | 不限速 |
+| repair 包 | 计入 wire_bytes |
 
 ---
 
-## 15. CLI reference
+## 12. 日志与指标
 
-### `wg_multi_pipeline`
+### 12.1 发送端 summary
 
-```bash
-# Receiver
-./build/wg_multi_pipeline --codec wirehair --wh-ack \
-  --udp-recv 9000 /tmp/out.bin --local-node-id 4 --idle-sec 5 --strict
+| 字段 | 含义 |
+| --- | --- |
+| `source_bytes` | 文件有效载荷字节 |
+| `segments` | 段数 |
+| `repair_sent` | 发出的 repair 包数 |
+| `wire_bytes` | 线上总字节（含头） |
+| `repair_rounds` | ACK 补包轮数 |
+| `send_window_hwm` | 在途段数峰值 |
+| `status` | `ok` / `failed` |
 
-# Sender
-./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
-  --wh-segment-mib=2 --wh-repair-pct=20 --wh-window=8 \
-  --final-dst 4 --ttl 8 --rate-mbps 1000 \
-  --udp-send 10.10.12.2 9000 input.bin
-```
+### 12.2 脚本衍生指标
 
-| Flag | Default | Meaning |
+| 指标 | 计算 |
+| --- | --- |
+| goodput | `source_bytes × 8 / wall_s / 1e6` Mbps |
+| wire | `wire_bytes × 8 / wall_s / 1e6` Mbps |
+
+### 12.3 接收端
+
+| 字段 | 含义 |
+| --- | --- |
+| `ahead_window_drops` | 超出接收窗口的丢包数 |
+| `socket_rcvbuf` | 内核实际 SO_RCVBUF |
+
+### 12.4 失败标志
+
+| 日志 | 含义 |
+| --- | --- |
+| `ack_timeout=yes` | 段 repair 达上限仍无 ACK |
+| `status=failed` | 发送失败 |
+
+### 12.5 Relay summary
+
+`ack_egress_*`、`data_egress_*`：队列高水位、等待时间、入队计数。
+
+---
+
+## 13. 命令行参数
+
+### 13.1 `wg_multi_pipeline`
+
+| 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--codec wirehair` | — | Enable PFC / wire v4 |
-| `--wh-segment-mib=N` | 10 | Segment size |
-| `--wh-repair-pct=P` | 10 | No-ACK repair budget; ACK cap helper |
-| `--wh-window=N` | 8 | Shared sender/receiver window (max 16) |
-| `--wh-ack` / `--no-wh-ack` | off | Segment ACK |
-| `--ack-port=N` | ephemeral | Sender ACK listen port |
-| `--final-dst=N` | 4 | Ultimate sink node id |
-| `--ttl=N` | 8 | Hop budget |
-| `--local-node-id=N` | 4 | This node's id (receiver filter) |
-| `--flow-id=N` | 0 | Wire flow id |
-| `--rate-mbps=N` | unlimited | Wire-byte pacing |
-| `--strict` | — | Fail if output incomplete |
-| `--idle-sec=N` | — | Receiver idle timeout |
+| `--codec wirehair` | — | 启用 PFC |
+| `--wh-segment-mib=N` | 10 | 段大小（MiB） |
+| `--wh-repair-pct=P` | 10 | 无 ACK repair 比例；ACK 模式参与上限计算 |
+| `--wh-window=N` | 8 | 滑动窗口（最大 16） |
+| `--wh-ack` / `--no-wh-ack` | 关 | 段级 ACK |
+| `--ack-port=N` | 自动 | 发送端 ACK 监听端口 |
+| `--final-dst=N` | 4 | 最终目的节点 |
+| `--ttl=N` | 8 | 跳数预算 |
+| `--local-node-id=N` | 4 | 本节点 id |
+| `--flow-id=N` | 0 | 单流 wire flow id |
+| `--rate-mbps=N` | 不限 | 线速上限 |
+| `--udp-send H P FILE` | — | 发送 |
+| `--udp-recv P OUT` | — | 接收 |
+| `--udp-send-multi --flow …` | — | 多流发送 |
+| `--max-flows=N` | — | 接收最大流数 |
+| `--strict` | — | 输出不完整则失败 |
+| `--idle-sec=N` | — | 接收空闲超时 |
+| `--no-pace` | — | 关闭限速 |
 
-### `wire_relay`
+### 13.2 `wire_relay`
+
+| 参数 | 说明 |
+| --- | --- |
+| `--local-node-id` | 本节点 id |
+| `--listen` / `--next-hop` | 监听与下一跳 |
+| `--local-decode --codec wirehair` | 本地解码落盘 |
+| `--source FILE --codec wirehair` | 本地编码发送 |
+| `--wh-segment-mib` / `--wh-repair-pct` / `--wh-window` / `--wh-ack` | 同 wg_multi_pipeline |
+| `--return-hop HOST:PORT` | ACK 回程 fallback |
+| `--final-dst` / `--ttl` | `--source` 时必填 |
+
+---
+
+## 14. 代码文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `include/wire_header.h` | v4 头定义 |
+| `wirehair_segment.h/c` | 段编解码、窗口、ACK |
+| `wire_udp.h/c` | UDP 收发、滑动窗口、限速、recvmmsg |
+| `pipeline.c` | 多流调度、共享 pacer |
+| `main.c` | CLI |
+| `relay.c` | 转发、ACK 回程、路由学习 |
+| `egress_queue.c` | ACK/DATA 双队列 |
+| `local_source.c` / `local_decode.c` | relay 内嵌收发 |
+| `fec_transport.c` | 无 socket 库 API（见 `FEC_TRANSPORT.md`） |
+| `scripts/vm_wirehair_full_matrix.py` | VM 回归矩阵 |
+
+库嵌入（不用 `wg_multi_pipeline` 二进制）：见 [`FEC_TRANSPORT.md`](FEC_TRANSPORT.md)。  
+库层无滑动窗口；窗口在 `wire_udp.c` 实现。
+
+---
+
+## 15. 测试
+
+### 15.1 本地
 
 ```bash
-# Mid-hop (opaque)
-./build/wire_relay --local-node-id 2 --listen 9000 \
-  --next-hop 10.10.23.2:9000
-
-# Sink
-./build/wire_relay --local-node-id 4 --listen 9000 \
-  --next-hop 127.0.0.1:9 \
-  --local-decode --codec wirehair --wh-ack \
-  --output-dir /tmp/out
-
-# Source
-./build/wire_relay --local-node-id 1 --listen 9000 \
-  --next-hop 10.10.12.2:9000 \
-  --source input.bin --codec wirehair --wh-ack \
-  --final-dst 4 --ttl 8 --return-hop 10.10.12.1:9100
+make wg-demo wire-relay
+make integration-test
+./build/wirehair_segment_tests
 ```
 
-Relay accepts the same `--wh-*` flags when `--codec wirehair` is set.
+### 15.2 VM 矩阵
 
----
+```bash
+python3 scripts/vm_wirehair_full_matrix.py
+WH_MATRIX_ACK_ONLY=1 python3 scripts/vm_wirehair_full_matrix.py   # 只跑 ACK
+WH_MATRIX_FRESH=1 python3 scripts/vm_wirehair_full_matrix.py      # 忽略旧结果
+```
 
-## 16. Code map
+维度：direct / relay × ACK on/off × 1/2/4 流 × 500/1000/2000/5000 Mbps  
+输出：`build/wirehair_full_matrix.json`
 
-| File | Role |
-| --- | --- |
-| `include/wire_header.h` | v4 header layout and flags |
-| `apps/wg_multi_pipeline/wirehair_segment.h/c` | Segment fountain, window, ACK |
-| `apps/wg_multi_pipeline/wire_udp.h/c` | UDP send/recv, sliding window, pacing |
-| `apps/wg_multi_pipeline/pipeline.c` | Multi-flow orchestration, shared pacer |
-| `apps/wg_multi_pipeline/main.c` | CLI parsing |
-| `apps/wire_relay/relay.c` | Forward, ACK lane, return routes |
-| `apps/wire_relay/egress_queue.c` | Dual-lane fair egress |
-| `apps/wire_relay/local_source.c` | Relay-embedded sender |
-| `apps/wire_relay/local_decode.c` | Relay-embedded receiver |
-| `include/fec_transport.h` / `src/fec_transport.c` | Socket-free library API |
-| `third_party/wirehair/` | Vendored fountain codec |
-| `scripts/vm_wirehair_full_matrix.py` | VM regression matrix |
-| `tests/wire_wirehair_test.sh` | Local integration tests |
-| `tests/wirehair_segment_tests.c` | Segment unit tests |
-
----
-
-## 17. Library embedding (`fec_transport`)
-
-For custom UDP loops without `wg_multi_pipeline`, use `fec_transport` with
-`FEC_CODEC_WIREHAIR`. Same v4 on-wire format; caller supplies `output` and
-`ack_output` callbacks.
-
-See [`FEC_TRANSPORT.md`](FEC_TRANSPORT.md) §3 and §6.
-
-Differences from the full binary path:
-
-- No built-in sliding window in the library (single-segment `fec_encoder_push`)
-- `wg_multi_pipeline` adds windowing, `recvmmsg`, relay integration, and
-  multi-flow pacing on top of `wirehair_segment_*`
-
----
-
-## 18. Host tuning
-
-Before high-rate PFC benchmarks on Linux:
+### 15.3 主机调优（跑满速前）
 
 ```bash
 sudo sysctl -w net.core.rmem_max=67108864
@@ -674,94 +570,28 @@ sudo sysctl -w net.core.wmem_max=67108864
 sudo sysctl -w net.core.netdev_max_backlog=5000
 ```
 
-Confirm receiver log shows `socket_rcvbuf` near the requested 64 MiB.
-
-For cross-host latency/jitter stats, synchronize clocks (e.g. Chrony) — wire
-headers carry `CLOCK_REALTIME` encode timestamps.
+确认接收日志 `socket_rcvbuf` 接近 64M。
 
 ---
 
-## 19. Testing
+## 16. 约束
 
-### Local
-
-```bash
-make wg-demo wire-relay
-make integration-test          # includes wire_wirehair_test.sh
-./build/wirehair_segment_tests
-```
-
-`tests/wire_wirehair_test.sh` covers direct ACK, sliding window
-(`send_window_hwm`), and `ahead_window_drops=0`.
-
-### VM matrix
-
-```bash
-python3 scripts/vm_wirehair_full_matrix.py
-WH_MATRIX_ACK_ONLY=1 python3 scripts/vm_wirehair_full_matrix.py
-```
-
-Matrix dimensions:
-
-- Topology: direct, relay
-- ACK: on, off (`ACK_ONLY` env skips no-ACK)
-- Flows: 1, 2, 4
-- Rates: 500, 1000, 2000, 5000 Mbps
-
-Output: `build/wirehair_full_matrix.json` and `.log`.
-
-### Loss injection (manual)
-
-```bash
-# On sender egress interface (example)
-sudo tc qdisc replace dev station0 root netem loss 1%
-# … run PFC transfer …
-sudo tc qdisc del dev station0 root
-```
-
-Expect `repair_sent > 0` under loss; `repair_sent = 0` on clean paths.
+- 仅 wire v4；不可与 v3 codec 混用
+- 每段 source_packets ≤ 64000
+- `shard_count` ≤ uint16 上限
+- window ≤ 16
+- ACK 模式单段 repair 上限 = source_packets（100%）
+- 无鉴权；用 `sha256sum` 或 `--strict` 校验完整性
+- relay 队列满时丢包（`drop_egress_full`），不保证送达
 
 ---
 
-## 20. Troubleshooting
+## 相关文档
 
-| Symptom | Likely cause | What to check |
-| --- | --- | --- |
-| `ack_timeout=yes` | Loss + ACK loss exceeds repair cap | `repair_sent`, path loss, relay ACK lane drops |
-| `ahead_window_drops > 0` | Sender window too aggressive vs receiver | Lower rate, increase `--wh-window`, check relay backlog |
-| `repair_sent = 0` but OK | Clean path, no repair needed | Normal; inject `tc netem` to verify repair path |
-| Identical `repair_sent` at 1%/3%/5% loss | All segments need ≥1 repair round; fixed 5% round size | Expected per-round budget behavior |
-| Low goodput with relay | Extra hop + fair egress + WiFi | Compare direct; check `ack_egress_*` / `data_egress_*` |
-| `socket_rcvbuf` ≪ 64M | sysctl cap | Raise `rmem_max` |
-| RS receiver rejects stream | Codec mismatch | Both ends `--codec wirehair` |
-| Multi-flow ACK wrong port | Demux by 5-tuple instead of `flow_id` | Use distinct `flow_id`; relay learns per flow |
-
----
-
-## 21. Design limits
-
-- Wire v4 only; no mixing with v3 RS/copy on the same encoder.
-- Max ~64000 source packets per segment (Wirehair block count limit).
-- `shard_count` must fit in `uint16_t`.
-- Receiver window max 16 segments.
-- ACK repair cap: 100% of source packets per segment (not unbounded fountain).
-- Not authenticated: verify file hashes (`sha256sum`, `--strict`).
-- `fec_transport` and `wg_multi_pipeline` share wire format but not all features
-  (windowing lives in `wire_udp.c`).
-- Relay opaque forward does not recode or trim repair — end-to-end PFC semantics
-  are preserved, but relay queues can drop under overload (`drop_egress_full`).
-
----
-
-## 22. Related docs
-
-| Document | Contents |
+| 文档 | 内容 |
 | --- | --- |
-| [`apps/wg_multi_pipeline/README.md`](../apps/wg_multi_pipeline/README.md) | CLI quick start, multi-flow |
-| [`apps/wire_relay/README.md`](../apps/wire_relay/README.md) | Relay CLI, egress lanes |
-| [`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md) | Relay pipeline design |
-| [`FEC_TRANSPORT.md`](FEC_TRANSPORT.md) | Library API |
-| [`SCRIPTS.md`](SCRIPTS.md) | VM matrix and other scripts |
-| [`VM_NETWORK_BENCHMARK.md`](VM_NETWORK_BENCHMARK.md) | Raw path baselines (iperf) |
-| [`tests/TESTING.md`](../tests/TESTING.md) | General test guide |
-| [`third_party/wirehair/README.md`](../third_party/wirehair/README.md) | Wirehair codec internals |
+| [`apps/wg_multi_pipeline/README.md`](../apps/wg_multi_pipeline/README.md) | 程序 CLI 速查 |
+| [`apps/wire_relay/README.md`](../apps/wire_relay/README.md) | relay CLI |
+| [`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md) | relay pipeline 细节 |
+| [`FEC_TRANSPORT.md`](FEC_TRANSPORT.md) | 库 API |
+| [`SCRIPTS.md`](SCRIPTS.md) | 脚本说明 |
