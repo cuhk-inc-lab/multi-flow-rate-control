@@ -140,6 +140,7 @@ ACK/DATA snapshot APIs are also available.
 Library API (same v4, no sockets):
 **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md)**.
 Pipeline notes: **[docs/WIRE_RELAY_PIPELINE.md](../../docs/WIRE_RELAY_PIPELINE.md)**.
+PFC system overview: **[docs/PFC.md](../../docs/PFC.md)**.
 
 ### Relay benchmark cases
 

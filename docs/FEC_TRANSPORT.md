@@ -218,5 +218,6 @@ ACK travels the reverse hops to the source --ack-port.
 ```
 
 See [`apps/wg_multi_pipeline/README.md`](../apps/wg_multi_pipeline/README.md),
-[`apps/wire_relay/README.md`](../apps/wire_relay/README.md), and
-[`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md).
+[`apps/wire_relay/README.md`](../apps/wire_relay/README.md),
+[`WIRE_RELAY_PIPELINE.md`](WIRE_RELAY_PIPELINE.md), and
+[`PFC.md`](PFC.md) (full system overview).

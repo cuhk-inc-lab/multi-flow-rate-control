@@ -93,6 +93,9 @@ RS codec (architecture, API, runtime profiles):
 **[docs/RS_CODEC.md](docs/RS_CODEC.md)**.
 FEC transport library (RS groups + Wirehair v4 with optional ACK):
 **[docs/FEC_TRANSPORT.md](docs/FEC_TRANSPORT.md)**.
+PFC (Piecewise Fountain Code) system overview — Wirehair segments, ACK,
+sliding window, relay, metrics:
+**[docs/PFC.md](docs/PFC.md)**.
 Per-node wire hop:
 **[apps/wire_relay/README.md](apps/wire_relay/README.md)**,
 **[docs/WIRE_RELAY_PIPELINE.md](docs/WIRE_RELAY_PIPELINE.md)**.

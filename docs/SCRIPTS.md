@@ -155,6 +155,8 @@ Helper (kept for multiflow / stress relay NIC sampling):
 - Relay learns per-flow previous-hop UDP endpoints for RETURN_PATH ACK;
   `--return-hop` is only a fallback before a route is learned.
 
+Full PFC system reference: [`docs/PFC.md`](../docs/PFC.md).
+
 **Usage**
 - `python3 scripts/vm_wirehair_full_matrix.py`
 - `WH_MATRIX_ACK_ONLY=1 python3 scripts/vm_wirehair_full_matrix.py` (ACK cases only)

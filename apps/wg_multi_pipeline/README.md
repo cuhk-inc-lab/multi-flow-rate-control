@@ -32,7 +32,7 @@ cmp c.ts  out_c.ts
 | `--codec rs-fec` | Systematic Reed-Solomon FEC via liberasurecode: 4 data + 2 parity shards |
 | `--codec rs` | Systematic Reed-Solomon FEC via vendored hqm/rscode (column-wise RS 4+2); GPL |
 | `--codec none` / `--no-codec` | Local relay: skip coding; pointer-only post-worker queue. In wire UDP modes, `none` sends raw single-shard blocks |
-| `--codec wirehair` | Fountain segments on wire **v4**. Defaults: 10 MiB / 10% repair / ACK off. See [docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md) |
+| `--codec wirehair` | Fountain segments on wire **v4**. Defaults: 10 MiB / 10% repair / ACK off. See [docs/PFC.md](../../docs/PFC.md) (system overview) and [docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md) (library API) |
 | `--multi` | Multiple `in out` pairs; omit for a single pair |
 | (default) | Pacing **on** + BlockCodec **on** (reversible `+/-`, not encryption) |
 
