@@ -93,6 +93,7 @@ wait "$receiver_pid"
 receiver_pid=
 cmp "$input" "$full_out"
 grep -Eq 'repair_sent=[1-9][0-9]*' "$base/wire_wirehair_full_send.log"
+grep -q 'wirehair-recv: flow 0 worker started queue_cap=' "$full_out.log"
 
 python3 - 22123 22121 <<'PY' &
 import select
@@ -141,6 +142,8 @@ cmp "$input" "$ack_out"
 ack_repairs=$(awk -F'repair_sent=' '{split($2, a, " "); print a[1]}' \
     "$base/wire_wirehair_ack_send.log")
 test "$ack_repairs" -lt 1873
+grep -q 'send_window_hwm=3' "$base/wire_wirehair_ack_send.log"
+grep -q 'ahead_window_drops=0 ' "$ack_out.log"
 
 mismatch_out="$base/wire_wirehair_mismatch.bin"
 start_receiver rs 22122 "$mismatch_out" --no-wh-ack
@@ -179,6 +182,49 @@ if [ -x "$relay" ]; then
     wait "$relay2_pid" 2>/dev/null || true
     relay1_pid=
     relay2_pid=
+
+    # Multi-flow ACK return routing: the relay learns each sender socket from
+    # forward DATA, so ACKs return to ack-port-base + flow index without a
+    # single static --return-hop port collapsing all flows onto flow 0.
+    multi_prefix="$base/wire_wirehair_multi_"
+    multi_log="$base/wire_wirehair_multi_recv.log"
+    rm -f "${multi_prefix}"* "$multi_log"
+    "$bin" --codec wirehair --wh-segment-mib=10 --wh-repair-pct=10 --wh-ack \
+        --local-node-id 4 --udp-recv 22141 "$multi_prefix" --max-flows 2 \
+        --idle-sec 8 --strict >"$multi_log" 2>&1 &
+    receiver_pid=$!
+    wait_ready "$multi_log" 'wirehair-recv: listening' "$receiver_pid"
+    "$relay" --local-node-id 2 --listen 22140 \
+        --next-hop 127.0.0.1:22141 --idle-exit-sec 8 \
+        >"$base/wire_wirehair_multi_relay.log" 2>&1 &
+    relay1_pid=$!
+    wait_ready "$base/wire_wirehair_multi_relay.log" \
+        'wire-relay: local_node_id' "$relay1_pid"
+    "$bin" --codec wirehair --wh-segment-mib=10 --wh-repair-pct=10 --wh-ack \
+        --ack-port=22150 --local-node-id 1 --final-dst 4 --ttl 8 \
+        --udp-send-multi \
+        --flow "0:127.0.0.1:22140:$hop_input:100" \
+        --flow "1:127.0.0.1:22140:$hop_input:100" \
+        >"$base/wire_wirehair_multi_send.log" 2>&1
+    wait "$receiver_pid"
+    receiver_pid=
+    flow0=
+    flow1=
+    for candidate in "${multi_prefix}"*flow_0*; do
+        if [ -f "$candidate" ]; then flow0=$candidate; break; fi
+    done
+    for candidate in "${multi_prefix}"*flow_1*; do
+        if [ -f "$candidate" ]; then flow1=$candidate; break; fi
+    done
+    test -n "$flow0"
+    test -n "$flow1"
+    cmp "$hop_input" "$flow0"
+    cmp "$hop_input" "$flow1"
+    test "$(grep -c 'wirehair-recv: flow .* worker started queue_cap=' \
+        "$multi_log")" -eq 2
+    kill "$relay1_pid" 2>/dev/null || true
+    wait "$relay1_pid" 2>/dev/null || true
+    relay1_pid=
 fi
 
 echo "wire v4 segmented Wirehair loss, ACK, mismatch, and relay tests passed"

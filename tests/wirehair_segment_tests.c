@@ -23,6 +23,12 @@ typedef struct PacketStore {
     size_t count;
 } PacketStore;
 
+typedef struct DelayedAck {
+    const PacketStore *store;
+    size_t ack_after_packets;
+    int never_ack;
+} DelayedAck;
+
 static int collect_output(uint32_t flow_id, const uint8_t *data, size_t len,
                           void *opaque)
 {
@@ -92,6 +98,20 @@ static int store_emit(const WireHeader *header, const uint8_t *payload,
     store->packets[store->count].payload_len = payload_len;
     store->count++;
     return 0;
+}
+
+static int delayed_ack_poll(uint32_t flow_id, uint64_t segment_id,
+                            unsigned wait_ms, void *opaque)
+{
+    DelayedAck *delay = opaque;
+
+    (void)flow_id;
+    (void)segment_id;
+    (void)wait_ms;
+    if (delay == NULL || delay->store == NULL || delay->never_ack) {
+        return 0;
+    }
+    return delay->store->count >= delay->ack_after_packets ? 1 : 0;
 }
 
 static int run_roundtrip(size_t bytes, int ack_enabled)
@@ -284,6 +304,135 @@ out:
     return result;
 }
 
+static int test_ack_repair_rounds_and_timeout(void)
+{
+    WirehairSegmentConfig config;
+    WirehairSegmentSendStats stats;
+    PacketStore store;
+    DelayedAck delay;
+    uint8_t input[4096];
+    uint32_t source_packets;
+    size_t i;
+
+    wirehair_segment_config_defaults(&config);
+    config.segment_bytes = sizeof(input);
+    config.repair_percent = 50u;
+    config.ack_enabled = true;
+    for (i = 0; i < sizeof(input); i++) {
+        input[i] = (uint8_t)(i * 13u + 5u);
+    }
+    source_packets = wirehair_segment_source_packets(sizeof(input));
+
+    /* An ACK available after the final source packet must avoid all repair. */
+    memset(&store, 0, sizeof(store));
+    delay = (DelayedAck){
+        .store = &store,
+        .ack_after_packets = source_packets,
+    };
+    if (wirehair_segment_send(&config, 9u, 0u, 4u, 8u, input,
+                              sizeof(input), store_emit, &store,
+                              delayed_ack_poll, &delay, &stats) != 0 ||
+        !stats.stopped_by_ack || stats.ack_timed_out ||
+        stats.repair_sent != 0u || stats.repair_rounds != 0u) {
+        fprintf(stderr,
+                "post-source ACK did not avoid repair sent=%u rounds=%u "
+                "stopped=%d timeout=%d\n",
+                stats.repair_sent, stats.repair_rounds,
+                stats.stopped_by_ack, stats.ack_timed_out);
+        return -1;
+    }
+
+    memset(&store, 0, sizeof(store));
+    delay = (DelayedAck){
+        .store = &store,
+        .ack_after_packets = source_packets + 1u,
+    };
+    if (wirehair_segment_send(&config, 9u, 0u, 4u, 8u, input,
+                              sizeof(input), store_emit, &store,
+                              delayed_ack_poll, &delay, &stats) != 0 ||
+        !stats.stopped_by_ack || stats.ack_timed_out ||
+        stats.repair_sent == 0u || stats.repair_rounds == 0u) {
+        fprintf(stderr,
+                "delayed ACK did not stop repair rounds sent=%u rounds=%u "
+                "stopped=%d timeout=%d\n",
+                stats.repair_sent, stats.repair_rounds,
+                stats.stopped_by_ack, stats.ack_timed_out);
+        return -1;
+    }
+
+    memset(&store, 0, sizeof(store));
+    delay = (DelayedAck){
+        .store = &store,
+        .never_ack = 1,
+    };
+    memset(&stats, 0, sizeof(stats));
+    if (wirehair_segment_send(&config, 9u, 1u, 4u, 8u, input,
+                              sizeof(input), store_emit, &store,
+                              delayed_ack_poll, &delay, &stats) == 0 ||
+        !stats.ack_timed_out || stats.stopped_by_ack ||
+        stats.repair_sent != source_packets) {
+        fprintf(stderr,
+                "missing ACK did not hard-fail sent=%u source=%u "
+                "stopped=%d timeout=%d\n",
+                stats.repair_sent, source_packets,
+                stats.stopped_by_ack, stats.ack_timed_out);
+        return -1;
+    }
+    return 0;
+}
+
+static int test_incremental_tx_batches(void)
+{
+    WirehairSegmentConfig config;
+    WirehairSegmentTx *tx;
+    const WirehairSegmentSendStats *stats;
+    PacketStore store;
+    uint8_t input[4096];
+    uint32_t source_packets;
+    uint32_t repair_packets;
+    int emitted;
+
+    memset(input, 0x5a, sizeof(input));
+    memset(&store, 0, sizeof(store));
+    wirehair_segment_config_defaults(&config);
+    config.segment_bytes = sizeof(input);
+    config.repair_percent = 50u;
+    config.ack_enabled = true;
+    source_packets = wirehair_segment_source_packets(sizeof(input));
+    repair_packets =
+        wirehair_segment_ack_repair_round_packets(source_packets);
+    tx = wirehair_segment_tx_create(&config, 17u, 3u, 4u, 8u,
+                                    input, sizeof(input));
+    if (tx == NULL) {
+        return -1;
+    }
+    emitted = wirehair_segment_tx_emit_source(tx, 1u, store_emit, &store);
+    if (emitted != 1 || wirehair_segment_tx_source_complete(tx)) {
+        wirehair_segment_tx_destroy(tx);
+        return -1;
+    }
+    emitted = wirehair_segment_tx_emit_source(
+        tx, source_packets, store_emit, &store);
+    if (emitted != (int)source_packets - 1 ||
+        !wirehair_segment_tx_source_complete(tx) ||
+        wirehair_segment_tx_repair_exhausted(tx)) {
+        wirehair_segment_tx_destroy(tx);
+        return -1;
+    }
+    emitted = wirehair_segment_tx_emit_repair(
+        tx, repair_packets, store_emit, &store);
+    stats = wirehair_segment_tx_stats(tx);
+    if (emitted != (int)repair_packets || stats == NULL ||
+        stats->repair_sent != repair_packets ||
+        stats->repair_rounds != 1u ||
+        stats->packets_sent != source_packets + repair_packets) {
+        wirehair_segment_tx_destroy(tx);
+        return -1;
+    }
+    wirehair_segment_tx_destroy(tx);
+    return 0;
+}
+
 int main(void)
 {
     WirehairSegmentConfig config;
@@ -306,7 +455,9 @@ int main(void)
         run_roundtrip(28000u, 0) != 0 ||
         run_roundtrip(731u, 1) != 0 ||
         test_outof_window_drop() != 0 ||
-        test_ack_repeat_after_recover() != 0) {
+        test_ack_repeat_after_recover() != 0 ||
+        test_ack_repair_rounds_and_timeout() != 0 ||
+        test_incremental_tx_batches() != 0) {
         fprintf(stderr, "wirehair segment tests failed\n");
         return 1;
     }

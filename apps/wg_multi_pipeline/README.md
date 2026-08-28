@@ -132,10 +132,35 @@ Library embedding (no sockets): **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPO
 | Flag | Meaning |
 |------|---------|
 | `--wh-segment-mib=N` | Segment size in MiB (default 10) |
-| `--wh-repair-pct=P` | No ACK: send this much repair. ACK: unused as a target; safety cap is 100% of source |
-| `--wh-window=N` | Receiver in-flight segment window (default 8, max 16) |
+| `--wh-repair-pct=P` | No ACK: send this much repair once. ACK: cap only (100% source); each micro-round is 5% of source with 50/100 ms waits |
+| `--wh-window=N` | Shared sender/receiver in-flight segment window (default 8, max 16) |
 | `--wh-ack` / `--no-wh-ack` | Request ACK to stop leftover repair (default off) |
 | `--ack-port=N` | Sender bind port for incoming ACK datagrams |
+
+In ACK mode, the sender keeps at most `--wh-window` segments in flight and
+records ACKs by segment id, including out-of-order ACKs.  It never admits a
+segment beyond `[oldest_unacked, oldest_unacked + window)`.  Exhausting the
+100%-of-source repair cap without ACK fails the send rather than allowing a
+missing segment to stall the receiver's rolling window.  Small timed repair
+rounds run only for unacknowledged segments while other window slots continue
+to make progress.
+
+The UDP receiver requests a 64 MiB receive buffer and logs both the requested
+and kernel-granted `SO_RCVBUF` values. Linux caps the request at
+`net.core.rmem_max`; raise that host setting when the logged value is much
+smaller than requested. Wirehair receive uses `recvmmsg()` batches to drain
+microbursts, validates and demultiplexes packets in the receive thread, then
+feeds each flow through its own bounded queue and decode worker. The per-flow
+worker owns Wirehair decode, output writes, and ACK emission; each queued
+packet retains its source address so ACKs return to the correct previous hop.
+
+For a 64 MiB request on Linux, raise the host limits before benchmarking:
+
+```bash
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.wmem_max=67108864
+sudo sysctl -w net.core.netdev_max_backlog=5000
+```
 
 ## Per-block latency and jitter
 
@@ -212,6 +237,11 @@ process per VM.
 
 Sender uses `--udp-send-multi` + repeated `--flow` specs, receiver uses
 `--udp-recv <port> <out_prefix> --max-flows N`.
+
+For Wirehair, rate-limited multi-flow sends share one aggregate wire-byte
+pacer. This spaces packets across flows instead of allowing independent flow
+timers to emit synchronized UDP bursts. The aggregate limit is the sum of the
+per-flow `rate_mbps` values.
 
 **Demux rules (do not confuse):**
 

@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <stdint.h>
 
+typedef struct WireUdpSharedPacer WireUdpSharedPacer;
+
 typedef struct WireUdpSendConfig {
     const char *host;
     uint16_t    port;
@@ -20,6 +22,7 @@ typedef struct WireUdpSendConfig {
     uint8_t     ttl;
     uint16_t    ack_port;
     WirehairSegmentConfig wirehair;
+    WireUdpSharedPacer *shared_pacer;
 } WireUdpSendConfig;
 
 typedef struct WireUdpRecvConfig {
@@ -60,6 +63,9 @@ typedef struct WireUdpTx {
 
 int wire_udp_send(const WireUdpSendConfig *config);
 int wire_udp_recv(const WireUdpRecvConfig *config);
+WireUdpSharedPacer *wire_udp_shared_pacer_create(double aggregate_rate_mbps,
+                                                  uint8_t max_inflight);
+void wire_udp_shared_pacer_destroy(WireUdpSharedPacer *pacer);
 int wire_udp_tx_init(WireUdpTx *tx, const char *host, uint16_t port,
                      uint32_t flow_id, double source_rate_mbps,
                      uint8_t final_dst, uint8_t ttl);

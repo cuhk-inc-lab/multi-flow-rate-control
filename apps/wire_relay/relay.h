@@ -22,7 +22,8 @@
  *           no  → TTL--
  *               → [optional] recode_fn (per-datagram; NULL = opaque)
  *               → [optional] decode_reencode_fn (Phase 3A reserved; stub OPAQUE)
- *               → EgressQueue → [optional] egress_fn → sendto(next-hop)
+ *               → ACK/Data EgressQueues → fair TX
+ *                 → [optional] egress_fn → sendto(next-hop/return route)
  *
  *   Local file/FIFO (optional LocalSourceConfig)
  *     → encode → fill final_dst/ttl → relay_inject_wire_datagram
@@ -35,6 +36,14 @@
 
 #ifndef RELAY_DEFAULT_EGRESS_CAPACITY
 #define RELAY_DEFAULT_EGRESS_CAPACITY 16384u
+#endif
+
+#ifndef RELAY_ACK_EGRESS_CAPACITY
+#define RELAY_ACK_EGRESS_CAPACITY 1024u
+#endif
+
+#ifndef RELAY_ACK_EGRESS_QUOTA
+#define RELAY_ACK_EGRESS_QUOTA 8u
 #endif
 
 #ifndef RELAY_MAX_DATAGRAM
@@ -131,7 +140,7 @@ typedef struct RelayConfig {
     void               *process_ctx;
     /* 0 => run until SIGINT/SIGTERM; otherwise exit after idle seconds. */
     unsigned            idle_exit_sec;
-    /* Packet slots in the global EgressQueue (default 16384). */
+    /* Packet slots in the DATA/other EgressQueue (default 16384). */
     size_t              egress_capacity;
     /*
      * Max wait when EgressQueue is full (milliseconds). 0 = try-drop only
@@ -221,6 +230,10 @@ const RelayFlowStats *relay_total_stats(const RelayCtx *ctx);
 const GenerationCacheStats *relay_cache_stats(const RelayCtx *ctx);
 GenerationCache *relay_generation_cache(RelayCtx *ctx);
 void relay_egress_stats_snapshot(const RelayCtx *ctx, EgressQueueStats *out);
+void relay_ack_egress_stats_snapshot(const RelayCtx *ctx,
+                                     EgressQueueStats *out);
+void relay_data_egress_stats_snapshot(const RelayCtx *ctx,
+                                      EgressQueueStats *out);
 void relay_deferred_stats_snapshot(const RelayCtx *ctx,
                                    RelayDeferredHubStats *out);
 

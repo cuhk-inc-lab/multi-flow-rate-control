@@ -23,7 +23,8 @@ UDP in
             → [--transit-hook identity|plus-minus] ingress transform
             → [--decode-reencode-stub] Phase 3A reserved (OPAQUE)
             → [--process cache] GenerationCache observe
-            → EgressQueue → [plus-minus: payload -1] → sendto(next-hop)
+            → ACK/Data EgressQueues → fair TX
+              → [plus-minus: payload -1] → sendto(next-hop/return route)
 
 Local file/FIFO
   → [--source] encode → inject → same Destination Check / transit / egress
@@ -95,8 +96,8 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--listen` | UDP bind port |
 | `--next-hop` | `HOST:PORT` for non-local forward |
 | `--idle-exit-sec` | Optional; exit after N seconds with no UDP/source activity (tests) |
-| `--egress-capacity` | Global EgressQueue slots (default 16384) |
-| `--egress-wait-ms` | Max wait when egress full (default **0** = try-drop); `>0` blocks processing worker only, never UDP RX |
+| `--egress-capacity` | DATA/other egress lane slots (default 16384); the ACK lane is fixed at 1024 |
+| `--egress-wait-ms` | Max wait when the selected egress lane is full (default **0** = try-drop); `>0` blocks processing worker only, never UDP RX |
 | `--deferred-per-flow` | Per-flow RX deferred datagram cap (default 4096) |
 | `--deferred-total` | Global RX deferred datagram cap (default 32768) |
 | `--max-active-flows` | Max concurrent wire flow_id slots in deferred hub (1..64, default 64) |
@@ -115,13 +116,27 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--flow-id` / `--rate-mbps` | Optional source pacing |
 | `--output` | L1 single-flow output file |
 | `--output-dir` | L2 multi-flow output directory |
-| `--return-hop` | Where to send Wirehair ACK (`WIRE_FLAG_RETURN_PATH`) |
-| `--wh-segment-mib` / `--wh-repair-pct` | Segment size; no-ACK repair budget (ACK sprays until ACK, cap 100% source) |
-| `--wh-window` | Receiver segment window (default 8, max 16) |
+| `--return-hop` | Fallback Wirehair ACK target when no per-flow learned previous hop exists |
+| `--wh-segment-mib` / `--wh-repair-pct` | Segment size; no-ACK repair budget or ACK repair-round size (cap 100% source) |
+| `--wh-window` | Shared sender/receiver in-flight segment window (default 8, max 16) |
 | `--wh-ack` / `--no-wh-ack` | Destination emits ACK; source stops leftover repair |
 
-Wirehair (`--codec wirehair`) uses wire **v4**. ACK is optional (`--wh-ack`)
-and must be routed back with `--return-hop` on each hop toward the source.
+Wirehair (`--codec wirehair`) uses wire **v4**. ACK is optional (`--wh-ack`).
+Relays learn the previous-hop UDP endpoint independently for each forward
+`flow_id` and return ACK there; this preserves the sender's per-flow ACK ports.
+`--return-hop` is retained as a fallback for ACKs that arrive before a route
+has been learned.
+
+Forwarded v4 ACK packets carrying `WIRE_FLAG_RETURN_PATH` use a dedicated
+1024-slot ACK egress lane. All DATA and other packets retain the
+`--egress-capacity` lane. TX prefers ACK but sends one waiting DATA packet
+after at most eight consecutive ACK packets; if only one lane has packets it
+drains that lane without waiting for the other. Shutdown and empty-lane waits
+use a shared condition notification, not polling. Summary output reports
+`ack_egress_*` and `data_egress_*` queue metrics separately. The legacy
+`relay_egress_stats_snapshot()` API remains a DATA-lane snapshot; explicit
+ACK/DATA snapshot APIs are also available.
+
 Library API (same v4, no sockets):
 **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md)**.
 Pipeline notes: **[docs/WIRE_RELAY_PIPELINE.md](../../docs/WIRE_RELAY_PIPELINE.md)**.

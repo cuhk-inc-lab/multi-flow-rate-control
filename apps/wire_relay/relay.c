@@ -18,6 +18,16 @@
 #include <unistd.h>
 
 #define RELAY_UDP_SOCKBUF (8 * 1024 * 1024)
+#define RELAY_RETURN_ROUTE_CAPACITY RELAY_MAX_FLOWS
+#define RELAY_SOURCE_ACK_CAPACITY WH_SEGMENT_WINDOW_MAX
+
+typedef struct RelayReturnRoute {
+    uint32_t                flow_id;
+    struct sockaddr_storage peer;
+    socklen_t               peer_len;
+    uint64_t                last_seen_ns;
+    int                     valid;
+} RelayReturnRoute;
 
 /*
  * TEST ONLY build switch for HOL baseline (Phase 0 single-RX behavior):
@@ -30,7 +40,9 @@
 
 struct RelayCtx {
     RelayConfig                 config;
-    EgressQueue                 egress;
+    EgressQueue                 ack_egress;
+    EgressQueue                 data_egress;
+    EgressFairDequeuer          egress_dequeuer;
     RelayDeferredHub            deferred;
     int                         deferred_inited;
     GenerationCache             gen_cache;
@@ -60,9 +72,16 @@ struct RelayCtx {
     void                       *tx_capture_ctx;
     RelayFlowStats              per_flow[RELAY_MAX_FLOWS];
     RelayFlowStats              total;
-    uint32_t                    source_ack_flow;
-    uint64_t                    source_ack_segment;
-    int                         source_ack_valid;
+    /*
+     * Learned previous-hop endpoint per forward flow.  DATA is sent from the
+     * same UDP socket on which its ACK must arrive, so this also preserves
+     * per-flow ACK ports and works hop-by-hop through multiple relays.
+     * Protected by ingress_mu.
+     */
+    RelayReturnRoute            return_routes[RELAY_RETURN_ROUTE_CAPACITY];
+    uint32_t                    source_ack_flow[RELAY_SOURCE_ACK_CAPACITY];
+    uint64_t                    source_ack_segment[RELAY_SOURCE_ACK_CAPACITY];
+    uint8_t                     source_ack_valid[RELAY_SOURCE_ACK_CAPACITY];
     volatile sig_atomic_t       stop;
 };
 
@@ -164,6 +183,80 @@ static RelayFlowStats *flow_stats_slot(RelayCtx *ctx, uint32_t flow_id)
     return &ctx->per_flow[flow_id];
 }
 
+static void learn_return_route(RelayCtx *ctx, const uint8_t *datagram,
+                               size_t len, const struct sockaddr *peer,
+                               socklen_t peer_len)
+{
+    WireHeader header;
+    RelayReturnRoute *chosen = NULL;
+    RelayReturnRoute *oldest = NULL;
+    uint64_t now;
+    size_t i;
+
+    if (ctx == NULL || datagram == NULL || peer == NULL ||
+        peer_len == 0 || peer_len > sizeof(struct sockaddr_storage) ||
+        wire_header_decode(&header, datagram, len) != 0 ||
+        header.version != WIRE_VERSION_V4 ||
+        (header.flags & WIRE_FLAG_RETURN_PATH) != 0 ||
+        (header.flags & WIRE_FLAG_ACK_REQUEST) == 0) {
+        return;
+    }
+    now = relay_mono_ns();
+    pthread_mutex_lock(&ctx->ingress_mu);
+    for (i = 0; i < RELAY_RETURN_ROUTE_CAPACITY; i++) {
+        RelayReturnRoute *route = &ctx->return_routes[i];
+
+        if (route->valid && route->flow_id == header.flow_id) {
+            chosen = route;
+            break;
+        }
+        if (!route->valid && chosen == NULL) {
+            chosen = route;
+        }
+        if (route->valid &&
+            (oldest == NULL || route->last_seen_ns < oldest->last_seen_ns)) {
+            oldest = route;
+        }
+    }
+    if (chosen == NULL) {
+        chosen = oldest;
+    }
+    if (chosen != NULL) {
+        memset(&chosen->peer, 0, sizeof(chosen->peer));
+        memcpy(&chosen->peer, peer, peer_len);
+        chosen->peer_len = peer_len;
+        chosen->flow_id = header.flow_id;
+        chosen->last_seen_ns = now;
+        chosen->valid = 1;
+    }
+    pthread_mutex_unlock(&ctx->ingress_mu);
+}
+
+static int lookup_return_route(RelayCtx *ctx, uint32_t flow_id,
+                               struct sockaddr_storage *peer,
+                               socklen_t *peer_len)
+{
+    size_t i;
+    int found = 0;
+
+    if (ctx == NULL || peer == NULL || peer_len == NULL) {
+        return 0;
+    }
+    pthread_mutex_lock(&ctx->ingress_mu);
+    for (i = 0; i < RELAY_RETURN_ROUTE_CAPACITY; i++) {
+        const RelayReturnRoute *route = &ctx->return_routes[i];
+
+        if (route->valid && route->flow_id == flow_id) {
+            *peer = route->peer;
+            *peer_len = route->peer_len;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->ingress_mu);
+    return found;
+}
+
 static void sync_cache_stats_to_total(RelayCtx *ctx)
 {
     const GenerationCacheStats *gs;
@@ -188,13 +281,15 @@ static void print_stats(const RelayCtx *ctx)
 {
     uint32_t i;
     const GenerationCacheStats *gs = NULL;
-    EgressQueueStats eq;
+    EgressQueueStats ack_eq;
+    EgressQueueStats data_eq;
     RelayDeferredHubStats ds;
 
     if (ctx->cache_enabled) {
         gs = generation_cache_stats(&ctx->gen_cache);
     }
-    egress_queue_stats_snapshot(&ctx->egress, &eq);
+    egress_queue_stats_snapshot(&ctx->ack_egress, &ack_eq);
+    egress_queue_stats_snapshot(&ctx->data_egress, &data_eq);
     memset(&ds, 0, sizeof(ds));
     if (ctx->deferred_inited) {
         relay_deferred_hub_stats_snapshot(&ctx->deferred, &ds);
@@ -202,6 +297,7 @@ static void print_stats(const RelayCtx *ctx)
 
     fprintf(stderr,
             "wire-relay: local_node_id=%u summary egress_capacity=%zu "
+            "ack_egress_capacity=%u "
             "egress_wait_ms=%u deferred_per_flow=%zu deferred_total=%zu "
             "max_active_flows=%u rx=%llu forward=%llu "
             "local=%llu drop_ttl=%llu drop_malformed=%llu drop_send=%llu "
@@ -209,11 +305,16 @@ static void print_stats(const RelayCtx *ctx)
             "drop_deferred_flow=%llu drop_deferred_total=%llu "
             "drop_deferred_table=%llu "
             "inject_ok=%llu inject_reject_loopback=%llu "
-            "egress_immediate=%llu egress_waited=%llu egress_wait_ns_total=%llu "
-            "egress_wait_ns_max=%llu egress_high_watermark=%llu "
+            "data_egress_immediate=%llu data_egress_waited=%llu "
+            "data_egress_wait_ns_total=%llu data_egress_wait_ns_max=%llu "
+            "data_egress_high_watermark=%llu "
+            "ack_egress_immediate=%llu ack_egress_waited=%llu "
+            "ack_egress_wait_ns_total=%llu ack_egress_wait_ns_max=%llu "
+            "ack_egress_high_watermark=%llu "
             "deferred_hwm=%llu\n",
             (unsigned)ctx->config.local_node_id,
             ctx->config.egress_capacity,
+            (unsigned)RELAY_ACK_EGRESS_CAPACITY,
             (unsigned)ctx->config.egress_wait_ms,
             ctx->config.deferred_per_flow,
             ctx->config.deferred_total,
@@ -231,11 +332,16 @@ static void print_stats(const RelayCtx *ctx)
             (unsigned long long)ds.drop_table_full,
             (unsigned long long)ctx->total.inject_ok,
             (unsigned long long)ctx->total.inject_reject_loopback,
-            (unsigned long long)eq.enqueue_immediate,
-            (unsigned long long)eq.enqueue_waited,
-            (unsigned long long)eq.wait_ns_total,
-            (unsigned long long)eq.wait_ns_max,
-            (unsigned long long)eq.high_watermark,
+            (unsigned long long)data_eq.enqueue_immediate,
+            (unsigned long long)data_eq.enqueue_waited,
+            (unsigned long long)data_eq.wait_ns_total,
+            (unsigned long long)data_eq.wait_ns_max,
+            (unsigned long long)data_eq.high_watermark,
+            (unsigned long long)ack_eq.enqueue_immediate,
+            (unsigned long long)ack_eq.enqueue_waited,
+            (unsigned long long)ack_eq.wait_ns_total,
+            (unsigned long long)ack_eq.wait_ns_max,
+            (unsigned long long)ack_eq.high_watermark,
             (unsigned long long)ds.high_watermark);
     if (gs != NULL) {
         fprintf(stderr,
@@ -310,6 +416,7 @@ typedef struct ForwardPending {
     EgressPacket      pkt;
     RelayFlowStats   *slot;
     RelayPacketSource source;
+    int               ack_lane;
 } ForwardPending;
 
 static void prepare_forward_pending(ForwardPending *pending,
@@ -322,6 +429,10 @@ static void prepare_forward_pending(ForwardPending *pending,
     pending->active = 1;
     pending->slot = slot;
     pending->source = source;
+    pending->ack_lane =
+        header->version == WIRE_VERSION_V4 &&
+        header->type == WIRE_TYPE_ACK &&
+        (header->flags & WIRE_FLAG_RETURN_PATH) != 0;
     pending->pkt.datagram = *datagram_owned;
     pending->pkt.len = len;
     pending->pkt.flow_id = header->flow_id;
@@ -340,26 +451,32 @@ static void prepare_forward_pending(ForwardPending *pending,
 static void relay_apply_forward_pending(RelayCtx *ctx, ForwardPending *pending)
 {
     EgressStatus est;
+    EgressQueue *queue;
 
     if (ctx == NULL || pending == NULL || !pending->active) {
         return;
     }
 
+    queue = pending->ack_lane ? &ctx->ack_egress : &ctx->data_egress;
     if (ctx->config.egress_wait_ms == 0) {
-        est = egress_queue_try_enqueue(&ctx->egress, &pending->pkt);
+        est = egress_queue_try_enqueue(queue, &pending->pkt);
         if (est == EGRESS_OK) {
             if (pending->source == RELAY_SRC_LOCAL_ENCODER) {
                 pending->slot->inject_ok++;
                 ctx->total.inject_ok++;
             }
-        } else {
+        } else if (est == EGRESS_ERR_FULL) {
             pending->slot->drop_egress_full++;
             ctx->total.drop_egress_full++;
             free(pending->pkt.datagram);
             pending->pkt.datagram = NULL;
+        } else {
+            /* Shutdown/invalid enqueue is not a queue-capacity drop. */
+            free(pending->pkt.datagram);
+            pending->pkt.datagram = NULL;
         }
     } else {
-        est = egress_queue_timed_enqueue(&ctx->egress, &pending->pkt,
+        est = egress_queue_timed_enqueue(queue, &pending->pkt,
                                          ctx->config.egress_wait_ms);
         if (est == EGRESS_OK) {
             if (pending->source == RELAY_SRC_LOCAL_ENCODER) {
@@ -498,9 +615,12 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
         ctx->config.local_source->codec_kind == CODEC_KIND_WIREHAIR &&
         ctx->config.local_source->wirehair.ack_enabled &&
         header.flow_id == ctx->config.local_source->flow_id) {
-        ctx->source_ack_flow = header.flow_id;
-        ctx->source_ack_segment = header.block_id;
-        ctx->source_ack_valid = 1;
+        size_t ack_index =
+            (size_t)(header.block_id % RELAY_SOURCE_ACK_CAPACITY);
+
+        ctx->source_ack_flow[ack_index] = header.flow_id;
+        ctx->source_ack_segment[ack_index] = header.block_id;
+        ctx->source_ack_valid[ack_index] = 1;
         slot->local_deliver++;
         ctx->total.local_deliver++;
         free(datagram);
@@ -892,9 +1012,11 @@ static void *tx_worker_main(void *arg)
         WireHeader header;
         const struct sockaddr *target;
         socklen_t target_len;
+        struct sockaddr_storage learned_return;
+        socklen_t learned_return_len = 0;
         int return_path;
 
-        st = egress_queue_dequeue(&ctx->egress, &pkt);
+        st = egress_fair_dequeue(&ctx->egress_dequeuer, &pkt);
         if (st == EGRESS_ERR_SHUTDOWN) {
             break;
         }
@@ -914,16 +1036,24 @@ static void *tx_worker_main(void *arg)
         }
         return_path = header.version == WIRE_VERSION_V4 &&
                       (header.flags & WIRE_FLAG_RETURN_PATH) != 0;
-        if (return_path && !ctx->have_return_hop) {
-            slot->drop_no_return_hop++;
-            ctx->total.drop_no_return_hop++;
-            free(pkt.datagram);
-            continue;
+        if (return_path) {
+            if (lookup_return_route(ctx, header.flow_id, &learned_return,
+                                    &learned_return_len)) {
+                target = (const struct sockaddr *)&learned_return;
+                target_len = learned_return_len;
+            } else if (ctx->have_return_hop) {
+                target = (const struct sockaddr *)&ctx->return_hop;
+                target_len = ctx->return_hop_len;
+            } else {
+                slot->drop_no_return_hop++;
+                ctx->total.drop_no_return_hop++;
+                free(pkt.datagram);
+                continue;
+            }
+        } else {
+            target = (const struct sockaddr *)&ctx->next_hop;
+            target_len = ctx->next_hop_len;
         }
-        target = return_path
-                     ? (const struct sockaddr *)&ctx->return_hop
-                     : (const struct sockaddr *)&ctx->next_hop;
-        target_len = return_path ? ctx->return_hop_len : ctx->next_hop_len;
         if (ctx->config.egress_fn != NULL) {
             if (ctx->config.egress_fn(pkt.datagram, pkt.len, &header,
                                       ctx->config.egress_ctx) != 0) {
@@ -989,8 +1119,8 @@ static void relay_ctx_cleanup(RelayCtx *ctx)
      *  2) join local source (injects fail with SHUTDOWN once stop set)
      *  3) deferred hub shutdown + join processing
      *  4) wait inject_in_flight; destroy generation cache
-     *  5) egress shutdown + join TX
-     *  6) destroy egress
+     *  5) both egress lanes shutdown + join TX
+     *  6) destroy fair dequeuer and both egress lanes
      *  7) destroy deferred (free residual datagrams once)
      *  8) destroy mutexes / sockets
      */
@@ -1021,12 +1151,15 @@ static void relay_ctx_cleanup(RelayCtx *ctx)
     }
     pthread_mutex_unlock(&ctx->ingress_mu);
 
-    egress_queue_shutdown(&ctx->egress);
+    egress_queue_shutdown(&ctx->ack_egress);
+    egress_queue_shutdown(&ctx->data_egress);
     if (ctx->tx_started) {
         (void)pthread_join(ctx->tx_thread, NULL);
         ctx->tx_started = 0;
     }
-    egress_queue_destroy(&ctx->egress);
+    egress_fair_dequeuer_destroy(&ctx->egress_dequeuer);
+    egress_queue_destroy(&ctx->ack_egress);
+    egress_queue_destroy(&ctx->data_egress);
 
     if (ctx->deferred_inited) {
         relay_deferred_hub_destroy(&ctx->deferred);
@@ -1100,7 +1233,25 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         return -1;
     }
     ctx->ingress_idle_inited = 1;
-    if (egress_queue_init(&ctx->egress, egress_cap) != EGRESS_OK) {
+    if (egress_queue_init(&ctx->data_egress, egress_cap) != EGRESS_OK) {
+        pthread_cond_destroy(&ctx->ingress_idle);
+        ctx->ingress_idle_inited = 0;
+        pthread_mutex_destroy(&ctx->ingress_mu);
+        return -1;
+    }
+    if (egress_queue_init(&ctx->ack_egress,
+                          RELAY_ACK_EGRESS_CAPACITY) != EGRESS_OK) {
+        egress_queue_destroy(&ctx->data_egress);
+        pthread_cond_destroy(&ctx->ingress_idle);
+        ctx->ingress_idle_inited = 0;
+        pthread_mutex_destroy(&ctx->ingress_mu);
+        return -1;
+    }
+    if (egress_fair_dequeuer_init(&ctx->egress_dequeuer,
+                                  &ctx->ack_egress, &ctx->data_egress,
+                                  RELAY_ACK_EGRESS_QUOTA) != EGRESS_OK) {
+        egress_queue_destroy(&ctx->ack_egress);
+        egress_queue_destroy(&ctx->data_egress);
         pthread_cond_destroy(&ctx->ingress_idle);
         ctx->ingress_idle_inited = 0;
         pthread_mutex_destroy(&ctx->ingress_mu);
@@ -1112,7 +1263,9 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
     dcfg.per_flow_capacity = ctx->config.deferred_per_flow;
     dcfg.total_capacity = ctx->config.deferred_total;
     if (relay_deferred_hub_init(&ctx->deferred, &dcfg) != RELAY_DEFERRED_OK) {
-        egress_queue_destroy(&ctx->egress);
+        egress_fair_dequeuer_destroy(&ctx->egress_dequeuer);
+        egress_queue_destroy(&ctx->ack_egress);
+        egress_queue_destroy(&ctx->data_egress);
         pthread_cond_destroy(&ctx->ingress_idle);
         ctx->ingress_idle_inited = 0;
         pthread_mutex_destroy(&ctx->ingress_mu);
@@ -1127,7 +1280,9 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         if (generation_cache_init(&ctx->gen_cache, &gcfg) != 0) {
             relay_deferred_hub_destroy(&ctx->deferred);
             ctx->deferred_inited = 0;
-            egress_queue_destroy(&ctx->egress);
+            egress_fair_dequeuer_destroy(&ctx->egress_dequeuer);
+            egress_queue_destroy(&ctx->ack_egress);
+            egress_queue_destroy(&ctx->data_egress);
             pthread_cond_destroy(&ctx->ingress_idle);
             ctx->ingress_idle_inited = 0;
             pthread_mutex_destroy(&ctx->ingress_mu);
@@ -1266,10 +1421,25 @@ GenerationCache *relay_generation_cache(RelayCtx *ctx)
 
 void relay_egress_stats_snapshot(const RelayCtx *ctx, EgressQueueStats *out)
 {
+    relay_data_egress_stats_snapshot(ctx, out);
+}
+
+void relay_ack_egress_stats_snapshot(const RelayCtx *ctx,
+                                     EgressQueueStats *out)
+{
     if (ctx == NULL || out == NULL) {
         return;
     }
-    egress_queue_stats_snapshot(&ctx->egress, out);
+    egress_queue_stats_snapshot(&ctx->ack_egress, out);
+}
+
+void relay_data_egress_stats_snapshot(const RelayCtx *ctx,
+                                      EgressQueueStats *out)
+{
+    if (ctx == NULL || out == NULL) {
+        return;
+    }
+    egress_queue_stats_snapshot(&ctx->data_egress, out);
 }
 
 void relay_deferred_stats_snapshot(const RelayCtx *ctx,
@@ -1306,13 +1476,15 @@ static int relay_local_source_ack_poll(uint32_t flow_id, uint64_t segment_id,
 
     for (;;) {
         int matched;
+        size_t ack_index =
+            (size_t)(segment_id % RELAY_SOURCE_ACK_CAPACITY);
 
         pthread_mutex_lock(&ctx->ingress_mu);
-        matched = ctx->source_ack_valid &&
-                  ctx->source_ack_flow == flow_id &&
-                  ctx->source_ack_segment == segment_id;
+        matched = ctx->source_ack_valid[ack_index] &&
+                  ctx->source_ack_flow[ack_index] == flow_id &&
+                  ctx->source_ack_segment[ack_index] == segment_id;
         if (matched) {
-            ctx->source_ack_valid = 0;
+            ctx->source_ack_valid[ack_index] = 0;
         }
         pthread_mutex_unlock(&ctx->ingress_mu);
         if (matched || waited >= wait_ms) {
@@ -1427,6 +1599,8 @@ RelayStatus relay_run(const RelayConfig *config)
 
     while (!ctx.stop) {
         struct pollfd pfd = {.fd = ctx.listen_sock, .events = POLLIN};
+        struct sockaddr_storage peer;
+        socklen_t peer_len;
         int poll_ms = 1000;
         int polled;
         ssize_t received;
@@ -1476,9 +1650,11 @@ RelayStatus relay_run(const RelayConfig *config)
             continue;
         }
 
+        memset(&peer, 0, sizeof(peer));
+        peer_len = sizeof(peer);
         do {
             received = recvfrom(ctx.listen_sock, rxbuf, sizeof(rxbuf), 0,
-                                NULL, NULL);
+                                (struct sockaddr *)&peer, &peer_len);
         } while (received < 0 && errno == EINTR);
         if (received < 0) {
             perror("wire-relay: recvfrom");
@@ -1486,6 +1662,8 @@ RelayStatus relay_run(const RelayConfig *config)
             break;
         }
         ctx.last_activity_ns = relay_mono_ns();
+        learn_return_route(&ctx, rxbuf, (size_t)received,
+                           (const struct sockaddr *)&peer, peer_len);
 
         owned = malloc((size_t)received);
         if (owned == NULL) {

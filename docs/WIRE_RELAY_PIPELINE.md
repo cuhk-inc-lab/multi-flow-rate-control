@@ -16,20 +16,29 @@ Wirehair alone uses wire v4. It treats `block_id` as a segment id,
 (or 10% of source, whichever is larger), an 8-segment receive window, and a
 1370-byte packet payload chosen to stay under a 1450-byte path MTU without IP
 fragmentation. `--wh-ack` requests an ACK as soon as recovery completes; the
-sender polls ACK while sending (including source packets) and stops leftover
-repair immediately. Repair is not a fixed percent: the sender sprays at line
-rate until ACK, with a safety cap of 100% of source packets so a lost ACK
-cannot run forever. Without ACK the sender transmits the configured
-`--wh-repair-pct` budget. After a segment is recovered, extra packets
-re-send ACK so a dropped ACK can still halt the sender.
+sender keeps at most `--wh-window` segments in flight and records ACKs by
+segment id, including out-of-order ACKs. It never admits a segment beyond
+`[oldest_unacked, oldest_unacked + window)`. While waiting for ACK, the sender
+stops leftover repair immediately for acknowledged segments. Repair is not a
+fixed percent in ACK mode: the sender emits fresh packet ids in 5% micro-rounds
+(`WH_ACK_REPAIR_ROUND_PCT`), waits briefly (50 ms after source, 100 ms between
+repair rounds), and uses a safety cap of 100% of source packets. Exhausting
+that cap without ACK hard-fails the segment instead of advancing and stranding
+the receiver window. Without ACK the sender transmits the configured repair
+budget once. After recovery, extra packets re-send ACK so a dropped ACK can
+still halt the sender.
 
 ACK datagrams carry `(flow_id, segment_id)`, set `WIRE_FLAG_RETURN_PATH`, and
-are forwarded through each relay's `--return-hop HOST:PORT`. A linear path
-must configure each return hop toward the previous relay; the relay nearest
-the sender points to the sender's `--ack-port`. Wirehair v4 bypasses the
-v3-only `GenerationCache`. A receiver keeps at most `window` active segment decoders (default 8, max 16),
-so the default peak decode payload storage is about 80 MiB per flow at 10 MiB
-segments. Packets ahead of the window are dropped without failing the flow.
+are forwarded to the previous-hop UDP endpoint learned from forward DATA for
+that flow. This preserves distinct sender ACK ports for multi-flow and works
+hop-by-hop through multiple relays. `--return-hop HOST:PORT` remains the
+fallback when no learned route exists. Wirehair v4 bypasses the
+v3-only `GenerationCache`. Sender and receiver share the same `window`
+(default 8, max 16). The sender logs `send_window_hwm`; the receiver logs
+`ahead_window_drops` when packets arrive beyond its rolling window. A receiver
+keeps at most `window` active segment decoders, so the default peak decode
+payload storage is about 80 MiB per flow at 10 MiB segments. Packets ahead of
+the window are dropped without failing the flow.
 
 Embedding the same Wirehair+ACK path without sockets:
 [`docs/FEC_TRANSPORT.md`](FEC_TRANSPORT.md).
@@ -49,7 +58,8 @@ UDP in
             → [optional] recode_fn            # ingress; NULL = opaque
             → [optional] decode_reencode_fn   # Phase 3A reserved; stub=OPAQUE
             → [--process cache] observe
-            → EgressQueue → [optional] egress_fn → sendto(next-hop)
+            → ACK/Data EgressQueues → fair TX → [optional] egress_fn
+              → sendto(next-hop or learned return route)
 
 Local file / FIFO (--source)
   → encode → fill final_dst/ttl → relay_inject_wire_datagram
@@ -64,7 +74,7 @@ Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
 
 | Phase | Scope | Status |
 |-------|--------|--------|
-| **1** | Opaque multi-flow forward + global EgressQueue + wire-level inject | **Implemented** |
+| **1** | Opaque multi-flow forward + ACK/Data egress lanes + wire-level inject | **Implemented** |
 | **2** | Copy-based GenerationCache + process hook; still opaque forward | **Implemented** |
 | **L0** | Extract reusable `WireFlowDecoder` from udp-recv | **Implemented** |
 | **L1** | Explicit-hop relay local-destination decode (`--output FILE`) | **Implemented** |
@@ -139,7 +149,7 @@ UDP RX → deferred → processing worker
   → DATA + --process cache: copy into GenerationCache; process hook
   → END/control: expire stale gens for flow; never cache; enqueue
   → build ForwardPending under ingress_mu; enqueue outside ingress_mu
-  → global FIFO EgressQueue → TX
+  → classify v4 RETURN_PATH ACK vs DATA/other egress lane → fair TX
 ```
 
 Defaults:
@@ -149,25 +159,42 @@ Defaults:
 - `--egress-wait-ms 0` — try-drop baseline; `>0` timed wait on **processing worker only**.
 - `--deferred-per-flow 4096`, `--deferred-total 32768`, `--max-active-flows 64`
   (sized for ~1 Gbps opaque-forward bursts; override downward to save memory).
-- `--egress-capacity 16384`.
+- `--egress-capacity 16384` for DATA/other; ACK capacity is fixed at 1024.
 - Limits: `gen_timeout_ms=500`, `max_gens=256`, `max_gens_per_flow=32`,
   `max_cache_bytes=32MiB`.
 
-### Egress backpressure (timed wait)
+### Dual-lane egress, fairness, and backpressure
 
-Global **FIFO** EgressQueue between **processing worker** and TX worker.
-UDP RX never waits on this queue.
+Two independent FIFO queues sit between the **processing worker** and TX:
+
+- ACK lane: only wire v4 packets with type `ACK` and
+  `WIRE_FLAG_RETURN_PATH`; fixed capacity 1024.
+- DATA lane: DATA and every other packet; `--egress-capacity` retains its
+  existing default and CLI meaning.
+
+TX checks ACK first, but after eight consecutive ACK dequeues it must select
+one DATA packet if DATA is waiting. If DATA is empty, ACK continues
+immediately; if ACK is empty, DATA continues immediately. Both queues notify
+one shared condition-generation waiter, so an empty TX blocks without
+busy-spin and cannot miss an enqueue or either-lane shutdown transition. TX
+exits only after both lanes are shutdown and drained. Learned per-flow return
+route selection remains after dequeue and is unchanged.
+
+UDP RX never waits on either egress queue.
 | `--egress-wait-ms` | Behavior on full queue |
 |--------------------|-------------------------|
-| `0` | Non-blocking `try_enqueue`; drop new packet → `drop_egress_full` |
-| `>0` | Wait up to N ms for space via `pthread_cond_timedwait`; timeout drops new packet → `drop_egress_timeout` |
+| `0` | Non-blocking `try_enqueue` on the selected lane; drop new packet → `drop_egress_full` |
+| `>0` | Wait up to N ms for selected-lane space via `pthread_cond_timedwait`; timeout drops new packet → `drop_egress_timeout` |
 
 - Never drop-oldest; never overwrite queued packets.
 - Processing builds `ForwardPending` under `ingress_mu`, then enqueues **outside**
   `ingress_mu` so timed wait does not block cache work on the mutex.
   UDP RX only enqueues into `RelayDeferredHub` and never waits on egress.
-- Queue-global metrics: `egress_enqueue_immediate`, `egress_enqueue_waited`,
-  `egress_wait_ns_total/max`, `egress_high_watermark`.
+- Per-lane summary metrics: `ack_egress_*` and `data_egress_*`, each reporting
+  enqueue-immediate, enqueue-waited, wait-ns total/max, and high watermark.
+  `relay_egress_stats_snapshot()` remains compatible as a DATA-lane snapshot;
+  `relay_ack_egress_stats_snapshot()` and
+  `relay_data_egress_stats_snapshot()` are explicit.
 - Per-flow drop counters: `drop_egress_full` (try path), `drop_egress_timeout` (timed path).
 - Deferred hub drops (new packet only): `drop_deferred_overflow_flow`,
   `drop_deferred_overflow_total`, `drop_deferred_table_full`.

@@ -36,11 +36,26 @@ struct WirehairSegmentReceiver {
     uint64_t end_segment_count;
     bool end_seen;
     bool complete;
+    uint64_t ahead_window_drops;
     WirehairSegmentOutputFn output_fn;
     void *output_ctx;
     WirehairSegmentAckEmitFn ack_fn;
     void *ack_ctx;
     WirehairSegmentSlot slots[WH_SEGMENT_WINDOW_MAX];
+};
+
+struct WirehairSegmentTx {
+    WirehairSegmentConfig config;
+    WirehairCodec encoder;
+    uint8_t *padded;
+    uint32_t flow_id;
+    uint64_t segment_id;
+    uint8_t final_dst;
+    uint8_t ttl;
+    uint32_t data_len;
+    uint32_t packet_limit;
+    uint32_t next_packet_id;
+    WirehairSegmentSendStats stats;
 };
 
 static pthread_once_t wh_segment_once = PTHREAD_ONCE_INIT;
@@ -109,6 +124,12 @@ uint32_t wirehair_segment_repair_packets(uint32_t source_packets,
         repair = WH_REPAIR_MIN_PACKETS;
     }
     return repair;
+}
+
+uint32_t wirehair_segment_ack_repair_round_packets(uint32_t source_packets)
+{
+    return wirehair_segment_repair_packets(source_packets,
+                                           WH_ACK_REPAIR_ROUND_PCT);
 }
 
 uint32_t wirehair_segment_repair_ceiling(uint32_t source_packets,
@@ -189,6 +210,181 @@ static int emit_one_packet(WirehairCodec encoder,
     return 0;
 }
 
+WirehairSegmentTx *wirehair_segment_tx_create(
+    const WirehairSegmentConfig *config, uint32_t flow_id,
+    uint64_t segment_id, uint8_t final_dst, uint8_t ttl,
+    const uint8_t *data, size_t data_len)
+{
+    WirehairSegmentTx *tx;
+    const uint8_t *message = data;
+    uint32_t codec_bytes;
+    uint32_t repair_ceiling;
+
+    if (!wirehair_segment_config_valid(config) || data == NULL ||
+        data_len == 0 || data_len > config->segment_bytes ||
+        data_len > UINT32_MAX || final_dst == 0 || ttl == 0 ||
+        !wirehair_ready()) {
+        return NULL;
+    }
+    tx = calloc(1, sizeof(*tx));
+    if (tx == NULL) {
+        return NULL;
+    }
+    tx->config = *config;
+    tx->flow_id = flow_id;
+    tx->segment_id = segment_id;
+    tx->final_dst = final_dst;
+    tx->ttl = ttl;
+    tx->data_len = (uint32_t)data_len;
+    tx->stats.source_packets =
+        wirehair_segment_source_packets((uint32_t)data_len);
+    tx->stats.repair_budget = wirehair_segment_repair_packets(
+        tx->stats.source_packets, config->repair_percent);
+    repair_ceiling = wirehair_segment_repair_ceiling(
+        tx->stats.source_packets, config->repair_percent,
+        config->ack_enabled);
+    tx->packet_limit = tx->stats.source_packets + repair_ceiling;
+
+    codec_bytes = (uint32_t)data_len;
+    if (codec_bytes < 2u * WH_PACKET_SIZE) {
+        codec_bytes = 2u * WH_PACKET_SIZE;
+        tx->padded = calloc(1, codec_bytes);
+        if (tx->padded == NULL) {
+            wirehair_segment_tx_destroy(tx);
+            return NULL;
+        }
+        memcpy(tx->padded, data, data_len);
+        message = tx->padded;
+    }
+    tx->encoder = wirehair_encoder_create(NULL, message, codec_bytes,
+                                           WH_PACKET_SIZE);
+    if (tx->encoder == NULL) {
+        wirehair_segment_tx_destroy(tx);
+        return NULL;
+    }
+    return tx;
+}
+
+void wirehair_segment_tx_destroy(WirehairSegmentTx *tx)
+{
+    if (tx == NULL) {
+        return;
+    }
+    wirehair_free(tx->encoder);
+    free(tx->padded);
+    free(tx);
+}
+
+static int wirehair_segment_tx_emit_range(
+    WirehairSegmentTx *tx, uint32_t end_packet_id,
+    WirehairSegmentEmitFn emit_fn, void *emit_ctx)
+{
+    uint32_t emitted = 0;
+
+    if (tx == NULL || emit_fn == NULL ||
+        end_packet_id < tx->next_packet_id) {
+        return -1;
+    }
+    if (end_packet_id > tx->packet_limit) {
+        end_packet_id = tx->packet_limit;
+    }
+    while (tx->next_packet_id < end_packet_id) {
+        if (emit_one_packet(
+                tx->encoder, &tx->config, tx->flow_id, tx->segment_id,
+                tx->final_dst, tx->ttl, tx->next_packet_id,
+                tx->packet_limit, tx->data_len, tx->stats.source_packets,
+                emit_fn, emit_ctx, &tx->stats) != 0) {
+            return -1;
+        }
+        tx->next_packet_id++;
+        emitted++;
+    }
+    return (int)emitted;
+}
+
+int wirehair_segment_tx_emit_source(WirehairSegmentTx *tx,
+                                    uint32_t max_packets,
+                                    WirehairSegmentEmitFn emit_fn,
+                                    void *emit_ctx)
+{
+    uint32_t end;
+
+    if (tx == NULL || max_packets == 0) {
+        return tx == NULL ? -1 : 0;
+    }
+    end = tx->next_packet_id + max_packets;
+    if (end < tx->next_packet_id ||
+        end > tx->stats.source_packets) {
+        end = tx->stats.source_packets;
+    }
+    return wirehair_segment_tx_emit_range(tx, end, emit_fn, emit_ctx);
+}
+
+int wirehair_segment_tx_emit_repair(WirehairSegmentTx *tx,
+                                    uint32_t max_packets,
+                                    WirehairSegmentEmitFn emit_fn,
+                                    void *emit_ctx)
+{
+    uint32_t end;
+    int emitted;
+
+    if (tx == NULL || tx->next_packet_id < tx->stats.source_packets ||
+        max_packets == 0) {
+        return tx == NULL ? -1 : 0;
+    }
+    end = tx->next_packet_id + max_packets;
+    if (end < tx->next_packet_id || end > tx->packet_limit) {
+        end = tx->packet_limit;
+    }
+    emitted = wirehair_segment_tx_emit_range(tx, end, emit_fn, emit_ctx);
+    if (emitted > 0) {
+        tx->stats.repair_rounds++;
+    }
+    return emitted;
+}
+
+bool wirehair_segment_tx_source_complete(const WirehairSegmentTx *tx)
+{
+    return tx != NULL &&
+           tx->next_packet_id >= tx->stats.source_packets;
+}
+
+bool wirehair_segment_tx_repair_exhausted(const WirehairSegmentTx *tx)
+{
+    return tx != NULL && tx->next_packet_id >= tx->packet_limit;
+}
+
+const WirehairSegmentSendStats *wirehair_segment_tx_stats(
+    const WirehairSegmentTx *tx)
+{
+    return tx != NULL ? &tx->stats : NULL;
+}
+
+static int wait_for_segment_ack(WirehairSegmentAckPollFn ack_poll,
+                                void *ack_ctx, uint32_t flow_id,
+                                uint64_t segment_id, unsigned wait_ms)
+{
+    unsigned waited = 0;
+
+    if (ack_poll == NULL) {
+        return 0;
+    }
+    while (waited < wait_ms) {
+        unsigned slice = WH_ACK_POLL_SLICE_MS;
+        int acked;
+
+        if (slice > wait_ms - waited) {
+            slice = wait_ms - waited;
+        }
+        acked = ack_poll(flow_id, segment_id, slice, ack_ctx);
+        if (acked != 0) {
+            return acked;
+        }
+        waited += slice;
+    }
+    return 0;
+}
+
 int wirehair_segment_send(const WirehairSegmentConfig *config,
                           uint32_t flow_id, uint64_t segment_id,
                           uint8_t final_dst, uint8_t ttl,
@@ -244,17 +440,33 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
     local_stats.repair_budget = repair_budget;
 
     /*
-     * ACK: poll before every packet (including source) with wait_ms=0 so
-     * pacing stays in emit_fn. Stop as soon as ACK arrives — repair count
-     * is however many were in flight, not a fixed percent.
-     * No ACK: send source + repair_budget and stop.
+     * No ACK (or an embedding without an ACK poll callback): retain the
+     * finite send behavior.  With ACK polling, do not advance to the next
+     * segment unless this segment is acknowledged.  Source is sent once,
+     * then fresh repair packet ids are emitted in small ACK micro-rounds
+     * (WH_ACK_REPAIR_ROUND_PCT).  A short wait between rounds gives the
+     * receiver time to decode/write and a late packet makes an already-
+     * recovered receiver re-send a lost ACK.
      */
-    for (packet_id = 0; packet_id < packet_limit; packet_id++) {
-        if (!config->ack_enabled &&
-            packet_id >= source_packets + repair_budget) {
-            break;
+    if (!config->ack_enabled || ack_poll == NULL) {
+        uint32_t send_limit = config->ack_enabled
+                                  ? packet_limit
+                                  : source_packets + repair_budget;
+
+        for (packet_id = 0; packet_id < send_limit; packet_id++) {
+            if (emit_one_packet(encoder, config, flow_id, segment_id,
+                                final_dst, ttl, packet_id, packet_limit,
+                                (uint32_t)data_len, source_packets, emit_fn,
+                                emit_ctx, &local_stats) != 0) {
+                goto out;
+            }
         }
-        if (config->ack_enabled && ack_poll != NULL) {
+        result = 0;
+        goto out;
+    }
+
+    for (packet_id = 0; packet_id < source_packets; packet_id++) {
+        {
             int acked = ack_poll(flow_id, segment_id, 0u, ack_ctx);
 
             if (acked < 0) {
@@ -262,7 +474,8 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
             }
             if (acked > 0) {
                 local_stats.stopped_by_ack = true;
-                break;
+                result = 0;
+                goto out;
             }
         }
         if (emit_one_packet(encoder, config, flow_id, segment_id, final_dst,
@@ -273,24 +486,73 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
         }
     }
 
-    /* Still wait briefly before the next segment if ACK has not arrived. */
-    if (config->ack_enabled && ack_poll != NULL &&
-        !local_stats.stopped_by_ack) {
-        unsigned wait_i;
+    /*
+     * Decoding normally completes on the last few source packets.  Waiting
+     * once here avoids immediately injecting a full repair round while the
+     * receiver is decoding the segment or flushing its output.
+     */
+    {
+        int acked = wait_for_segment_ack(ack_poll, ack_ctx, flow_id, segment_id,
+                                         WH_ACK_INITIAL_WAIT_MS);
 
-        for (wait_i = 0; wait_i < 100u; wait_i++) {
-            int acked = ack_poll(flow_id, segment_id, 10u, ack_ctx);
+        if (acked < 0) {
+            goto out;
+        }
+        if (acked > 0) {
+            local_stats.stopped_by_ack = true;
+            result = 0;
+            goto out;
+        }
+    }
+
+    while (packet_id < packet_limit) {
+        uint32_t round_packets =
+            wirehair_segment_ack_repair_round_packets(source_packets);
+        uint32_t round_end = packet_id + round_packets;
+        int acked;
+
+        if (round_end < packet_id || round_end > packet_limit) {
+            round_end = packet_limit;
+        }
+        local_stats.repair_rounds++;
+        while (packet_id < round_end) {
+            acked = ack_poll(flow_id, segment_id, 0u, ack_ctx);
 
             if (acked < 0) {
                 goto out;
             }
             if (acked > 0) {
                 local_stats.stopped_by_ack = true;
-                break;
+                result = 0;
+                goto out;
             }
+            if (emit_one_packet(encoder, config, flow_id, segment_id,
+                                final_dst, ttl, packet_id, packet_limit,
+                                (uint32_t)data_len, source_packets, emit_fn,
+                                emit_ctx, &local_stats) != 0) {
+                goto out;
+            }
+            packet_id++;
+        }
+        acked = wait_for_segment_ack(ack_poll, ack_ctx, flow_id, segment_id,
+                                     WH_ACK_REPAIR_WAIT_MS);
+        if (acked < 0) {
+            goto out;
+        }
+        if (acked > 0) {
+            local_stats.stopped_by_ack = true;
+            result = 0;
+            goto out;
         }
     }
-    result = 0;
+
+    /*
+     * Exhausting the advertised repair id space without an ACK is a hard
+     * segment failure.  Advancing here would permanently strand the receiver
+     * behind this segment and eventually overflow its decode window.
+     */
+    local_stats.ack_timed_out = true;
+    result = -1;
 out:
     wirehair_free(encoder);
     free(padded);
@@ -523,6 +785,7 @@ int wirehair_segment_receiver_ingest(WirehairSegmentReceiver *receiver,
      * often this happens under loss.
      */
     if (header->block_id - receiver->next_emit_segment >= receiver->window) {
+        receiver->ahead_window_drops++;
         return 0;
     }
 
@@ -567,4 +830,10 @@ bool wirehair_segment_receiver_complete(
     const WirehairSegmentReceiver *receiver)
 {
     return receiver != NULL && receiver->complete;
+}
+
+uint64_t wirehair_segment_receiver_ahead_drops(
+    const WirehairSegmentReceiver *receiver)
+{
+    return receiver != NULL ? receiver->ahead_window_drops : 0u;
 }

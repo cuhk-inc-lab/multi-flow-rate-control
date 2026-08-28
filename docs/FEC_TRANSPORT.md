@@ -81,8 +81,8 @@ Call `fec_transport_config_init()` first, then set:
 | --- | --- | --- |
 | `codec` | Must be `FEC_CODEC_WIREHAIR` | — |
 | `segment_bytes` | Bytes gathered before a fountain session | 10 MiB |
-| `repair_percent` | No ACK: extra packets as % of source (floor 2). ACK: not the target; safety cap is 100% of source | 10 |
-| `window` | Receiver in-flight segment slots | 8 |
+| `repair_percent` | No ACK: extra packets as % of source (floor 2). ACK: cap only (100% source); binaries use 5% micro-rounds with short waits | 10 |
+| `window` | Shared sender/receiver in-flight segment window | 8 |
 | `ack_enabled` | Request ACK; encoder stops leftover repair | **off** (must set `1`) |
 | `origin_node` | v4 `origin_node` | 1 |
 | `final_dst` | Ultimate delivery node | wire default (4) |
@@ -135,6 +135,12 @@ An empty `flush` with nothing buffered still sends a v4 END.
 3. Sender: on ACK RX, `fec_encoder_input_ack(enc, datagram, length)`.
    Remaining queued **parity** for that segment is dropped; no more
    repair is generated.
+
+`wg_multi_pipeline` / `wire_relay` extend this with a bounded sender sliding
+window: at most `window` segments may be in flight, ACKs may arrive
+out-of-order, and unacknowledged segments receive timed 5% repair micro-rounds
+until ACK or the 100%-of-source cap. Multi-flow sends share one aggregate
+wire-byte pacer so flows do not burst in lockstep.
 
 ```c
 cfg.ack_enabled = 1;

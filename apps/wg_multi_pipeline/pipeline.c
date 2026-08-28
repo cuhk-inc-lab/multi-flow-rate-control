@@ -2210,6 +2210,8 @@ static WgPipelineStatus run_wirehair_multi_send(
     const WgWireMultiSendConfig *config)
 {
     WirehairMultiSender *senders;
+    WireUdpSharedPacer *shared_pacer = NULL;
+    double aggregate_rate_mbps = 0.0;
     uint32_t i;
     WgPipelineStatus status = WG_PIPE_OK;
 
@@ -2221,6 +2223,17 @@ static WgPipelineStatus run_wirehair_multi_send(
     }
     senders = calloc(config->flow_count, sizeof(*senders));
     if (senders == NULL) {
+        return WG_PIPE_ERR;
+    }
+    for (i = 0; i < config->flow_count; i++) {
+        if (config->flows[i].source_rate_mbps > 0.0) {
+            aggregate_rate_mbps += config->flows[i].source_rate_mbps;
+        }
+    }
+    shared_pacer = wire_udp_shared_pacer_create(
+        aggregate_rate_mbps, wirehair_segment_window(&config->wirehair));
+    if (shared_pacer == NULL) {
+        free(senders);
         return WG_PIPE_ERR;
     }
     for (i = 0; i < config->flow_count; i++) {
@@ -2240,6 +2253,7 @@ static WgPipelineStatus run_wirehair_multi_send(
                     ? 0
                     : (uint16_t)(config->ack_port_base + i),
             .wirehair = config->wirehair,
+            .shared_pacer = shared_pacer,
         };
         if (pthread_create(&senders[i].thread, NULL,
                            wirehair_multi_sender_thread, &senders[i]) != 0) {
@@ -2256,6 +2270,7 @@ static WgPipelineStatus run_wirehair_multi_send(
             }
         }
     }
+    wire_udp_shared_pacer_destroy(shared_pacer);
     free(senders);
     return status;
 }

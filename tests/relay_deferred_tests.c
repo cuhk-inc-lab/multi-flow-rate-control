@@ -64,6 +64,30 @@ static uint8_t *make_owned_data(uint32_t flow_id, uint64_t block_id,
     return buf;
 }
 
+static uint8_t *make_v4_return_ack(uint32_t flow_id, uint64_t segment_id,
+                                   size_t *len_out)
+{
+    uint8_t *buf;
+    WireHeader hdr;
+
+    buf = calloc(1, WIRE_V4_HEADER_SIZE);
+    if (buf == NULL) {
+        return NULL;
+    }
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version = WIRE_VERSION_V4;
+    hdr.type = WIRE_TYPE_ACK;
+    hdr.final_dst = 1;
+    hdr.ttl = 8;
+    hdr.flow_id = flow_id;
+    hdr.block_id = segment_id;
+    hdr.origin_node = 4;
+    hdr.flags = WIRE_FLAG_RETURN_PATH;
+    wire_header_encode_v4(buf, &hdr);
+    *len_out = WIRE_V4_HEADER_SIZE;
+    return buf;
+}
+
 static RelayDeferredPacket make_pkt(uint32_t flow_id, uint64_t seq)
 {
     RelayDeferredPacket pkt;
@@ -410,6 +434,42 @@ static void test_data_end_fifo_inject_only(void)
     relay_harness_close(ctx);
 }
 
+static void test_relay_ack_data_lane_classification(void)
+{
+    RelayCtx *ctx = NULL;
+    RelayConfig cfg;
+    TxCapture cap;
+    EgressQueueStats ack_stats;
+    EgressQueueStats data_stats;
+    EgressQueueStats compat_stats;
+    uint8_t *buf;
+    size_t len;
+
+    memset(&cap, 0, sizeof(cap));
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.local_node_id = 2;
+    cfg.egress_capacity = 16;
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    buf = make_v4_return_ack(7, 100, &len);
+    EXPECT(buf != NULL);
+    EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
+    free(buf);
+    buf = make_owned_data(7, 101, WIRE_TYPE_DATA, &len);
+    EXPECT(buf != NULL);
+    EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
+    free(buf);
+
+    relay_ack_egress_stats_snapshot(ctx, &ack_stats);
+    relay_data_egress_stats_snapshot(ctx, &data_stats);
+    relay_egress_stats_snapshot(ctx, &compat_stats);
+    EXPECT(ack_stats.enqueue_immediate == 1);
+    EXPECT(data_stats.enqueue_immediate == 1);
+    EXPECT(memcmp(&data_stats, &compat_stats, sizeof(data_stats)) == 0);
+
+    relay_harness_close(ctx);
+}
+
 typedef struct {
     RelayCtx *ctx;
     volatile int release;
@@ -521,6 +581,7 @@ int main(void)
     test_wakeup_and_shutdown();
     test_producer_not_blocked_by_slow_consumer();
     test_data_end_fifo_inject_only();
+    test_relay_ack_data_lane_classification();
     test_egress_wait_blocks_inject_not_deferred_producer();
     test_high_flow_id_mapping();
 

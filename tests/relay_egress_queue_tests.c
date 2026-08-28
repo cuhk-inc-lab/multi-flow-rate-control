@@ -233,6 +233,182 @@ static void test_high_watermark(void)
     egress_queue_destroy(&q);
 }
 
+static void test_fair_ack_priority(void)
+{
+    EgressQueue ack;
+    EgressQueue data;
+    EgressFairDequeuer d;
+    EgressPacket pkt;
+    EgressPacket out;
+
+    EXPECT(egress_queue_init(&ack, 4) == EGRESS_OK);
+    EXPECT(egress_queue_init(&data, 4) == EGRESS_OK);
+    EXPECT(egress_fair_dequeuer_init(&d, &ack, &data, 8) == EGRESS_OK);
+    pkt = make_pkt(20);
+    EXPECT(egress_queue_try_enqueue(&data, &pkt) == EGRESS_OK);
+    pkt = make_pkt(10);
+    EXPECT(egress_queue_try_enqueue(&ack, &pkt) == EGRESS_OK);
+
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 10);
+    free(out.datagram);
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 20);
+    free(out.datagram);
+
+    egress_queue_shutdown(&ack);
+    egress_queue_shutdown(&data);
+    egress_fair_dequeuer_destroy(&d);
+    egress_queue_destroy(&ack);
+    egress_queue_destroy(&data);
+}
+
+static void test_fair_quota_prevents_data_starvation(void)
+{
+    EgressQueue ack;
+    EgressQueue data;
+    EgressFairDequeuer d;
+    EgressPacket pkt;
+    EgressPacket out;
+    int i;
+
+    EXPECT(egress_queue_init(&ack, 16) == EGRESS_OK);
+    EXPECT(egress_queue_init(&data, 4) == EGRESS_OK);
+    EXPECT(egress_fair_dequeuer_init(&d, &ack, &data, 8) == EGRESS_OK);
+    for (i = 0; i < 9; i++) {
+        pkt = make_pkt((uint8_t)(10 + i));
+        EXPECT(egress_queue_try_enqueue(&ack, &pkt) == EGRESS_OK);
+    }
+    pkt = make_pkt(99);
+    EXPECT(egress_queue_try_enqueue(&data, &pkt) == EGRESS_OK);
+
+    for (i = 0; i < 8; i++) {
+        EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+        EXPECT(out.datagram[0] == (uint8_t)(10 + i));
+        free(out.datagram);
+    }
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 99);
+    free(out.datagram);
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 18);
+    free(out.datagram);
+
+    egress_queue_shutdown(&ack);
+    egress_queue_shutdown(&data);
+    egress_fair_dequeuer_destroy(&d);
+    egress_queue_destroy(&ack);
+    egress_queue_destroy(&data);
+}
+
+static void test_fair_single_lane_and_ownership(void)
+{
+    EgressQueue ack;
+    EgressQueue data;
+    EgressFairDequeuer d;
+    EgressPacket pkt;
+    EgressPacket out;
+    uint8_t *owned;
+
+    EXPECT(egress_queue_init(&ack, 4) == EGRESS_OK);
+    EXPECT(egress_queue_init(&data, 4) == EGRESS_OK);
+    EXPECT(egress_fair_dequeuer_init(&d, &ack, &data, 8) == EGRESS_OK);
+
+    pkt = make_pkt(31);
+    owned = pkt.datagram;
+    EXPECT(egress_queue_try_enqueue(&ack, &pkt) == EGRESS_OK);
+    EXPECT(pkt.datagram == NULL);
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+    EXPECT(out.datagram == owned);
+    free(out.datagram);
+
+    pkt = make_pkt(41);
+    owned = pkt.datagram;
+    EXPECT(egress_queue_try_enqueue(&data, &pkt) == EGRESS_OK);
+    EXPECT(pkt.datagram == NULL);
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_OK);
+    EXPECT(out.datagram == owned);
+    free(out.datagram);
+
+    egress_queue_shutdown(&ack);
+    egress_queue_shutdown(&data);
+    EXPECT(egress_fair_dequeue(&d, &out) == EGRESS_ERR_SHUTDOWN);
+    egress_fair_dequeuer_destroy(&d);
+    egress_queue_destroy(&ack);
+    egress_queue_destroy(&data);
+}
+
+typedef struct {
+    EgressFairDequeuer *d;
+    EgressStatus result;
+} FairWaiterArgs;
+
+static void *fair_waiter_main(void *arg)
+{
+    FairWaiterArgs *args = arg;
+    EgressPacket out;
+
+    args->result = egress_fair_dequeue(args->d, &out);
+    if (args->result == EGRESS_OK) {
+        free(out.datagram);
+    }
+    return NULL;
+}
+
+static void test_fair_shutdown_wakes_empty_waiter(void)
+{
+    EgressQueue ack;
+    EgressQueue data;
+    EgressFairDequeuer d;
+    FairWaiterArgs args;
+    pthread_t th;
+
+    EXPECT(egress_queue_init(&ack, 2) == EGRESS_OK);
+    EXPECT(egress_queue_init(&data, 2) == EGRESS_OK);
+    EXPECT(egress_fair_dequeuer_init(&d, &ack, &data, 8) == EGRESS_OK);
+    memset(&args, 0, sizeof(args));
+    args.d = &d;
+    EXPECT(pthread_create(&th, NULL, fair_waiter_main, &args) == 0);
+    usleep(2000);
+    egress_queue_shutdown(&ack);
+    usleep(2000);
+    egress_queue_shutdown(&data);
+    EXPECT(pthread_join(th, NULL) == 0);
+    EXPECT(args.result == EGRESS_ERR_SHUTDOWN);
+
+    egress_fair_dequeuer_destroy(&d);
+    egress_queue_destroy(&ack);
+    egress_queue_destroy(&data);
+}
+
+static void test_fair_enqueue_wakes_empty_waiter(void)
+{
+    EgressQueue ack;
+    EgressQueue data;
+    EgressFairDequeuer d;
+    FairWaiterArgs args;
+    EgressPacket pkt;
+    pthread_t th;
+
+    EXPECT(egress_queue_init(&ack, 2) == EGRESS_OK);
+    EXPECT(egress_queue_init(&data, 2) == EGRESS_OK);
+    EXPECT(egress_fair_dequeuer_init(&d, &ack, &data, 8) == EGRESS_OK);
+    memset(&args, 0, sizeof(args));
+    args.d = &d;
+    EXPECT(pthread_create(&th, NULL, fair_waiter_main, &args) == 0);
+    usleep(2000);
+    pkt = make_pkt(55);
+    EXPECT(egress_queue_try_enqueue(&data, &pkt) == EGRESS_OK);
+    EXPECT(pthread_join(th, NULL) == 0);
+    EXPECT(args.result == EGRESS_OK);
+
+    egress_queue_shutdown(&ack);
+    egress_queue_shutdown(&data);
+    egress_fair_dequeuer_destroy(&d);
+    egress_queue_destroy(&ack);
+    egress_queue_destroy(&data);
+}
+
 int main(void)
 {
     test_timed_enqueue_immediate();
@@ -241,6 +417,11 @@ int main(void)
     test_timed_enqueue_shutdown_wakeup();
     test_fifo_order();
     test_high_watermark();
+    test_fair_ack_priority();
+    test_fair_quota_prevents_data_starvation();
+    test_fair_single_lane_and_ownership();
+    test_fair_shutdown_wakes_empty_waiter();
+    test_fair_enqueue_wakes_empty_waiter();
 
     if (g_failures != 0) {
         fprintf(stderr, "%d failure(s)\n", g_failures);
