@@ -5,6 +5,7 @@
 #include "stream_config.h"
 #include "wire_header.h"
 #include "wirehair_segment.h"
+#include "wirehair_segment_sender.h"
 
 #include <wirehair/wirehair.h>
 
@@ -88,6 +89,7 @@ struct FecEncoder {
     int wh_acked;
     int wh_send_end;
     int wh_end_sent;
+    WirehairSegmentSender *wh_sender;
 };
 
 struct FecDecoder {
@@ -113,6 +115,11 @@ static int fec_backend_users;
 static uint16_t fec_backend_k;
 static uint16_t fec_backend_r;
 static uint16_t fec_backend_shard;
+
+static FecStatus wirehair_enqueue_header(FecEncoder *encoder,
+                                         const WireHeader *header,
+                                         const uint8_t *payload,
+                                         uint8_t kind);
 
 void fec_transport_config_init(FecTransportConfig *config)
 {
@@ -303,6 +310,131 @@ static WirehairSegmentConfig encoder_wh_config(const FecEncoder *encoder)
     config.origin_node = encoder->config.origin_node;
     config.ack_ttl = encoder->config.ack_ttl;
     return config;
+}
+
+static int fec_wh_sender_emit(const WireHeader *header, const uint8_t *payload,
+                              size_t payload_len,
+                              WirehairSegmentSenderPacketKind kind,
+                              void *ctx)
+{
+    FecEncoder *encoder = ctx;
+    uint8_t fec_kind;
+    FecStatus status;
+    size_t len;
+
+    if (encoder == NULL || header == NULL) {
+        return -1;
+    }
+    len = wire_header_size(header) + payload_len;
+    if (!queue_can_add(encoder, 1u, len)) {
+        return 1;
+    }
+    fec_kind = kind == WH_SENDER_PKT_REPAIR ? FEC_KIND_PARITY : FEC_KIND_DATA;
+    status = wirehair_enqueue_header(encoder, header, payload, fec_kind);
+    if (status == FEC_ERR_QUEUE_FULL) {
+        return 1;
+    }
+    return status == FEC_OK ? 0 : -1;
+}
+
+static WirehairSegmentSender *fec_wh_sender_create(FecEncoder *encoder)
+{
+    WirehairSegmentConfig config = encoder_wh_config(encoder);
+
+    if (!encoder->config.ack_enabled) {
+        return NULL;
+    }
+    return wirehair_segment_sender_create(
+        &config, encoder->config.flow_id, encoder->config.final_dst,
+        encoder->config.ttl, fec_wh_sender_emit, encoder);
+}
+
+static void fec_wh_sender_destroy(FecEncoder *encoder)
+{
+    if (encoder == NULL) {
+        return;
+    }
+    wirehair_segment_sender_destroy(encoder->wh_sender);
+    encoder->wh_sender = NULL;
+}
+
+static FecStatus fec_wh_sender_admit_buffer(FecEncoder *encoder,
+                                            uint64_t now_ns)
+{
+    uint64_t segment_id;
+    int admitted;
+
+    if (encoder->wh_sender == NULL || encoder->wh_len == 0u) {
+        return FEC_OK;
+    }
+    if (!wirehair_segment_sender_can_admit(encoder->wh_sender)) {
+        return FEC_ERR_BUSY;
+    }
+    segment_id = ((uint64_t)encoder->epoch << 32) |
+                 (uint64_t)encoder->next_group;
+    if (encoder->next_group == UINT32_MAX) {
+        encoder->group_exhausted = 1;
+        return FEC_ERR_EXHAUSTED;
+    }
+    encoder->next_group++;
+    admitted = wirehair_segment_sender_admit(
+        encoder->wh_sender, segment_id, encoder->wh_buf, encoder->wh_len);
+    if (admitted != 0) {
+        if (encoder->next_group > 0u) {
+            encoder->next_group--;
+        }
+        return admitted == -1 ? FEC_ERR_BUSY : FEC_ERR_CODEC;
+    }
+    encoder->wh_len = 0;
+    encoder->pending_since_valid = 0;
+    if (wirehair_segment_sender_tick(encoder->wh_sender, now_ns) != 0) {
+        return FEC_ERR_CODEC;
+    }
+    return FEC_OK;
+}
+
+static FecStatus fec_wh_sender_progress(FecEncoder *encoder, uint64_t now_ns)
+{
+    FecStatus status;
+
+    if (encoder->wh_sender == NULL) {
+        return FEC_OK;
+    }
+    while (encoder->wh_len == encoder->config.segment_bytes &&
+           wirehair_segment_sender_can_admit(encoder->wh_sender)) {
+        status = fec_wh_sender_admit_buffer(encoder, now_ns);
+        if (status == FEC_ERR_BUSY) {
+            break;
+        }
+        if (status != FEC_OK) {
+            return status;
+        }
+    }
+    if (wirehair_segment_sender_tick(encoder->wh_sender, now_ns) != 0) {
+        return FEC_ERR_CODEC;
+    }
+    if (wirehair_segment_sender_idle(encoder->wh_sender) &&
+        !wirehair_segment_sender_end_emitted(encoder->wh_sender)) {
+        if (wirehair_segment_sender_try_emit_end(encoder->wh_sender) < 0) {
+            return FEC_ERR_CODEC;
+        }
+        if (wirehair_segment_sender_end_emitted(encoder->wh_sender)) {
+            encoder->wh_end_sent = 1;
+            encoder->wh_send_end = 0;
+        }
+    }
+    return FEC_OK;
+}
+
+static int fec_wh_sender_has_pending(const FecEncoder *encoder)
+{
+    if (encoder->wh_sender == NULL) {
+        return 0;
+    }
+    return encoder->wh_len != 0u ||
+           !wirehair_segment_sender_idle(encoder->wh_sender) ||
+           !wirehair_segment_sender_end_emitted(encoder->wh_sender) ||
+           wirehair_segment_sender_failed(encoder->wh_sender);
 }
 
 static void wirehair_close_session(FecEncoder *encoder)
@@ -795,6 +927,11 @@ FecEncoder *fec_encoder_create(const FecTransportConfig *config,
             fec_encoder_destroy(encoder);
             return NULL;
         }
+        encoder->wh_sender = fec_wh_sender_create(encoder);
+        if (resolved.ack_enabled && encoder->wh_sender == NULL) {
+            fec_encoder_destroy(encoder);
+            return NULL;
+        }
         return encoder;
     }
     encoder->lengths = calloc(encoder->message_shards, sizeof(*encoder->lengths));
@@ -813,6 +950,7 @@ void fec_encoder_destroy(FecEncoder *encoder)
         return;
     }
     wirehair_close_session(encoder);
+    fec_wh_sender_destroy(encoder);
     free(encoder->wh_buf);
     free(encoder->lengths);
     free(encoder->block);
@@ -841,8 +979,15 @@ FecStatus fec_encoder_reset(FecEncoder *encoder, uint32_t epoch)
     encoder->last_refill_valid = 0;
     if (encoder_is_wirehair(encoder)) {
         wirehair_close_session(encoder);
+        fec_wh_sender_destroy(encoder);
+        encoder->wh_sender = fec_wh_sender_create(encoder);
         encoder->wh_send_end = 0;
         encoder->wh_end_sent = 0;
+        encoder->wh_len = 0;
+        encoder->pending_since_valid = 0;
+        if (encoder->config.ack_enabled && encoder->wh_sender == NULL) {
+            return FEC_ERR_NOMEM;
+        }
         memset(&encoder->stats, 0, sizeof(encoder->stats));
         return FEC_OK;
     }
@@ -859,7 +1004,8 @@ int fec_encoder_has_pending(const FecEncoder *encoder)
            (encoder->data_count != 0 || encoder->q_count != 0 ||
             (encoder_is_wirehair(encoder) &&
              (encoder->wh_len != 0u || encoder->wh_codec != NULL ||
-              encoder->wh_send_end)));
+              encoder->wh_send_end ||
+              fec_wh_sender_has_pending(encoder))));
 }
 
 static uint64_t bytes_to_ns(uint64_t bytes, uint64_t rate_bps)
@@ -915,6 +1061,22 @@ FecStatus fec_encoder_flush(FecEncoder *encoder)
         return FEC_ERR_INVAL;
     }
     if (encoder_is_wirehair(encoder)) {
+        if (encoder->wh_sender != NULL) {
+            FecStatus status;
+
+            while (encoder->wh_len > 0u) {
+                status = fec_wh_sender_admit_buffer(encoder, 0u);
+                if (status == FEC_ERR_BUSY) {
+                    break;
+                }
+                if (status != FEC_OK) {
+                    return status;
+                }
+            }
+            wirehair_segment_sender_mark_input_finished(encoder->wh_sender);
+            encoder->wh_send_end = 1;
+            return fec_wh_sender_progress(encoder, 0u);
+        }
         /* Flush always finishes the current segment (if any) and sends END. */
         encoder->wh_send_end = 1;
         return wirehair_fill_queue(encoder);
@@ -940,6 +1102,36 @@ FecStatus fec_encoder_push(FecEncoder *encoder,
 
         if (encoder->group_exhausted) {
             return FEC_ERR_EXHAUSTED;
+        }
+        if (encoder->wh_sender != NULL) {
+            while (length > 0u) {
+                size_t room = encoder->config.segment_bytes - encoder->wh_len;
+                size_t take;
+
+                if (room == 0u) {
+                    status = fec_wh_sender_admit_buffer(encoder, now_ns);
+                    if (status != FEC_OK) {
+                        return status;
+                    }
+                    room = encoder->config.segment_bytes;
+                }
+                if (encoder->wh_len == 0u) {
+                    encoder->pending_since_ns = now_ns;
+                    encoder->pending_since_valid = 1;
+                }
+                take = length < room ? length : room;
+                memcpy(encoder->wh_buf + encoder->wh_len, bytes, take);
+                encoder->wh_len += take;
+                bytes += take;
+                length -= take;
+                if (encoder->wh_len == encoder->config.segment_bytes) {
+                    status = fec_wh_sender_admit_buffer(encoder, now_ns);
+                    if (status != FEC_OK) {
+                        return status;
+                    }
+                }
+            }
+            return FEC_OK;
         }
         if (encoder->wh_codec != NULL) {
             status = wirehair_fill_queue(encoder);
@@ -1036,10 +1228,18 @@ FecStatus fec_encoder_drain(FecEncoder *encoder, size_t budget)
         return FEC_ERR_INVAL;
     }
     if (encoder_is_wirehair(encoder)) {
-        FecStatus filled = wirehair_fill_queue(encoder);
+        FecStatus filled;
 
-        if (filled != FEC_OK) {
-            return filled;
+        if (encoder->wh_sender != NULL) {
+            filled = fec_wh_sender_progress(encoder, 0u);
+            if (filled != FEC_OK) {
+                return filled;
+            }
+        } else {
+            filled = wirehair_fill_queue(encoder);
+            if (filled != FEC_OK) {
+                return filled;
+            }
         }
     }
     while (budget > 0u && encoder->q_count > 0u) {
@@ -1091,8 +1291,23 @@ FecStatus fec_encoder_update(FecEncoder *encoder, uint64_t now_ns)
     }
     refill_tokens(encoder, now_ns);
     if (encoder_is_wirehair(encoder)) {
-        FecStatus status;
-
+        if (encoder->wh_sender != NULL) {
+            if (encoder->pending_since_valid && encoder->wh_len != 0u &&
+                encoder->config.flush_timeout_ns != 0u &&
+                now_ns >= encoder->pending_since_ns &&
+                now_ns - encoder->pending_since_ns >=
+                    encoder->config.flush_timeout_ns) {
+                status = fec_wh_sender_admit_buffer(encoder, now_ns);
+                if (status != FEC_OK && status != FEC_ERR_BUSY) {
+                    return status;
+                }
+            }
+            status = fec_wh_sender_progress(encoder, now_ns);
+            if (status != FEC_OK) {
+                return status;
+            }
+            return fec_encoder_drain(encoder, SIZE_MAX);
+        }
         if (encoder->pending_since_valid && encoder->wh_len != 0u &&
             encoder->wh_codec == NULL &&
             encoder->config.flush_timeout_ns != 0u &&
@@ -1146,6 +1361,14 @@ FecStatus fec_encoder_input_ack(FecEncoder *encoder,
     }
     if (!encoder_is_wirehair(encoder)) {
         return FEC_ERR_INVAL;
+    }
+    if (encoder->wh_sender != NULL) {
+        if (wirehair_segment_sender_input_ack(encoder->wh_sender, datagram,
+                                                length) != 0) {
+            return FEC_ERR_NOT_FEC;
+        }
+        encoder->stats.recovered_groups++;
+        return FEC_OK;
     }
     if (wire_header_decode(&header, datagram, length) != 0 ||
         header.version != WIRE_VERSION_V4 || header.type != WIRE_TYPE_ACK) {

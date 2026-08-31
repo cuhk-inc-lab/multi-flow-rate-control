@@ -803,6 +803,67 @@ static int test_wirehair_ack_stops_repair(void)
     return 0;
 }
 
+static int test_wirehair_ack_windowed_segments(void)
+{
+    FecTransportConfig config;
+    Capture wire = {0};
+    Capture app = {0};
+    Capture acks = {0};
+    DualCap dual = {.app = &app, .acks = &acks};
+    FecCallbacks enc_cb = {.output = capture_output, .ctx = &wire};
+    FecCallbacks dec_cb = {
+        .output = dual_app_output,
+        .ack_output = dual_ack_output,
+        .ctx = &dual};
+    FecEncoder *encoder;
+    FecDecoder *decoder;
+    uint8_t payload[8192];
+    size_t i;
+    size_t ack_seen = 0;
+    uint64_t now_ns = 1000u;
+
+    for (i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(i + 3u);
+    }
+    wirehair_cfg(&config);
+    config.segment_bytes = 4096u;
+    config.window = 2u;
+    config.ack_enabled = 1u;
+    encoder = fec_encoder_create(&config, &enc_cb);
+    decoder = fec_decoder_create(&config, &dec_cb);
+    EXPECT(encoder != NULL && decoder != NULL);
+    EXPECT(fec_encoder_push(encoder, payload, sizeof(payload), now_ns) == FEC_OK);
+    EXPECT(fec_encoder_flush(encoder) == FEC_OK);
+    while (fec_encoder_has_pending(encoder)) {
+        size_t before = wire.count;
+        size_t pkt;
+
+        now_ns += 200000000ull;
+        EXPECT(fec_encoder_update(encoder, now_ns) == FEC_OK);
+        if (wire.count == before) {
+            EXPECT(fec_encoder_drain(encoder, 8) == FEC_OK);
+        }
+        for (pkt = before; pkt < wire.count; pkt++) {
+            EXPECT(fec_decoder_input(decoder, wire.buf[pkt], wire.len[pkt],
+                                     now_ns + pkt) == FEC_OK);
+        }
+        while (ack_seen < acks.count) {
+            EXPECT(fec_encoder_input_ack(encoder, acks.buf[ack_seen],
+                                         acks.len[ack_seen]) == FEC_OK);
+            ack_seen++;
+        }
+    }
+    EXPECT(app.count == 2);
+    EXPECT(app.len[0] == 4096u);
+    EXPECT(app.len[1] == 4096u);
+    EXPECT(memcmp(app.buf[0], payload, 4096u) == 0);
+    EXPECT(memcmp(app.buf[1], payload + 4096u, 4096u) == 0);
+    EXPECT(acks.count >= 2);
+    fec_encoder_destroy(encoder);
+    fec_decoder_destroy(decoder);
+    return 0;
+}
+
 int main(void)
 {
     if (test_clean_roundtrip(4, 2) != 0 ||
@@ -825,7 +886,8 @@ int main(void)
         test_drop_any_two_shards() != 0 ||
         test_incompatible_wire() != 0 ||
         test_wirehair_roundtrip_and_drop() != 0 ||
-        test_wirehair_ack_stops_repair() != 0) {
+        test_wirehair_ack_stops_repair() != 0 ||
+        test_wirehair_ack_windowed_segments() != 0) {
         return 1;
     }
     puts("fec_transport tests passed");

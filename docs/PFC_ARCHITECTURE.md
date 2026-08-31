@@ -28,7 +28,8 @@ Three PFC implementations share wire v4:
 │  Socket-free library                                         │
 │  src/fec_transport.c  +  include/fec_transport.h             │
 │  codec = FEC_CODEC_WIREHAIR                                  │
-│  NO sliding window: one segment session at a time            │
+│  NO sliding window when ack_enabled=0 (one segment session at a time)      │
+│  ack_enabled=1 → wirehair_segment_sender.c (same window as binaries)       │
 │  caller owns UDP; drain() / decoder_input()                  │
 └─────────────────────────┴──────────────────────────────────┘
                            │
@@ -209,9 +210,9 @@ Config fields (Wirehair): `segment_bytes`, `repair_percent`, `ack_enabled`,
 `origin_node`, `final_dst`, `ttl`, `ack_ttl`, `flow_id`, `flush_timeout_ns`,
 `output_queue_*`, `wire_rate_bps`.
 
-Library ACK drops leftover queued repair for the **current** session. Binary ACK
-mode uses a **window of segments** and 5% micro-rounds. The two control loops
-are not the same.
+Library ACK mode uses `wirehair_segment_sender` with a **window of segments**
+and 5% micro-rounds. No-ACK mode still emits one segment session at a time
+via the output queue. The two control loops differ only when `ack_enabled=0`.
 
 ---
 

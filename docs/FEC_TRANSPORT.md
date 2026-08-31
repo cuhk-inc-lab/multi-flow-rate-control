@@ -136,30 +136,35 @@ An empty `flush` with nothing buffered still sends a v4 END.
    Remaining queued **parity** for that segment is dropped; no more
    repair is generated.
 
-`wg_multi_pipeline` / `wire_relay` extend this with a bounded sender sliding
-window: at most `window` segments may be in flight, ACKs may arrive
-out-of-order, and unacknowledged segments receive timed 5% repair micro-rounds
-until ACK or the 100%-of-source cap. Multi-flow sends share one aggregate
-wire-byte pacer so flows do not burst in lockstep.
+`wg_multi_pipeline` / `wire_relay` share the same v4 format. When
+`ack_enabled` is set, the library uses the same sliding-window sender as the
+binaries (`wirehair_segment_sender.c`): bounded in-flight segments, 5% repair
+micro-rounds, and out-of-order ACK handling. Call `fec_encoder_update()` with
+monotonic `now_ns` so repair timing advances between `drain()` calls.
+
+`wg_multi_pipeline` / `wire_relay` binaries still encode via `wirehair_segment_*`
+directly (see §6). Use `fec_transport` when you want a non-blocking
+encoder/decoder you can plug into your own UDP loop.
 
 ```c
 cfg.ack_enabled = 1;
 
 FecCallbacks dec_cb = {
     .output = write_app,
-    .ack_output = send_ack_udp,   /* NULL = still recover, never stop repair */
+    .ack_output = send_ack_udp,
     .ctx = ctx,
 };
 
-/* sender RX path */
-fec_encoder_input_ack(enc, ack_datagram, ack_len);
+for (;;) {
+    uint64_t now_ns = monotonic_ns();
+    fec_encoder_push(enc, chunk, chunk_len, now_ns);
+    fec_encoder_update(enc, now_ns);
+    fec_encoder_drain(enc, 32);
+    /* on RX: decoder_input / encoder_input_ack */
+}
 ```
 
 The library never opens sockets. ACK return routing is the caller’s job.
-
-`drain(1)` in a loop is a useful pattern: send one packet, immediately
-feed the decoder (or the real network), then feed ACK back so repair
-stops early.
 
 ## 4. Tests
 

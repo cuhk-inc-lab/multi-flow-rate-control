@@ -87,6 +87,7 @@ RSCODE_OBJS = \
 	$(OBJ_DIR)/wg_rs_gf256_avx2.o \
 	$(OBJ_DIR)/wg_rs_gf256_ssse3.o \
 	$(OBJ_DIR)/wg_wirehair_segment.o \
+	$(OBJ_DIR)/wg_wirehair_segment_sender.o \
 	$(WIREHAIR_LIB)
 
 HOST_ARCH := $(shell uname -m)
@@ -310,6 +311,12 @@ $(OBJ_DIR)/wg_wirehair_segment.o: $(WG_DIR)/wirehair_segment.c \
 	$(CC) $(CFLAGS) -DWIREHAIR_STATIC -I$(WG_DIR) \
 		-I$(WIREHAIR_DIR)/include -c $< -o $@
 
+$(OBJ_DIR)/wg_wirehair_segment_sender.o: $(WG_DIR)/wirehair_segment_sender.c \
+	$(WG_DIR)/wirehair_segment_sender.h $(WG_DIR)/wirehair_segment.h \
+	$(WG_DIR)/stream_config.h $(INCLUDE_HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -DWIREHAIR_STATIC -I$(WG_DIR) \
+		-I$(WIREHAIR_DIR)/include -c $< -o $@
+
 $(OBJ_DIR)/wg_rs_codec.o: $(WG_DIR)/rs_codec.c $(INCLUDE_HDRS) $(WG_HDRS) \
 	$(RSCODE_DIR)/ecc.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(RSCODE_DIR) -c $< -o $@
@@ -452,7 +459,8 @@ $(RS_ENCODE_GENERAL_TEST_BIN): $(TEST_DIR)/rs_encode_general_tests.c \
 	$(CC) $(CFLAGS) -I$(WG_DIR) $^ -o $@ $(LDFLAGS) $(RS_LDFLAGS)
 
 $(OBJ_DIR)/fec_transport.o: $(SRC_DIR)/fec_transport.c include/fec_transport.h \
-	$(INCLUDE_HDRS) $(WG_HDRS) $(WG_DIR)/wirehair_segment.h | $(OBJ_DIR)
+	$(INCLUDE_HDRS) $(WG_HDRS) $(WG_DIR)/wirehair_segment.h \
+	$(WG_DIR)/wirehair_segment_sender.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -DWIREHAIR_STATIC -I$(WG_DIR) -I$(RSCODE_DIR) \
 		-I$(WIREHAIR_DIR)/include -c $< -o $@
 
@@ -461,7 +469,8 @@ $(FEC_TRANSPORT_TEST_BIN): $(TEST_DIR)/fec_transport_tests.c \
 	$(OBJ_DIR)/wg_codec.o $(OBJ_DIR)/wg_block_codec.o $(OBJ_DIR)/wg_copy_codec.o \
 	$(OBJ_DIR)/wg_xor_fec_codec.o $(OBJ_DIR)/wg_rs_fec_codec.o \
 	$(OBJ_DIR)/wg_rs_codec.o $(RSCODE_OBJS) \
-	$(OBJ_DIR)/wg_wirehair_segment.o $(WIREHAIR_LIB) | $(OBJ_DIR)
+	$(OBJ_DIR)/wg_wirehair_segment.o $(OBJ_DIR)/wg_wirehair_segment_sender.o \
+	$(WIREHAIR_LIB) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -I$(WG_DIR) -I$(WIREHAIR_DIR)/include $^ -o $@ \
 		$(LDFLAGS) $(RS_LDFLAGS)
 
