@@ -11,6 +11,7 @@
 
 - VXLAN 总览：[`vxlan/vxlan_era_experiment_summary.md`](vxlan/vxlan_era_experiment_summary.md)
 - Linear Phase3 四 codec 上限（含 goodput/link）：[`linear/linear_phase3_ceil_4codec.md`](linear/linear_phase3_ceil_4codec.md)
+- Linear Phase4B stress（含图表）：[`linear/commercial_pool_20260908-173026_phase4b_stress.md`](linear/commercial_pool_20260908-173026_phase4b_stress.md)
 
 ## 归类说明
 

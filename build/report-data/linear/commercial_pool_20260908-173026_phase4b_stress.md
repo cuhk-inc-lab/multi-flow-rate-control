@@ -29,39 +29,39 @@
 
 ### CPU overlay
 
-![CPU all nodes](charts/cpu-all.svg)
+![CPU all nodes](commercial_pool_20260908-173026_phase4b_batch1/charts/cpu-all.svg)
 
 ### node1
 
-![CPU node1](charts/node1-cpu.svg)
+![CPU node1](commercial_pool_20260908-173026_phase4b_batch1/charts/node1-cpu.svg)
 
-![RX node1](charts/node1-rx.svg)
+![RX node1](commercial_pool_20260908-173026_phase4b_batch1/charts/node1-rx.svg)
 
-![TX node1](charts/node1-tx.svg)
+![TX node1](commercial_pool_20260908-173026_phase4b_batch1/charts/node1-tx.svg)
 
 ### node2
 
-![CPU node2](charts/node2-cpu.svg)
+![CPU node2](commercial_pool_20260908-173026_phase4b_batch1/charts/node2-cpu.svg)
 
-![RX node2](charts/node2-rx.svg)
+![RX node2](commercial_pool_20260908-173026_phase4b_batch1/charts/node2-rx.svg)
 
-![TX node2](charts/node2-tx.svg)
+![TX node2](commercial_pool_20260908-173026_phase4b_batch1/charts/node2-tx.svg)
 
 ### node3
 
-![CPU node3](charts/node3-cpu.svg)
+![CPU node3](commercial_pool_20260908-173026_phase4b_batch1/charts/node3-cpu.svg)
 
-![RX node3](charts/node3-rx.svg)
+![RX node3](commercial_pool_20260908-173026_phase4b_batch1/charts/node3-rx.svg)
 
-![TX node3](charts/node3-tx.svg)
+![TX node3](commercial_pool_20260908-173026_phase4b_batch1/charts/node3-tx.svg)
 
 ### node4
 
-![CPU node4](charts/node4-cpu.svg)
+![CPU node4](commercial_pool_20260908-173026_phase4b_batch1/charts/node4-cpu.svg)
 
-![RX node4](charts/node4-rx.svg)
+![RX node4](commercial_pool_20260908-173026_phase4b_batch1/charts/node4-rx.svg)
 
-![TX node4](charts/node4-tx.svg)
+![TX node4](commercial_pool_20260908-173026_phase4b_batch1/charts/node4-tx.svg)
 
 
 ## Streams
@@ -122,39 +122,39 @@
 
 ### CPU overlay
 
-![CPU all nodes](charts/cpu-all.svg)
+![CPU all nodes](commercial_pool_20260908-173026_phase4b_batch2/charts/cpu-all.svg)
 
 ### node1
 
-![CPU node1](charts/node1-cpu.svg)
+![CPU node1](commercial_pool_20260908-173026_phase4b_batch2/charts/node1-cpu.svg)
 
-![RX node1](charts/node1-rx.svg)
+![RX node1](commercial_pool_20260908-173026_phase4b_batch2/charts/node1-rx.svg)
 
-![TX node1](charts/node1-tx.svg)
+![TX node1](commercial_pool_20260908-173026_phase4b_batch2/charts/node1-tx.svg)
 
 ### node2
 
-![CPU node2](charts/node2-cpu.svg)
+![CPU node2](commercial_pool_20260908-173026_phase4b_batch2/charts/node2-cpu.svg)
 
-![RX node2](charts/node2-rx.svg)
+![RX node2](commercial_pool_20260908-173026_phase4b_batch2/charts/node2-rx.svg)
 
-![TX node2](charts/node2-tx.svg)
+![TX node2](commercial_pool_20260908-173026_phase4b_batch2/charts/node2-tx.svg)
 
 ### node3
 
-![CPU node3](charts/node3-cpu.svg)
+![CPU node3](commercial_pool_20260908-173026_phase4b_batch2/charts/node3-cpu.svg)
 
-![RX node3](charts/node3-rx.svg)
+![RX node3](commercial_pool_20260908-173026_phase4b_batch2/charts/node3-rx.svg)
 
-![TX node3](charts/node3-tx.svg)
+![TX node3](commercial_pool_20260908-173026_phase4b_batch2/charts/node3-tx.svg)
 
 ### node4
 
-![CPU node4](charts/node4-cpu.svg)
+![CPU node4](commercial_pool_20260908-173026_phase4b_batch2/charts/node4-cpu.svg)
 
-![RX node4](charts/node4-rx.svg)
+![RX node4](commercial_pool_20260908-173026_phase4b_batch2/charts/node4-rx.svg)
 
-![TX node4](charts/node4-tx.svg)
+![TX node4](commercial_pool_20260908-173026_phase4b_batch2/charts/node4-tx.svg)
 
 
 ## Streams
@@ -211,39 +211,39 @@
 
 ### CPU overlay
 
-![CPU all nodes](charts/cpu-all.svg)
+![CPU all nodes](commercial_pool_20260908-173026_phase4b_batch3/charts/cpu-all.svg)
 
 ### node1
 
-![CPU node1](charts/node1-cpu.svg)
+![CPU node1](commercial_pool_20260908-173026_phase4b_batch3/charts/node1-cpu.svg)
 
-![RX node1](charts/node1-rx.svg)
+![RX node1](commercial_pool_20260908-173026_phase4b_batch3/charts/node1-rx.svg)
 
-![TX node1](charts/node1-tx.svg)
+![TX node1](commercial_pool_20260908-173026_phase4b_batch3/charts/node1-tx.svg)
 
 ### node2
 
-![CPU node2](charts/node2-cpu.svg)
+![CPU node2](commercial_pool_20260908-173026_phase4b_batch3/charts/node2-cpu.svg)
 
-![RX node2](charts/node2-rx.svg)
+![RX node2](commercial_pool_20260908-173026_phase4b_batch3/charts/node2-rx.svg)
 
-![TX node2](charts/node2-tx.svg)
+![TX node2](commercial_pool_20260908-173026_phase4b_batch3/charts/node2-tx.svg)
 
 ### node3
 
-![CPU node3](charts/node3-cpu.svg)
+![CPU node3](commercial_pool_20260908-173026_phase4b_batch3/charts/node3-cpu.svg)
 
-![RX node3](charts/node3-rx.svg)
+![RX node3](commercial_pool_20260908-173026_phase4b_batch3/charts/node3-rx.svg)
 
-![TX node3](charts/node3-tx.svg)
+![TX node3](commercial_pool_20260908-173026_phase4b_batch3/charts/node3-tx.svg)
 
 ### node4
 
-![CPU node4](charts/node4-cpu.svg)
+![CPU node4](commercial_pool_20260908-173026_phase4b_batch3/charts/node4-cpu.svg)
 
-![RX node4](charts/node4-rx.svg)
+![RX node4](commercial_pool_20260908-173026_phase4b_batch3/charts/node4-rx.svg)
 
-![TX node4](charts/node4-tx.svg)
+![TX node4](commercial_pool_20260908-173026_phase4b_batch3/charts/node4-tx.svg)
 
 
 ## Streams

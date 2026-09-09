@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="280" viewBox="0 0 720 280">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<text x="56" y="18" font-family="sans-serif" font-size="14" font-weight="600" fill="#111">CPU all nodes</text>
+<text x="14" y="134.0" font-family="sans-serif" font-size="11" fill="#555" transform="rotate(-90 14,134.0)">%</text>
+<line x1="56" y1="28" x2="56" y2="240" stroke="#ccc"/>
+<line x1="56" y1="240" x2="704" y2="240" stroke="#ccc"/>
+<line x1="56" y1="240.0" x2="704" y2="240.0" stroke="#eee"/>
+<text x="50" y="244.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#666">0</text>
+<line x1="56" y1="187.0" x2="704" y2="187.0" stroke="#eee"/>
+<text x="50" y="191.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#666">25</text>
+<line x1="56" y1="134.0" x2="704" y2="134.0" stroke="#eee"/>
+<text x="50" y="138.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#666">50</text>
+<line x1="56" y1="81.0" x2="704" y2="81.0" stroke="#eee"/>
+<text x="50" y="85.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#666">75</text>
+<line x1="56" y1="28.0" x2="704" y2="28.0" stroke="#eee"/>
+<text x="50" y="32.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#666">100</text>
+<text x="56.0" y="258" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">0s</text>
+<text x="218.0" y="258" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">5s</text>
+<text x="380.0" y="258" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">10s</text>
+<text x="542.0" y="258" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">14s</text>
+<text x="704.0" y="258" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">19s</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" points="56.0,222.2 90.1,229.9 124.2,223.8 158.3,221.2 192.4,222.7 226.5,218.2 260.6,225.0 294.7,218.3 328.8,222.8 362.9,225.7 397.1,223.8 431.2,230.0 465.3,226.3 499.4,230.4 533.5,231.2 567.6,230.9 601.7,234.7 635.8,230.4 669.9,230.7"/>
+<text x="64" y="272" font-family="sans-serif" font-size="11" fill="#2563eb">node1</text>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" points="56.0,203.7 90.1,200.8 124.2,183.4 158.3,187.3 192.4,191.6 226.5,189.8 260.6,190.1 294.7,192.5 328.8,192.3 362.9,191.6 397.1,199.6 431.2,191.8 465.3,202.6 499.4,195.7 533.5,204.0 567.6,195.7 601.7,200.1 635.8,201.3 669.9,198.4"/>
+<text x="174" y="272" font-family="sans-serif" font-size="11" fill="#dc2626">node2</text>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" points="56.0,218.2 90.1,217.3 124.2,215.1 158.3,214.5 192.4,207.8 226.5,210.4 260.6,210.8 294.7,208.0 328.8,213.8 362.9,208.2 397.1,214.5 431.2,211.9 465.3,216.6 499.4,216.7 533.5,215.8 567.6,222.7 601.7,217.7 635.8,215.9 669.9,199.3"/>
+<text x="284" y="272" font-family="sans-serif" font-size="11" fill="#16a34a">node3</text>
+<polyline fill="none" stroke="#ca8a04" stroke-width="2" points="56.0,228.6 90.1,224.1 124.2,220.6 158.3,219.2 192.4,225.5 226.5,218.8 260.6,226.0 294.7,218.1 328.8,226.3 362.9,219.9 397.1,224.4 431.2,223.9 465.3,223.0 499.4,227.9 533.5,223.0 567.6,227.8 601.7,223.3 635.8,229.3 669.9,228.6 704.0,232.6"/>
+<text x="394" y="272" font-family="sans-serif" font-size="11" fill="#ca8a04">node4</text>
+</svg>
