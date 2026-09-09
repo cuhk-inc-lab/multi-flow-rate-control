@@ -7,7 +7,7 @@ cd "$REPO"
 export WH_TOPO=linear
 export WH_SUDO_PASS="${WH_SUDO_PASS:-}"
 LOG=$REPO/build/linear_full_run.log
-mkdir -p "$REPO/build/report-data" "$REPO/build"
+mkdir -p "$REPO/build/report-data/linear" "$REPO/build/report-data/vxlan" "$REPO/build"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "======== LINEAR FULL RUN start $(date) WH_TOPO=$WH_TOPO ========"
@@ -28,7 +28,7 @@ p=Path('build/linear_wirehair_loss_repair_matrix.json')
 if p.exists():
     rows=json.loads(p.read_text())
     ok=sum(1 for r in rows if r.get('checksum_ok'))
-    Path('build/report-data/linear_phase2_loss_repair.md').write_text(
+    Path('build/report-data/linear/linear_phase2_loss_repair.md').write_text(
         f"# Linear Phase2 loss×ACK\n\ncases={len(rows)} checksum_ok={ok}\n\nraw: `{p}`\n")
     print('phase2 cases', len(rows), 'ok', ok)
 PY
@@ -54,7 +54,7 @@ for r in rows:
     if c is None: continue
     if path=='hop3_kernel': ceil['kernel'][mode]=float(c)
     if path=='hop3_relay': ceil['relay'][mode]=float(c)
-Path('build/report-data/linear_phase3_ceiling.md').write_text("\n".join(lines)+"\n")
+Path('build/report-data/linear/linear_phase3_ceiling.md').write_text("\n".join(lines)+"\n")
 Path('build/linear_phase3_ceil_for_p4.json').write_text(json.dumps(ceil, indent=2)+"\n")
 print('phase3 rows', len(rows), 'ceil', ceil)
 PY
@@ -135,7 +135,7 @@ for b in (1,2,3):
     p=Path(f"build/wire-stress-linear-4b-batch{b}/results.md")
     lines.append(f"## batch{b}\n")
     lines.append(p.read_text() if p.exists() else "(missing)\n")
-Path("build/report-data/linear_phase4b_stress.md").write_text("\n".join(lines))
+Path("build/report-data/linear/linear_phase4b_stress.md").write_text("\n".join(lines))
 PY
 
 echo "===== PHASE 5 resource ====="
@@ -152,17 +152,17 @@ if t2!=t:
 PY
 WH_P5_FRESH=1 WH_P5_NAME=linear_phase5_resource WH_P5_PARTS=A,B,C \
   python3 -u scripts/local/vm_phase5_resource_profile.py || echo "WARN phase5 rc=$?"
-if [[ -f build/report-data/phase5_resource_profile.md ]]; then
-  cp -a build/report-data/phase5_resource_profile.md build/report-data/linear_phase5_resource_profile.md
+if [[ -f build/report-data/vxlan/phase5_resource_profile.md ]]; then
+  cp -a build/report-data/vxlan/phase5_resource_profile.md build/report-data/linear/linear_phase5_resource_profile.md
 fi
 
 python3 - <<'PY'
 from pathlib import Path
-Path("build/report-data/linear_full_summary.md").write_text(
+Path("build/report-data/linear/linear_full_summary.md").write_text(
 """# Linear topology full re-run summary
 
 - Topology: bridge hops `10.20.20` / `10.30.30` / `10.40.40`
-- Reports under `build/report-data/linear_*.md`
+- Reports under `build/report-data/linear/`
 - Raw: `build/linear_*` and `build/wire-stress-linear-*`
 """)
 print("done summary")

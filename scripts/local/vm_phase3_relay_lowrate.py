@@ -45,7 +45,7 @@ FRESH = os.environ.get("WH_P3R_FRESH", "0") == "1"
 REPO = Path(__file__).resolve().parents[2]
 OUT_JSON = REPO / "build" / f"{NAME}.json"
 OUT_PROBES = REPO / "build" / f"{NAME}_probes.json"
-OUT_MD = REPO / "build" / "report-data" / f"{NAME}.md"
+OUT_MD = REPO / "build" / "report-data" / "linear" / f"{NAME}.md"
 
 
 def is_pass(row: dict) -> bool:

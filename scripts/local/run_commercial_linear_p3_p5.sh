@@ -21,7 +21,7 @@ export WH_DISK_THRESHOLD_PCT="${WH_DISK_THRESHOLD_PCT:-78}"
 
 TAG="${WH_COMMERCIAL_TAG:-commercial_$(date +%Y%m%d-%H%M%S)}"
 LOG=$REPO/build/${TAG}_run.log
-mkdir -p "$REPO/build/report-data" "$REPO/build"
+mkdir -p "$REPO/build/report-data/linear" "$REPO/build/report-data/vxlan" "$REPO/build"
 exec > >(tee -a "$LOG") 2>&1
 
 cleanup_disk() {
@@ -141,7 +141,7 @@ for b in (1, 2, 3):
     p = Path(f"build/wire-stress-{tag}-4b-batch{b}/results.md")
     lines.append(f"## batch{b}\n")
     lines.append(p.read_text() if p.exists() else "(missing)\n")
-Path(f"build/report-data/{tag}_phase4b_stress.md").write_text("\n".join(lines))
+Path(f"build/report-data/linear/{tag}_phase4b_stress.md").write_text("\n".join(lines))
 PY
 
 echo "===== PHASE 5 resource profile ====="
@@ -158,8 +158,8 @@ if t2 != t:
 PY
 WH_P5_FRESH=1 WH_P5_NAME=${TAG}_phase5_resource WH_P5_PARTS=A,B,C \
   python3 -u scripts/local/vm_phase5_resource_profile.py || echo "WARN phase5 rc=$?"
-if [[ -f build/report-data/phase5_resource_profile.md ]]; then
-  cp -a build/report-data/phase5_resource_profile.md "build/report-data/${TAG}_phase5_resource_profile.md"
+if [[ -f build/report-data/vxlan/phase5_resource_profile.md ]]; then
+  cp -a build/report-data/vxlan/phase5_resource_profile.md "build/report-data/linear/${TAG}_phase5_resource_profile.md"
 fi
 
 echo "===== COMMERCIAL BRIEF ====="
@@ -168,4 +168,4 @@ python3 scripts/local/generate_commercial_brief.py --tag "$TAG" || echo "WARN br
 cleanup_disk
 echo "======== COMMERCIAL Phase3-5 end $(date) tag=$TAG ========"
 echo "LOG=$LOG"
-echo "BRIEF=build/report-data/${TAG}_commercial_brief.md"
+echo "BRIEF=build/report-data/linear/${TAG}_commercial_brief.md"

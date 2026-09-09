@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
-from topo_lab import N1, N2, N3, N4, RELAY2_NEXT, RELAY3_NEXT, MONITOR_IFACES  # noqa: E402
+from topo_lab import N1, N2, N3, N4, RELAY2_NEXT, RELAY3_NEXT, MONITOR_IFACES, TOPO  # noqa: E402
 
 SSH = {
     1: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "fyp1@10.10.10.161"],
@@ -714,7 +714,8 @@ def save(rows: list) -> None:
 
 
 def write_report(rows: list) -> None:
-    report = REPO / "build" / "report-data" / "phase5_resource_profile.md"
+    sub = "linear" if TOPO == "linear" else "vxlan"
+    report = REPO / "build" / "report-data" / sub / "phase5_resource_profile.md"
     report.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "# Phase 5 — 运行时资源剖面（CPU / 内存 / NIC）",

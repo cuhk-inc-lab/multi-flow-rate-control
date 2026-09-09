@@ -30,7 +30,7 @@ time = __import__("time")
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
-from topo_lab import N1, N2, N3, N4, CEILING_PATHS, MONITOR_IFACES  # noqa: E402
+from topo_lab import N1, N2, N3, N4, CEILING_PATHS, MONITOR_IFACES, TOPO  # noqa: E402
 
 SSH = {
     1: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "fyp1@10.10.10.161"],
@@ -622,11 +622,14 @@ def search_ceiling(path, codec_mode, port_base: int, probes: list) -> dict:
         "max_pass_link_rx_mbps": last_pass.get("link_rx_mbps"),
         "best_goodput_mbps": best_gp.get("goodput_mbps"),
         "best_goodput_at_rate": best_gp.get("rate"),
+        "best_wire_mbps": best_gp.get("wire_mbps"),
         "best_link_tx_mbps": best_gp.get("link_tx_mbps"),
         "best_link_rx_mbps": best_gp.get("link_rx_mbps"),
         "first_fail_rate_mbps": first_fail["rate"] if first_fail else None,
         "precision_mbps": PRECISION,
         "ceiling_mbps": best_gp.get("goodput_mbps"),
+        "ceiling_link_tx_mbps": best_gp.get("link_tx_mbps"),
+        "ceiling_link_rx_mbps": best_gp.get("link_rx_mbps"),
         "repair_sent": last_pass.get("repair_sent"),
     }
 
@@ -648,9 +651,12 @@ def save(results, probes):
         "first_fail_rate_mbps",
         "best_goodput_mbps",
         "best_goodput_at_rate",
+        "best_wire_mbps",
         "best_link_tx_mbps",
         "best_link_rx_mbps",
         "ceiling_mbps",
+        "ceiling_link_tx_mbps",
+        "ceiling_link_rx_mbps",
         "precision_mbps",
         "repair_sent",
     ]
@@ -660,8 +666,9 @@ def save(results, probes):
         for r in results:
             w.writerow(r)
 
-    # Markdown summary table
-    md_path = REPO / "build" / "report-data" / f"{NAME}.md"
+    # Markdown summary table (goodput + link side-by-side)
+    report_subdir = "linear" if TOPO == "linear" else "vxlan"
+    md_path = REPO / "build" / "report-data" / report_subdir / f"{NAME}.md"
     md_path.parent.mkdir(parents=True, exist_ok=True)
     codecs = []
     for r in results:
@@ -674,19 +681,56 @@ def save(results, probes):
         if p and p not in paths:
             paths.append(p)
     by = {(r.get("path"), r.get("codec_mode")): r for r in results}
+
+    def fmt_num(x):
+        if x is None:
+            return "—"
+        if isinstance(x, float):
+            return f"{x:.0f}" if abs(x - round(x)) < 0.05 else f"{x:.1f}"
+        return str(x)
+
+    def cell_gp_link(r):
+        if not r or r.get("ceiling_mbps") is None:
+            return "—"
+        gp = r.get("ceiling_mbps")
+        ltx = r.get("best_link_tx_mbps")
+        lrx = r.get("best_link_rx_mbps")
+        # Prefer tx; show rx if materially different
+        if ltx is None and lrx is None:
+            return f"{gp:.0f}"
+        link = ltx if ltx is not None else lrx
+        if ltx is not None and lrx is not None and abs(ltx - lrx) > 50:
+            return f"{gp:.0f} / tx{ltx:.0f} rx{lrx:.0f}"
+        return f"{gp:.0f} / {link:.0f}"
+
     lines = [
         f"# Phase3 单流上限 — `{NAME}`",
         "",
         f"- PASS: checksum OK 或完成率 ≥ {PASS_PCT:.0f}%",
         f"- payload: {FILE_MIB} MiB；精度 ≤{PRECISION} Mbps；max_rate={MAX_RATE}",
         f"- Wirehair: seg={WH_SEGMENT} win={WH_WINDOW}",
-        f"- ceiling = PASS 探针中最大实测 goodput（Mbps）",
+        f"- **goodput** = PASS 探针中最大实测有效吞吐（源数据）",
+        f"- **link_tx / link_rx** = 同一次 best-goodput 探针的 NIC 计数吞吐（Mbps）",
+        f"- 主表单元格格式：`goodput / link`（单位 Mbps；link 默认取 link_tx）",
         "",
-        "## 上限 goodput (Mbps)",
+        "## 上限 goodput / link (Mbps)",
         "",
         "| path \\ codec | " + " | ".join(codecs) + " |",
         "|---|" + "|".join(["---:"] * len(codecs)) + "|",
     ]
+    for path in paths:
+        cells = [cell_gp_link(by.get((path, c))) for c in codecs]
+        lines.append(f"| {path} | " + " | ".join(cells) + " |")
+
+    lines.extend(
+        [
+            "",
+            "## 上限 goodput only (Mbps)",
+            "",
+            "| path \\ codec | " + " | ".join(codecs) + " |",
+            "|---|" + "|".join(["---:"] * len(codecs)) + "|",
+        ]
+    )
     for path in paths:
         cells = []
         for c in codecs:
@@ -694,27 +738,51 @@ def save(results, probes):
             if not r or r.get("ceiling_mbps") is None:
                 cells.append("—")
             else:
-                mp = r.get("max_pass_rate_mbps")
-                ceil = r.get("ceiling_mbps")
-                cells.append(f"{ceil:.0f} (pass≤{mp})")
+                cells.append(f"{r['ceiling_mbps']:.0f} (pass≤{r.get('max_pass_rate_mbps')})")
         lines.append(f"| {path} | " + " | ".join(cells) + " |")
+
+    lines.extend(
+        [
+            "",
+            "## 同探针链路吞吐 link_tx (Mbps)",
+            "",
+            "| path \\ codec | " + " | ".join(codecs) + " |",
+            "|---|" + "|".join(["---:"] * len(codecs)) + "|",
+        ]
+    )
+    for path in paths:
+        cells = []
+        for c in codecs:
+            r = by.get((path, c))
+            if not r or r.get("best_link_tx_mbps") is None:
+                cells.append("—")
+            else:
+                cells.append(fmt_num(r.get("best_link_tx_mbps")))
+        lines.append(f"| {path} | " + " | ".join(cells) + " |")
+
     lines.extend(
         [
             "",
             "## 明细",
             "",
-            "| path | codec | max_pass_rate | ceiling goodput | link_tx | link_rx | first_fail |",
-            "|---|---|---:|---:|---:|---:|---:|",
+            "| path | codec | max_pass_rate | goodput | wire | link_tx | link_rx | first_fail |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for r in results:
         def f(x):
             return "—" if x is None else (f"{x:.1f}" if isinstance(x, float) else str(x))
 
+        # wire at best-goodput probe is not stored separately; use max_pass_wire as proxy
+        # Prefer matching best probe wire if present on row later
+        wire = r.get("best_wire_mbps")
+        if wire is None:
+            wire = r.get("max_pass_wire_mbps")
         lines.append(
             f"| {r.get('path')} | {r.get('codec_mode')} | {f(r.get('max_pass_rate_mbps'))} | "
-            f"{f(r.get('ceiling_mbps'))} | {f(r.get('best_link_tx_mbps'))} | "
-            f"{f(r.get('best_link_rx_mbps'))} | {f(r.get('first_fail_rate_mbps'))} |"
+            f"{f(r.get('ceiling_mbps'))} | {f(wire)} | "
+            f"{f(r.get('best_link_tx_mbps'))} | {f(r.get('best_link_rx_mbps'))} | "
+            f"{f(r.get('first_fail_rate_mbps'))} |"
         )
     lines.append("")
     md_path.write_text("\n".join(lines) + "\n")
@@ -757,7 +825,8 @@ def main():
     cleanup()
     save(results, probes)
     print(f"\nDONE -> {LOCAL_JSON}", flush=True)
-    print(f"MD   -> {REPO / 'build' / 'report-data' / (NAME + '.md')}", flush=True)
+    report_subdir = "linear" if TOPO == "linear" else "vxlan"
+    print(f"MD   -> {REPO / 'build' / 'report-data' / report_subdir / (NAME + '.md')}", flush=True)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ set -euo pipefail
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 OUT=${RESULT_DIR:-"$REPO/build/linear_phase01_$(date +%Y%m%d-%H%M%S)"}
 mkdir -p "$OUT"
-REPORT="$REPO/build/report-data/linear_phase01_baseline.md"
+REPORT="$REPO/build/report-data/linear/linear_phase01_baseline.md"
 
 echo "OUT=$OUT"
 {

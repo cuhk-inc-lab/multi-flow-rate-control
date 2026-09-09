@@ -49,7 +49,7 @@ def main() -> None:
     args = ap.parse_args()
     tag = args.tag
     repo = Path(__file__).resolve().parents[2]
-    report = repo / "build" / "report-data"
+    report = repo / "build" / "report-data" / "linear"
     report.mkdir(parents=True, exist_ok=True)
 
     k = load_json(repo / "build" / f"{tag}_p3_kernel.json") or []
@@ -126,8 +126,8 @@ def main() -> None:
     lines += ["## Phase4 / Phase5 索引", ""]
     lines += [
         f"- Phase4A: `build/{tag}_phase4_multiflow_sat.json`（若存在）",
-        f"- Phase4B: `build/report-data/{tag}_phase4b_stress.md`",
-        f"- Phase5: `build/report-data/{tag}_phase5_resource_profile.md`",
+        f"- Phase4B: `build/report-data/linear/{tag}_phase4b_stress.md`",
+        f"- Phase5: `build/report-data/linear/{tag}_phase5_resource_profile.md`",
         f"- Ceil overlay: `build/{tag}_ceil_for_p4.json` / `{ceil}`",
         "",
         "## 建议对外演示口径",

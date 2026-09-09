@@ -57,8 +57,8 @@ for k in keys:
         f"| {k[0]} | {k[1]} | {None if not rb else rb.get('max_pass_rate_mbps')} | "
         f"{None if cb is None else round(cb,1)} | {None if not ra else ra.get('max_pass_rate_mbps')} | "
         f"{None if ca is None else round(ca,1)} | {d} |\n")
-Path('build/report-data/linear_relay_pool_before_after.md').write_text(''.join(lines))
-print('wrote build/report-data/linear_relay_pool_before_after.md')
+Path('build/report-data/linear/linear_relay_pool_before_after.md').write_text(''.join(lines))
+print('wrote build/report-data/linear/linear_relay_pool_before_after.md')
 PY
 
 echo "[waiter] launching commercial Phase3-5 $(date)"

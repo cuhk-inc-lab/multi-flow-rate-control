@@ -56,7 +56,7 @@ REPO = Path(__file__).resolve().parents[2]
 OUT_JSON = REPO / "build" / f"{NAME}.json"
 OUT_PROBES = REPO / "build" / f"{NAME}_probes.json"
 OUT_CSV = REPO / "build" / f"{NAME}.csv"
-OUT_MD = REPO / "build" / "report-data" / f"{NAME}.md"
+OUT_MD = REPO / "build" / "report-data" / "linear" / f"{NAME}.md"
 
 
 def is_pass(row: dict) -> bool:

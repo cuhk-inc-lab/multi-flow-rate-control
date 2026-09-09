@@ -22,7 +22,7 @@ NAME = "linear_phase3_relay_rs_pfc"
 REPO = Path("/home/scy/work/multi-flow-rate-control")
 OUT_JSON = REPO / "build" / f"{NAME}.json"
 OUT_PROBES = REPO / "build" / f"{NAME}_probes.json"
-OUT_MD = REPO / "build" / "report-data" / f"{NAME}.md"
+OUT_MD = REPO / "build" / "report-data" / "linear" / f"{NAME}.md"
 
 def is_pass(row):
     return row.get("verify") == "OK" or float(row.get("completion_pct") or 0) >= PASS_COMPLETION
