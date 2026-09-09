@@ -71,6 +71,8 @@ typedef struct RelayDeferredHubStats {
     uint64_t high_watermark;
 } RelayDeferredHubStats;
 
+typedef void (*RelayDeferredPacketFreeFn)(uint8_t *datagram, void *ctx);
+
 typedef struct RelayDeferredSlot {
     int                   in_use;
     uint32_t              wire_flow_id;
@@ -98,12 +100,17 @@ typedef struct RelayDeferredHub {
     int                    mu_inited;
     int                    cv_inited;
     RelayDeferredHubStats  stats;
+    RelayDeferredPacketFreeFn packet_free;
+    void                     *packet_free_ctx;
 } RelayDeferredHub;
 
 RelayDeferredStatus relay_deferred_hub_init(RelayDeferredHub *hub,
                                             const RelayDeferredHubConfig *cfg);
 void                relay_deferred_hub_shutdown(RelayDeferredHub *hub);
 void                relay_deferred_hub_destroy(RelayDeferredHub *hub);
+void                relay_deferred_hub_set_packet_free(RelayDeferredHub *hub,
+                                                       RelayDeferredPacketFreeFn fn,
+                                                       void *ctx);
 
 /*
  * Enqueue one owned datagram. On success ownership moves into the hub and

@@ -127,8 +127,14 @@ void egress_queue_destroy(EgressQueue *q)
     }
     if (q->slots != NULL) {
         for (i = 0; i < q->capacity; i++) {
-            free(q->slots[i].datagram);
-            q->slots[i].datagram = NULL;
+            if (q->slots[i].datagram != NULL) {
+                if (q->packet_free != NULL) {
+                    q->packet_free(q->slots[i].datagram, q->packet_free_ctx);
+                } else {
+                    free(q->slots[i].datagram);
+                }
+                q->slots[i].datagram = NULL;
+            }
         }
         free(q->slots);
         q->slots = NULL;
@@ -137,6 +143,16 @@ void egress_queue_destroy(EgressQueue *q)
     pthread_cond_destroy(&q->not_empty);
     pthread_mutex_destroy(&q->mutex);
     memset(q, 0, sizeof(*q));
+}
+
+void egress_queue_set_packet_free(EgressQueue *q, EgressPacketFreeFn fn,
+                                  void *ctx)
+{
+    if (q == NULL) {
+        return;
+    }
+    q->packet_free = fn;
+    q->packet_free_ctx = ctx;
 }
 
 void egress_queue_shutdown(EgressQueue *q)

@@ -1,0 +1,81 @@
+{
+  "nodes": {
+    "node1": {
+      "ssh": "local",
+      "ip": "10.10.12.1",
+      "monitor_ifaces": "station0"
+    },
+    "node2": {
+      "ssh": "fyp1@10.10.10.162",
+      "ip": "10.10.12.2",
+      "monitor_ifaces": "ap0 station1"
+    },
+    "node3": {
+      "ssh": "fyp1@10.10.10.163",
+      "ip": "10.10.23.2",
+      "monitor_ifaces": "ap1 station2"
+    },
+    "node4": {
+      "ssh": "fyp1@10.10.10.164",
+      "ip": "10.10.34.2",
+      "monitor_ifaces": "ap2"
+    }
+  },
+  "defaults": {
+    "idle_sec": 20,
+    "port_base": 9300,
+    "monitor": true,
+    "keep_remote_output": true,
+    "remote_repo": "/home/fyp1/work/multi-flow-rate-control"
+  },
+  "streams": [
+    {
+      "id": 0,
+      "from": "node1",
+      "to": "node4",
+      "file": "input_1m.ts",
+      "rate_mbps": 50,
+      "codec": "copy"
+    },
+    {
+      "id": 1,
+      "from": "node1",
+      "to": "node4",
+      "file": "input_10m.ts",
+      "rate_mbps": 100,
+      "codec": "copy"
+    },
+    {
+      "id": 2,
+      "from": "node2",
+      "to": "node4",
+      "file": "input_10m.ts",
+      "rate_mbps": 150,
+      "codec": "copy"
+    },
+    {
+      "id": 3,
+      "from": "node2",
+      "to": "node4",
+      "file": "input_20m.ts",
+      "rate_mbps": 200,
+      "codec": "copy"
+    },
+    {
+      "id": 4,
+      "from": "node3",
+      "to": "node4",
+      "file": "input_1m.ts",
+      "rate_mbps": 80,
+      "codec": "copy"
+    },
+    {
+      "id": 5,
+      "from": "node3",
+      "to": "node4",
+      "file": "input_10m.ts",
+      "rate_mbps": 120,
+      "codec": "copy"
+    }
+  ]
+}

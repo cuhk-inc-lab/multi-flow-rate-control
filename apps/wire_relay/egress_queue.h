@@ -13,6 +13,9 @@ typedef struct EgressPacket {
     uint64_t  enqueue_ns;    /* CLOCK_MONOTONIC nanoseconds */
 } EgressPacket;
 
+/* Optional free hook for pooled datagrams (default: free). */
+typedef void (*EgressPacketFreeFn)(uint8_t *datagram, void *ctx);
+
 typedef enum {
     EGRESS_OK = 0,
     EGRESS_ERR_INVALID = -1,
@@ -49,6 +52,8 @@ typedef struct EgressQueue {
     int                shutdown;
     EgressQueueStats   stats;
     EgressQueueWaiter *waiter;
+    EgressPacketFreeFn packet_free;
+    void              *packet_free_ctx;
 } EgressQueue;
 
 typedef struct EgressFairDequeuer {
@@ -63,6 +68,8 @@ typedef struct EgressFairDequeuer {
 EgressStatus egress_queue_init(EgressQueue *q, size_t capacity);
 void         egress_queue_destroy(EgressQueue *q);
 void         egress_queue_shutdown(EgressQueue *q);
+void         egress_queue_set_packet_free(EgressQueue *q, EgressPacketFreeFn fn,
+                                         void *ctx);
 
 /*
  * Non-blocking enqueue. On success, ownership of pkt->datagram moves into the

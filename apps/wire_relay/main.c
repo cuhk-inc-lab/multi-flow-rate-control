@@ -1,5 +1,6 @@
 #include "local_decode.h"
 #include "local_source.h"
+#include "recode.h"
 #include "relay.h"
 #include "relay_deferred.h"
 
@@ -23,6 +24,8 @@ static void print_usage(const char *prog)
             "     [--transit-hook identity|plus-minus]\n"
             "       identity: ingress copy only; plus-minus: ingress +1, egress -1\n"
             "     [--decode-reencode-stub]    (reserve Phase 3A hook; always OPAQUE)\n"
+            "     [--bats-recoder identity]   (RS generation HOLD until ready;\n"
+            "         then I×M and EMIT via decode_reencode_fn; implies cache)\n"
             "     [--local-decode --codec copy|xor-fec|rs-fec|rs|wirehair|none\n"
             "         (--output FILE | --output-dir DIR)]\n"
             "     [--source FILE --final-dst N --ttl N --codec ...\n"
@@ -149,6 +152,8 @@ int main(int argc, char **argv)
     int transit_identity = 0;
     int transit_plus_minus = 0;
     int decode_reencode_stub = 0;
+    int bats_recoder_identity = 0;
+    RelayRsBatsRecoderCtx *bats_ctx = NULL;
     CodecKind codec_kind = CODEC_KIND_COPY;
     const char *output_path = NULL;
     const char *output_dir = NULL;
@@ -472,6 +477,14 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[argi], "--decode-reencode-stub") == 0) {
             decode_reencode_stub = 1;
             argi += 1;
+        } else if (strcmp(argv[argi], "--bats-recoder") == 0) {
+            if (argi + 1 >= argc ||
+                strcmp(argv[argi + 1], "identity") != 0) {
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            bats_recoder_identity = 1;
+            argi += 2;
         } else if (strcmp(argv[argi], "--test-tx-hold-us") == 0) {
             unsigned long parsed;
 
@@ -529,6 +542,21 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (bats_recoder_identity && decode_reencode_stub) {
+        fprintf(stderr,
+                "wire-relay: --bats-recoder and --decode-reencode-stub are "
+                "mutually exclusive\n");
+        return EXIT_FAILURE;
+    }
+    if (bats_recoder_identity) {
+        process_mode = RELAY_PROCESS_CACHE;
+        bats_ctx = relay_rs_bats_recoder_ctx_create();
+        if (bats_ctx == NULL) {
+            fprintf(stderr, "wire-relay: bats recoder alloc failed\n");
+            return EXIT_FAILURE;
+        }
+    }
+
     cfg.local_node_id = local_node_id;
     wirehair_config.origin_node = local_node_id;
     if (!wirehair_segment_config_valid(&wirehair_config)) {
@@ -549,8 +577,9 @@ int main(int argc, char **argv)
         transit_plus_minus ? relay_egress_payload_sub1 : NULL;
     cfg.egress_ctx = NULL;
     cfg.decode_reencode_fn =
+        bats_recoder_identity ? relay_rs_bats_identity_decode_reencode :
         decode_reencode_stub ? relay_decode_reencode_stub : NULL;
-    cfg.decode_reencode_ctx = NULL;
+    cfg.decode_reencode_ctx = bats_recoder_identity ? bats_ctx : NULL;
     cfg.delivery_fn = NULL;
     cfg.delivery_ctx = NULL;
     cfg.local_source = NULL;
@@ -621,6 +650,25 @@ int main(int argc, char **argv)
     }
 
     st = relay_run(&cfg);
+
+    if (bats_ctx != NULL) {
+        const RsBatsRecoderStats *bst = relay_rs_bats_recoder_stats(bats_ctx);
+
+        if (bst != NULL) {
+            fprintf(stderr,
+                    "wire-relay bats-recoder: generations=%llu "
+                    "recode_body_ns=%llu mismatch=%llu hold=%llu "
+                    "emit_datagrams=%llu emit_fail=%llu\n",
+                    (unsigned long long)bst->generations_recoded,
+                    (unsigned long long)bst->recode_body_ns,
+                    (unsigned long long)bst->recode_mismatch,
+                    (unsigned long long)bst->hold_packets,
+                    (unsigned long long)bst->emit_datagrams,
+                    (unsigned long long)bst->emit_fail);
+        }
+        relay_rs_bats_recoder_ctx_destroy(bats_ctx);
+        bats_ctx = NULL;
+    }
 
     if (hub_inited) {
         LocalDecodeHubStats hub_stats_snap;

@@ -4,3 +4,11 @@ build/
 # Editor
 *.swp
 *~
+
+# Local media / scratch (not part of the repo)
+*.ts
+e2
+*.log
+__pycache__/
+*.pyc
+.Python

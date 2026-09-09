@@ -120,9 +120,9 @@ typedef struct RelayConfig {
     RelayEgressFn       egress_fn;
     void               *egress_ctx;
     /*
-     * Reserved Phase 3A generation-level decode-and-reencode hook
+     * Phase 3A generation-level decode-and-reencode hook
      * (default NULL = not called). Stub: relay_decode_reencode_stub.
-     * Non-OPAQUE actions are not implemented and fall back to opaque.
+     * HOLD/EMIT are honored when the hook is set (see recode.h).
      */
     RelayDecodeReencodeFn decode_reencode_fn;
     void                 *decode_reencode_ctx;
@@ -200,11 +200,20 @@ RelayStatus relay_run(const RelayConfig *config);
  * with the real UDP RX path does NOT preserve per-flow relative order
  * between the two sources.
  *
- * On success, copies datagram into an owned buffer then submits.
+ * On success, copies datagram into a pool/owned buffer then submits.
  */
 RelayIngressStatus relay_inject_wire_datagram(RelayCtx *ctx,
                                               const uint8_t *datagram,
                                               size_t len);
+
+/*
+ * Zero-copy inject: takes ownership of *datagram_owned (pool or malloc).
+ * On success *datagram_owned is NULL. On failure ownership remains with caller
+ * unless an internal path consumed it (then *datagram_owned is NULL).
+ */
+RelayIngressStatus relay_inject_wire_datagram_owned(RelayCtx *ctx,
+                                                    uint8_t **datagram_owned,
+                                                    size_t len);
 
 /* Exposed for unit tests: mono time helper. */
 uint64_t relay_mono_ns(void);

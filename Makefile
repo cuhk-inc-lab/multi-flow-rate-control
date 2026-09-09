@@ -121,7 +121,9 @@ RELAY_OBJS = \
 	$(OBJ_DIR)/relay_main.o \
 	$(OBJ_DIR)/relay_relay.o \
 	$(OBJ_DIR)/relay_recode.o \
+	$(OBJ_DIR)/relay_rs_bats_recoder.o \
 	$(OBJ_DIR)/relay_egress_queue.o \
+	$(OBJ_DIR)/relay_datagram_pool.o \
 	$(OBJ_DIR)/relay_deferred.o \
 	$(OBJ_DIR)/relay_generation_cache.o \
 	$(OBJ_DIR)/relay_local_decode.o \
@@ -130,7 +132,9 @@ RELAY_OBJS = \
 RELAY_CORE_OBJS = \
 	$(OBJ_DIR)/relay_relay.o \
 	$(OBJ_DIR)/relay_recode.o \
+	$(OBJ_DIR)/relay_rs_bats_recoder.o \
 	$(OBJ_DIR)/relay_egress_queue.o \
+	$(OBJ_DIR)/relay_datagram_pool.o \
 	$(OBJ_DIR)/relay_deferred.o \
 	$(OBJ_DIR)/relay_generation_cache.o
 
@@ -156,6 +160,7 @@ RELAY_EGRESS_QUEUE_TEST_BIN = $(OBJ_DIR)/relay_egress_queue_tests
 RELAY_DEFERRED_TEST_BIN = $(OBJ_DIR)/relay_deferred_tests
 RELAY_LOCAL_DECODE_TEST_BIN = $(OBJ_DIR)/relay_local_decode_tests
 RELAY_LOCAL_SOURCE_TEST_BIN = $(OBJ_DIR)/relay_local_source_tests
+RS_BATS_RECODER_TEST_BIN = $(OBJ_DIR)/rs_bats_recoder_tests
 WIRE_UDP_RECV_DEMUX_TEST_BIN = $(OBJ_DIR)/wire_udp_recv_demux_tests
 WIRE_FLOW_DECODER_RS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_rs_tests
 WIRE_FLOW_DECODER_SYS_TEST_BIN = $(OBJ_DIR)/wire_flow_decoder_systematic_tests
@@ -179,7 +184,8 @@ $(OBJ_DIR)/relay_relay_inline.o: $(RELAY_DIR)/relay.c $(INCLUDE_HDRS) $(RELAY_HD
 	$(CC) $(CFLAGS) -DRELAY_TEST_INLINE_RX=1 -I$(RELAY_DIR) -I$(WG_DIR) -c $< -o $@
 
 $(OBJ_DIR)/wire_relay_hol_baseline: $(OBJ_DIR)/relay_main.o $(OBJ_DIR)/relay_relay_inline.o \
-	$(OBJ_DIR)/relay_recode.o $(OBJ_DIR)/relay_egress_queue.o $(OBJ_DIR)/relay_deferred.o \
+	$(OBJ_DIR)/relay_recode.o $(OBJ_DIR)/relay_egress_queue.o $(OBJ_DIR)/relay_datagram_pool.o \
+	$(OBJ_DIR)/relay_deferred.o \
 	$(OBJ_DIR)/relay_generation_cache.o $(OBJ_DIR)/relay_local_decode.o \
 	$(OBJ_DIR)/relay_local_source.o \
 	$(OBJ_DIR)/wire_header.o $(RELAY_DECODE_OBJS) | $(OBJ_DIR)
@@ -204,6 +210,7 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 	$(RELAY_DEFERRED_TEST_BIN) \
 	$(RELAY_LOCAL_DECODE_TEST_BIN) \
 	$(RELAY_LOCAL_SOURCE_TEST_BIN) \
+	$(RS_BATS_RECODER_TEST_BIN) \
 	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN) \
 	$(WIRE_FLOW_DECODER_SYS_TEST_BIN) $(WIRE_FLOW_DECODER_REORDER_TEST_BIN) \
 	$(RS_ENCODE_FAST_TEST_BIN) \
@@ -217,6 +224,7 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 	./$(RELAY_DEFERRED_TEST_BIN)
 	./$(RELAY_LOCAL_DECODE_TEST_BIN)
 	./$(RELAY_LOCAL_SOURCE_TEST_BIN)
+	./$(RS_BATS_RECODER_TEST_BIN)
 	./$(WIRE_UDP_RECV_DEMUX_TEST_BIN)
 	./$(WIRE_FLOW_DECODER_RS_TEST_BIN)
 	./$(WIRE_FLOW_DECODER_SYS_TEST_BIN)
@@ -229,7 +237,7 @@ test check: $(TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) $(RELAY_EGRESS_QUEUE_TEST_BI
 
 integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(RELAY_GEN_CACHE_TEST_BIN) \
 	$(RELAY_EGRESS_QUEUE_TEST_BIN) $(RELAY_DEFERRED_TEST_BIN) $(RELAY_LOCAL_DECODE_TEST_BIN) \
-	$(RELAY_LOCAL_SOURCE_TEST_BIN) \
+	$(RELAY_LOCAL_SOURCE_TEST_BIN) $(RS_BATS_RECODER_TEST_BIN) \
 	$(WIRE_UDP_RECV_DEMUX_TEST_BIN) $(WIRE_FLOW_DECODER_RS_TEST_BIN) \
 	$(WIRE_FLOW_DECODER_SYS_TEST_BIN) $(WIRE_FLOW_DECODER_REORDER_TEST_BIN) \
 	$(RS_ENCODE_FAST_TEST_BIN) \
@@ -248,6 +256,7 @@ integration-test wg-demo-test: $(WG_BIN) $(RELAY_BIN) $(WG_CODEC_TEST_BIN) $(REL
 	./$(RELAY_DEFERRED_TEST_BIN)
 	./$(RELAY_LOCAL_DECODE_TEST_BIN)
 	./$(RELAY_LOCAL_SOURCE_TEST_BIN)
+	./$(RS_BATS_RECODER_TEST_BIN)
 	./$(WIRE_UDP_RECV_DEMUX_TEST_BIN)
 	./$(WIRE_FLOW_DECODER_RS_TEST_BIN)
 	./$(WIRE_FLOW_DECODER_SYS_TEST_BIN)
@@ -375,6 +384,16 @@ $(RELAY_LOCAL_SOURCE_TEST_BIN): $(TEST_DIR)/relay_local_source_tests.c \
 		$(TEST_DIR)/relay_local_source_tests.c \
 		$(RELAY_LIB_OBJS) $(OBJ_DIR)/wire_header.o $(RELAY_DECODE_OBJS) \
 		-o $@ $(LDFLAGS) $(RS_LDFLAGS)
+
+$(RS_BATS_RECODER_TEST_BIN): $(TEST_DIR)/rs_bats_recoder_tests.c \
+	$(OBJ_DIR)/relay_rs_bats_recoder.o $(OBJ_DIR)/relay_generation_cache.o \
+	$(OBJ_DIR)/wire_header.o | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -I$(RELAY_DIR) -I$(WG_DIR) \
+		$(TEST_DIR)/rs_bats_recoder_tests.c \
+		$(OBJ_DIR)/relay_rs_bats_recoder.o \
+		$(OBJ_DIR)/relay_generation_cache.o \
+		$(OBJ_DIR)/wire_header.o \
+		-o $@ $(LDFLAGS)
 
 $(WIRE_UDP_RECV_DEMUX_TEST_BIN): $(TEST_DIR)/wire_udp_recv_demux_tests.c \
 	$(OBJ_DIR)/wg_wire_udp.o $(OBJ_DIR)/wg_wire_flow_decoder.o \

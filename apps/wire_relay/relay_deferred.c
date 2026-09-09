@@ -14,7 +14,7 @@ static void packet_clear(RelayDeferredPacket *pkt)
     pkt->enqueue_ns = 0;
 }
 
-static void free_slot_ring(RelayDeferredSlot *slot)
+static void free_slot_ring(RelayDeferredHub *hub, RelayDeferredSlot *slot)
 {
     size_t i;
 
@@ -22,7 +22,13 @@ static void free_slot_ring(RelayDeferredSlot *slot)
         return;
     }
     for (i = 0; i < slot->capacity; i++) {
-        free(slot->ring[i].datagram);
+        if (slot->ring[i].datagram != NULL) {
+            if (hub != NULL && hub->packet_free != NULL) {
+                hub->packet_free(slot->ring[i].datagram, hub->packet_free_ctx);
+            } else {
+                free(slot->ring[i].datagram);
+            }
+        }
         packet_clear(&slot->ring[i]);
     }
     free(slot->ring);
@@ -152,7 +158,7 @@ RelayDeferredStatus relay_deferred_hub_init(RelayDeferredHub *hub,
             uint32_t j;
 
             for (j = 0; j < i; j++) {
-                free_slot_ring(&hub->slots[j]);
+                free_slot_ring(hub, &hub->slots[j]);
             }
             free(hub->slots);
             hub->slots = NULL;
@@ -163,7 +169,7 @@ RelayDeferredStatus relay_deferred_hub_init(RelayDeferredHub *hub,
 
     if (pthread_mutex_init(&hub->mu, NULL) != 0) {
         for (i = 0; i < cfg->max_active_flows; i++) {
-            free_slot_ring(&hub->slots[i]);
+            free_slot_ring(hub, &hub->slots[i]);
         }
         free(hub->slots);
         hub->slots = NULL;
@@ -175,7 +181,7 @@ RelayDeferredStatus relay_deferred_hub_init(RelayDeferredHub *hub,
         pthread_mutex_destroy(&hub->mu);
         hub->mu_inited = 0;
         for (i = 0; i < cfg->max_active_flows; i++) {
-            free_slot_ring(&hub->slots[i]);
+            free_slot_ring(hub, &hub->slots[i]);
         }
         free(hub->slots);
         hub->slots = NULL;
@@ -213,7 +219,7 @@ void relay_deferred_hub_destroy(RelayDeferredHub *hub)
 
     if (hub->slots != NULL) {
         for (i = 0; i < hub->config.max_active_flows; i++) {
-            free_slot_ring(&hub->slots[i]);
+            free_slot_ring(hub, &hub->slots[i]);
             hub->slots[i].in_use = 0;
         }
         free(hub->slots);
@@ -231,6 +237,18 @@ void relay_deferred_hub_destroy(RelayDeferredHub *hub)
         hub->mu_inited = 0;
     }
 }
+
+void relay_deferred_hub_set_packet_free(RelayDeferredHub *hub,
+                                        RelayDeferredPacketFreeFn fn,
+                                        void *ctx)
+{
+    if (hub == NULL) {
+        return;
+    }
+    hub->packet_free = fn;
+    hub->packet_free_ctx = ctx;
+}
+
 
 RelayDeferredStatus relay_deferred_hub_try_push(RelayDeferredHub *hub,
                                                 RelayDeferredPacket *pkt)

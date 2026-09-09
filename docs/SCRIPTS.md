@@ -21,8 +21,11 @@ it, and the most common command forms.
 | `scripts/run_wire_multiflow_matrix.sh` | Multi-flow codec×rate matrix with per-flow checks | Validate concurrent flow behavior and relay load |
 | `scripts/run_wire_stress.sh` | Configurable multi-stream stress (YAML/JSON) | Custom from/to/file/rate/codec mixes across nodes |
 | `scripts/vm_wirehair_full_matrix.py` | Wirehair VM matrix: direct/relay × ACK × 1/2/4 flows × rates | ACK throughput/regression on Node1→Node2/Node3 |
+| `scripts/run_rs_compute_penalty.sh` | RS encode/recover CPU penalty experiments | See `docs/rs_compute_penalty_benchmark.md` |
+| `scripts/run_ffrs_resource_matrix.sh` | FFRS-style resource matrix runner | Lab CPU/NIC sampling with monitors |
 | `scripts/encode_multibitrate.sh` | Generate `input_1m.ts` / `input_10m.ts` / `input_20m.ts` | Prepare demo sources |
 | `scripts/run_dual_fifo.sh` | Live 3-stream FIFO demo with ffplay windows | Visual local demo of multi-flow processing |
+| `scripts/local/` | Linear-bridge lab topo + phase0–5 VM runners | Local topology; see `scripts/local/LINEAR_BRIDGE_HOPS.md` |
 
 Helper (kept for multiflow / stress relay NIC sampling):
 
@@ -31,6 +34,8 @@ Helper (kept for multiflow / stress relay NIC sampling):
 | `scripts/iperf_like_monitor.py` | Sample NIC/CPU timeseries; used by multiflow matrix and stress |
 | `scripts/wire_stress_run.py` | Orchestrator behind `run_wire_stress.sh` |
 | `scripts/wire_stress_charts.py` | SVG CPU/RX/TX charts from stress `monitor/*.csv` |
+| `scripts/parse_rs_compute_penalty.py` | Parse RS compute-penalty run outputs |
+| `scripts/proc_resource_monitor.py` | Process CPU/RSS sampler used by resource matrices |
 
 ## Script Details
 

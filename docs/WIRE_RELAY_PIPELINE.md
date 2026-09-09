@@ -3,7 +3,8 @@
 Application-layer **per-node** program for wire headers **v3 and v4**
 (`final_dst` + `ttl`). Binary: `apps/wire_relay/` → `build/wire_relay`.
 Each node runs this one binary: local encode, destination check, optional
-decode, and opaque forward. Mid-hop recode / decode-reencode are reserved.
+decode, opaque forward, and optional generation-level BATS identity recode
+(`--bats-recoder identity`).
 
 Wire v3 has **no independent coding vector** — only
 `type` / `shard_index` / `shard_count` / `valid_len` (plus routing fields).
@@ -47,7 +48,7 @@ Embedding the same Wirehair+ACK path without sockets:
 
 ## Unified per-node pipeline
 
-Target structure (encode / decode / forward implemented; mid-hop transform reserved):
+Target structure (encode / decode / forward / BATS identity recode):
 
 ```text
 UDP in
@@ -55,9 +56,9 @@ UDP in
   → final_dst == local_node_id?
         yes → delivery_fn (LocalDecodeHub → file); no TTL-- / egress
         no  → TTL--
-            → [optional] recode_fn            # ingress; NULL = opaque
-            → [optional] decode_reencode_fn   # Phase 3A reserved; stub=OPAQUE
-            → [--process cache] observe
+            → [optional] recode_fn            # per-datagram; NULL = skip
+            → [--process cache] GenerationCache
+            → [optional] decode_reencode_fn   # HOLD / EMIT / OPAQUE
             → ACK/Data EgressQueues → fair TX → [optional] egress_fn
               → sendto(next-hop or learned return route)
 
@@ -65,6 +66,14 @@ Local file / FIFO (--source)
   → encode → fill final_dst/ttl → relay_inject_wire_datagram
   → same Destination Check / transit / egress as UDP in
 ```
+
+`decode_reencode_fn` actions (honored by the relay):
+
+| Action | Meaning |
+|--------|---------|
+| `OPAQUE` | Forward the live datagram (default / stub) |
+| `HOLD` | Do not forward the live datagram (wait for a full generation) |
+| `EMIT` | Do not forward the live datagram; enqueue replacements from `emit_fn` |
 
 Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
 
@@ -80,8 +89,8 @@ Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
 | **L1** | Explicit-hop relay local-destination decode (`--output FILE`) | **Implemented** |
 | **L2** | Multi-flow local decode (`--output-dir DIR`) | **Implemented** |
 | **S0** | Local file/FIFO source encode → inject (`--source`) | **Implemented** |
-| **3A** | Decode-and-reencode relay (recover source, re-run current FEC encoder) | **Interface reserved** (`decode_reencode_fn`; stub OPAQUE) |
-| **3B** | True network recode | Future — requires new wire version |
+| **3A** | Generation-level mid-hop transform via `decode_reencode_fn` | **Partial**: HOLD/EMIT wired; `--bats-recoder identity` implemented; RS recover+reencode still reserved |
+| **3B** | True network recode with coding vectors | Future — requires new wire version |
 
 ### Local destination decode (L1 / L2)
 
@@ -218,12 +227,18 @@ default policy is **still forward** the current packet without caching
 
 ### Phase 3A vs 3B
 
-- **3A — decode-and-reencode:** After collecting enough recoverable shards,
-  decode source, re-run the existing FEC encoder. Possible on wire v3.
-  Hook: `RelayDecodeReencodeFn` / `--decode-reencode-stub` (always OPAQUE today).
-- **3B — true network recode:** Needs a future wire version with coding vectors.
-  Do not overload `recode_fn` / `decode_reencode_fn` for 3B.
-- Per-datagram optional transforms today: `--transit-hook identity` copies at
+- **3A — generation-level mid-hop:** Hook `RelayDecodeReencodeFn`. The stub
+  (`--decode-reencode-stub`) still returns OPAQUE. `--bats-recoder identity`
+  installs a real implementation: HOLD until an RS generation is `GEN_READY`,
+  left-multiply payload rows by an \(n \times n\) identity in GF(256) using
+  square \(n \times n\) blocks (right-pad the last block with zeros), then EMIT
+  the \(n\) replacement datagrams. Implies `--process cache`. Files:
+  `rs_bats_recoder.c`, `recode.c`. Full RS decode-and-reencode (recover source,
+  re-run encoder) remains reserved.
+- **3B — true network recode:** Needs a future wire version with coding
+  vectors. Do not overload `recode_fn` for 3B; keep generation work on
+  `decode_reencode_fn`.
+- Per-datagram optional transforms: `--transit-hook identity` copies at
   ingress; `--transit-hook plus-minus` applies DATA payload `+1` at ingress and
   `-1` after egress dequeue. Headers and END datagrams are unchanged.
 
@@ -236,9 +251,11 @@ default policy is **still forward** the current packet without caching
 `relay_inject_wire_datagram()` accepts an **already encoded** wire v3
 datagram only. Raw local data → encoder is `local_source_run` / `--source`.
 
-### 2. No arbitrary network recode on wire v3
+### 2. Network recode on wire v3
 
-See Phase 3A / 3B.
+True coding-vector network recode (Phase 3B) needs a future wire version.
+Generation-level identity BATS on v3 RS shards is supported via
+`--bats-recoder identity` (see Phase 3A).
 
 ### 3. TTL consistency: bytes are source of truth
 

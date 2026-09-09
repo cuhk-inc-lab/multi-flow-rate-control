@@ -1,0 +1,25 @@
+{
+  "nodes": {
+    "node1": {"ssh": "local", "ip": "10.20.20.1", "monitor_ifaces": "enp6s19"},
+    "node2": {"ssh": "fyp1@10.10.10.162", "ip": "10.20.20.2", "monitor_ifaces": "enp6s19 enp6s20"},
+    "node3": {"ssh": "fyp1@10.10.10.163", "ip": "10.30.30.2", "monitor_ifaces": "enp6s20 enp6s21"},
+    "node4": {"ssh": "fyp1@10.10.10.164", "ip": "10.40.40.2", "monitor_ifaces": "enp6s21"}
+  },
+  "defaults": {
+    "idle_sec": 25,
+    "port_base": 9400,
+    "monitor": true,
+    "keep_remote_output": true,
+    "remote_repo": "/home/fyp1/work/multi-flow-rate-control",
+    "wg_recv_extra": ["--wh-segment-mib=2", "--wh-window=8", "--wh-ack", "--local-node-id", "4"],
+    "wg_send_extra": ["--wh-segment-mib=2", "--wh-window=8", "--wh-ack", "--final-dst", "4", "--ttl", "8"]
+  },
+  "streams": [
+    {"id": 0, "from": "node1", "to": "node4", "file": "input_10m.ts", "rate_mbps": 120, "codec": "wirehair"},
+    {"id": 1, "from": "node2", "to": "node4", "file": "input_10m.ts", "rate_mbps": 80, "codec": "wirehair"},
+    {"id": 0, "from": "node1", "to": "node2", "file": "input_1m.ts", "rate_mbps": 60, "codec": "wirehair"},
+    {"id": 0, "from": "node1", "to": "node3", "file": "input_1m.ts", "rate_mbps": 60, "codec": "wirehair"},
+    {"id": 1, "from": "node2", "to": "node3", "file": "input_1m.ts", "rate_mbps": 40, "codec": "wirehair"},
+    {"id": 2, "from": "node1", "to": "node4", "file": "input_1m.ts", "rate_mbps": 40, "codec": "wirehair"}
+  ]
+}

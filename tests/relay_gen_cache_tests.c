@@ -1,5 +1,6 @@
 #include "egress_queue.h"
 #include "generation_cache.h"
+#include "recode.h"
 #include "relay.h"
 #include "wire_header.h"
 
@@ -1104,6 +1105,72 @@ static void test_local_packets_still_bypass_generation_cache(void)
     pthread_cond_destroy(&cap.cv);
 }
 
+static void test_bats_identity_hold_emit(void)
+{
+    RelayCtx *ctx = NULL;
+    TxCapture cap;
+    RelayConfig cfg = harness_cfg(RELAY_PROCESS_CACHE, 64);
+    RelayRsBatsRecoderCtx *bats = NULL;
+    uint8_t buf[WIRE_HEADER_SIZE + 16];
+    size_t len;
+    uint16_t shard;
+    const RelayFlowStats *tot;
+    int i;
+
+    bats = relay_rs_bats_recoder_ctx_create();
+    EXPECT(bats != NULL);
+    cfg.decode_reencode_fn = relay_rs_bats_identity_decode_reencode;
+    cfg.decode_reencode_ctx = bats;
+
+    memset(&cap, 0, sizeof(cap));
+    pthread_mutex_init(&cap.mu, NULL);
+    pthread_cond_init(&cap.cv, NULL);
+    EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
+
+    /* Inject 5 of 6 shards: should HOLD (no TX yet). */
+    for (shard = 0; shard < 5; shard++) {
+        len = make_data_datagram(buf, sizeof(buf), 3, 77, shard, 6, 4, 8, 16,
+                                 16, (uint8_t)(0xA0u + shard));
+        EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
+    }
+    usleep(20000);
+    EXPECT(cap.count == 0);
+    EXPECT(relay_rs_bats_recoder_stats(bats)->hold_packets >= 5);
+
+    /* Completing shard → EMIT all 6. */
+    len = make_data_datagram(buf, sizeof(buf), 3, 77, 5, 6, 4, 8, 16, 16, 0xA5);
+    EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
+    wait_forwarded(ctx, 6, 500);
+
+    tot = relay_total_stats(ctx);
+    EXPECT(tot != NULL);
+    EXPECT(tot->forward == 6);
+    EXPECT(cap.count == 6);
+    EXPECT(relay_rs_bats_recoder_stats(bats)->generations_recoded == 1);
+    EXPECT(relay_rs_bats_recoder_stats(bats)->emit_datagrams == 6);
+    EXPECT(relay_rs_bats_recoder_stats(bats)->recode_mismatch == 0);
+
+    /* Payloads preserved (identity). */
+    for (i = 0; i < 6; i++) {
+        WireHeader h;
+        EXPECT(wire_header_decode(&h, cap.packets[i], cap.lens[i]) == 0);
+        EXPECT(h.shard_index < 6);
+        EXPECT(cap.packets[i][WIRE_HEADER_SIZE] ==
+               (uint8_t)(0xA0u + h.shard_index));
+    }
+
+    /* Duplicate after emit stays HOLD (no extra TX). */
+    len = make_data_datagram(buf, sizeof(buf), 3, 77, 0, 6, 4, 8, 16, 16, 0xFF);
+    EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
+    usleep(20000);
+    EXPECT(cap.count == 6);
+
+    relay_harness_close(ctx);
+    relay_rs_bats_recoder_ctx_destroy(bats);
+    pthread_mutex_destroy(&cap.mu);
+    pthread_cond_destroy(&cap.cv);
+}
+
 int main(void)
 {
     test_key_isolation_flow();
@@ -1127,6 +1194,7 @@ int main(void)
     test_cache_flow_id_zero_and_uint32_max_are_distinct();
     test_cache_repeated_evictions_keep_accounts_consistent();
     test_local_packets_still_bypass_generation_cache();
+    test_bats_identity_hold_emit();
 
     if (g_failures != 0) {
         fprintf(stderr, "relay_gen_cache_tests: %d failure(s)\n", g_failures);

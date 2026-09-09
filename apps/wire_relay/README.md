@@ -21,8 +21,9 @@ UDP in
         yes → [--local-decode] LocalDecodeHub / WireFlowDecoder → file
         no  → TTL--
             → [--transit-hook identity|plus-minus] ingress transform
-            → [--decode-reencode-stub] Phase 3A reserved (OPAQUE)
-            → [--process cache] GenerationCache observe
+            → [--process cache] GenerationCache
+            → [--bats-recoder identity] HOLD until GEN_READY, I×M, EMIT
+              (or [--decode-reencode-stub] always OPAQUE)
             → ACK/Data EgressQueues → fair TX
               → [plus-minus: payload -1] → sendto(next-hop/return route)
 
@@ -31,12 +32,15 @@ Local file/FIFO
 ```
 
 - Default mid-hop path is **opaque forward**.
+- `--bats-recoder identity`: wait for a full RS generation, left-multiply
+  payloads by an identity matrix (square \(n\times n\) blocks + padding), EMIT
+  replacements; implies `--process cache`.
 - `plus-minus` applies `+1` to each DATA payload byte before enqueue and `-1`
   after dequeue. Headers and END datagrams are unchanged.
 - Locality is only `wire_header_is_local` / `final_dst` (never UDP/IP dst).
 - `relay_inject_wire_datagram()` accepts already-encoded wire v3 datagrams;
   `--source` is the raw file/FIFO → encoder path.
-- `--process cache`: observe/store only; still opaque-forward.
+- `--process cache`: observe/store; with bats, also the batch boundary for EMIT.
 - See [`docs/WIRE_RELAY_PIPELINE.md`](../../docs/WIRE_RELAY_PIPELINE.md).
 
 ### `--local-decode`
@@ -108,6 +112,7 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--max-cache-bytes` | Cache memory cap (default 32MiB) |
 | `--transit-hook identity` | Copy each ingress datagram through `recode_fn` |
 | `--transit-hook plus-minus` | DATA payload ingress `+1`, egress `-1`; END/header unchanged |
+| `--bats-recoder identity` | RS generation HOLD → identity block matmul → EMIT (implies cache) |
 | `--decode-reencode-stub` | Install Phase 3A stub (always OPAQUE) |
 | `--local-decode` | Enable local-destination decode |
 | `--source FILE` | Local file/FIFO encode → inject |
@@ -164,7 +169,9 @@ mkdir -p /tmp/wire_out
 
 ## Four-VM linear path
 
-Same binary on every node. Mid-hop stays opaque forward until Phase 3A/3B.
+Same binary on every node. Opaque forward by default; optional
+`--bats-recoder identity` for generation-level identity recode. Full RS
+decode-reencode and coding-vector network recode (Phase 3B) remain future work.
 
 ```text
 VM1 --source  →  VM2 forward  →  VM3 forward  →  VM4 --local-decode

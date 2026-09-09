@@ -2,6 +2,7 @@
 #define WIRE_RELAY_RECODE_H
 
 #include "generation_cache.h"
+#include "rs_bats_recoder.h"
 #include "wire_header.h"
 
 #include <stddef.h>
@@ -46,13 +47,13 @@ typedef enum {
     /* Keep current datagram on the opaque forward path. */
     RELAY_DECODE_REENCODE_OPAQUE = 0,
     /*
-     * Future: suppress forwarding this packet and wait for a replacement
-     * generation emit. Not implemented — treated as OPAQUE today.
+     * Suppress forwarding this packet (e.g. wait for a full generation).
+     * Caller frees the live datagram; cache may still hold a copy.
      */
     RELAY_DECODE_REENCODE_HOLD = 1,
     /*
-     * Future: replacement datagrams were emitted via the emit callback.
-     * Not implemented — treated as OPAQUE today.
+     * Replacement datagrams were passed to emit_fn. Suppress forwarding the
+     * live datagram; caller enqueues emitted packets outside ingress_mu.
      */
     RELAY_DECODE_REENCODE_EMIT = 2
 } RelayDecodeReencodeAction;
@@ -65,13 +66,48 @@ typedef int (*RelayDecodeReencodeEmitFn)(const uint8_t *datagram, size_t len,
                                          void *emit_ctx);
 
 /*
- * Reserved Phase 3A hook. Called (when non-NULL) after GenerationCache
- * insert on DATA, with gen possibly NULL on admission failure.
+ * Phase 3A generation-level hook. Called (when non-NULL) after
+ * GenerationCache insert on DATA, with gen possibly NULL on admission failure.
  *
- * Contract today: implementations must return RELAY_DECODE_REENCODE_OPAQUE
- * and must not rely on emit_fn. Stub: relay_decode_reencode_stub.
+ * When emit_fn is non-NULL, HOLD/EMIT are honored by the relay:
+ *   HOLD — do not forward the live datagram
+ *   EMIT — emit_fn copies were queued; do not forward the live datagram
+ * Stub always returns OPAQUE: relay_decode_reencode_stub.
  */
 typedef RelayDecodeReencodeAction (*RelayDecodeReencodeFn)(
+    const WireHeader *hdr,
+    const uint8_t *datagram,
+    size_t len,
+    GenerationEntry *gen,
+    GenerationInsertStatus insert_status,
+    RelayDecodeReencodeEmitFn emit_fn,
+    void *emit_ctx,
+    void *ctx);
+
+#define RS_BATS_EMITTED_RING 64u
+
+typedef struct RelayRsBatsEmittedKey {
+    uint32_t flow_id;
+    uint64_t block_id;
+    int      valid;
+} RelayRsBatsEmittedKey;
+
+typedef struct RelayRsBatsRecoderCtx {
+    RsBatsRecoderStats    stats;
+    RelayRsBatsEmittedKey emitted[RS_BATS_EMITTED_RING];
+    size_t                emitted_next;
+} RelayRsBatsRecoderCtx;
+
+RelayRsBatsRecoderCtx *relay_rs_bats_recoder_ctx_create(void);
+void relay_rs_bats_recoder_ctx_destroy(RelayRsBatsRecoderCtx *ctx);
+const RsBatsRecoderStats *relay_rs_bats_recoder_stats(
+    const RelayRsBatsRecoderCtx *ctx);
+
+/*
+ * Identity-matrix BATS via decode_reencode_fn:
+ *   collecting → HOLD; GEN_READY → I×M + emit_fn × n → EMIT.
+ */
+RelayDecodeReencodeAction relay_rs_bats_identity_decode_reencode(
     const WireHeader *hdr,
     const uint8_t *datagram,
     size_t len,

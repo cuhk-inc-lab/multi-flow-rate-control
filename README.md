@@ -132,8 +132,8 @@ make clean
 Wire UDP uses header **v3** (`include/wire_header.h`): 44-byte header with
 `final_dst` + `ttl` in the former reserved bytes. Each node runs one
 `wire_relay`: local file/FIFO encode, destination check, optional decode,
-opaque forward (recode / decode-reencode hooks reserved). Application-layer
-multi-hop:
+opaque forward, optional `--bats-recoder identity` (generation-level identity
+matrix recode). Application-layer multi-hop:
 
 ```text
 VM1 --source  →  VM2 forward  →  VM3 forward  →  VM4 --local-decode
