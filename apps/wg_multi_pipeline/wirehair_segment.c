@@ -6,8 +6,10 @@
 
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef enum WirehairSegmentSlotState {
     WH_SEG_SLOT_EMPTY = 0,
@@ -41,13 +43,28 @@ struct WirehairSegmentReceiver {
     void *output_ctx;
     WirehairSegmentAckEmitFn ack_fn;
     void *ack_ctx;
+    WirehairSegmentRecvStats stats;
+    atomic_uint_fast64_t recovered_ids[WH_SEGMENT_WINDOW_MAX];
+    atomic_uint_fast8_t recovered_valid[WH_SEGMENT_WINDOW_MAX];
     WirehairSegmentSlot slots[WH_SEGMENT_WINDOW_MAX];
 };
+
+static uint64_t wh_mono_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
 
 struct WirehairSegmentTx {
     WirehairSegmentConfig config;
     WirehairCodec encoder;
+    const uint8_t *message;
     uint8_t *padded;
+    uint32_t codec_bytes;
     uint32_t flow_id;
     uint64_t segment_id;
     uint8_t final_dst;
@@ -132,6 +149,23 @@ uint32_t wirehair_segment_ack_repair_round_packets(uint32_t source_packets)
                                            WH_ACK_REPAIR_ROUND_PCT);
 }
 
+unsigned wirehair_segment_ack_repair_delay_ms(unsigned srtt_ms)
+{
+    unsigned delay;
+
+    if (srtt_ms == 0u) {
+        return WH_ACK_INITIAL_WAIT_MS;
+    }
+    delay = srtt_ms * WH_ACK_SRTT_MULT;
+    if (delay < WH_ACK_WAIT_MIN_MS) {
+        delay = WH_ACK_WAIT_MIN_MS;
+    }
+    if (delay > WH_ACK_WAIT_MAX_MS) {
+        delay = WH_ACK_WAIT_MAX_MS;
+    }
+    return delay;
+}
+
 uint32_t wirehair_segment_repair_ceiling(uint32_t source_packets,
                                           uint8_t repair_percent,
                                           bool ack_enabled)
@@ -165,7 +199,70 @@ int wirehair_segment_config_valid(const WirehairSegmentConfig *config)
            source_packets + repair_packets <= UINT16_MAX;
 }
 
-static int emit_one_packet(WirehairCodec encoder,
+static int ensure_wirehair_encoder(WirehairCodec *encoder,
+                                   const uint8_t *message,
+                                   uint32_t codec_bytes,
+                                   WirehairSegmentSendStats *stats)
+{
+    uint64_t encode_started;
+
+    if (encoder == NULL) {
+        return -1;
+    }
+    if (*encoder != NULL) {
+        return 0;
+    }
+    if (message == NULL || codec_bytes == 0) {
+        return -1;
+    }
+    encode_started = wh_mono_ns();
+    *encoder = wirehair_encoder_create(NULL, message, codec_bytes,
+                                       WH_PACKET_SIZE);
+    if (stats != NULL) {
+        stats->encode_create_ns += wh_mono_ns() - encode_started;
+    }
+    return *encoder == NULL ? -1 : 0;
+}
+
+static int fill_packet_payload(WirehairCodec encoder, const uint8_t *message,
+                               uint32_t codec_bytes, uint32_t packet_id,
+                               uint32_t source_packets, uint8_t *payload,
+                               uint32_t *written,
+                               WirehairSegmentSendStats *stats)
+{
+    uint64_t encode_started = wh_mono_ns();
+
+    if (packet_id < source_packets) {
+        uint64_t offset = (uint64_t)packet_id * WH_PACKET_SIZE;
+        uint32_t remaining;
+
+        if (message == NULL || offset >= codec_bytes) {
+            return -1;
+        }
+        remaining = codec_bytes - (uint32_t)offset;
+        *written = remaining < WH_PACKET_SIZE ? remaining : WH_PACKET_SIZE;
+        memcpy(payload, message + offset, *written);
+    } else {
+        WirehairResult encode_result;
+
+        if (encoder == NULL) {
+            return -1;
+        }
+        encode_result = wirehair_encode(encoder, packet_id, payload,
+                                        WH_PACKET_SIZE, written);
+        if (encode_result != Wirehair_Success || *written == 0 ||
+            *written > WH_PACKET_SIZE) {
+            return -1;
+        }
+    }
+    if (stats != NULL) {
+        stats->encode_ns += wh_mono_ns() - encode_started;
+    }
+    return 0;
+}
+
+static int emit_one_packet(WirehairCodec encoder, const uint8_t *message,
+                           uint32_t codec_bytes,
                            const WirehairSegmentConfig *config,
                            uint32_t flow_id, uint64_t segment_id,
                            uint8_t final_dst, uint8_t ttl,
@@ -176,14 +273,10 @@ static int emit_one_packet(WirehairCodec encoder,
 {
     uint8_t payload[WH_PACKET_SIZE];
     uint32_t written = 0;
-    WirehairResult encode_result;
     WireHeader header;
 
-    memset(payload, 0, sizeof(payload));
-    encode_result = wirehair_encode(encoder, packet_id, payload,
-                                    sizeof(payload), &written);
-    if (encode_result != Wirehair_Success || written == 0 ||
-        written > sizeof(payload)) {
+    if (fill_packet_payload(encoder, message, codec_bytes, packet_id,
+                            source_packets, payload, &written, stats) != 0) {
         return -1;
     }
     header = (WireHeader){
@@ -216,7 +309,6 @@ WirehairSegmentTx *wirehair_segment_tx_create(
     const uint8_t *data, size_t data_len)
 {
     WirehairSegmentTx *tx;
-    const uint8_t *message = data;
     uint32_t codec_bytes;
     uint32_t repair_ceiling;
 
@@ -254,14 +346,11 @@ WirehairSegmentTx *wirehair_segment_tx_create(
             return NULL;
         }
         memcpy(tx->padded, data, data_len);
-        message = tx->padded;
+        tx->message = tx->padded;
+    } else {
+        tx->message = data;
     }
-    tx->encoder = wirehair_encoder_create(NULL, message, codec_bytes,
-                                           WH_PACKET_SIZE);
-    if (tx->encoder == NULL) {
-        wirehair_segment_tx_destroy(tx);
-        return NULL;
-    }
+    tx->codec_bytes = codec_bytes;
     return tx;
 }
 
@@ -289,11 +378,16 @@ static int wirehair_segment_tx_emit_range(
         end_packet_id = tx->packet_limit;
     }
     while (tx->next_packet_id < end_packet_id) {
+        if (tx->next_packet_id >= tx->stats.source_packets &&
+            ensure_wirehair_encoder(&tx->encoder, tx->message, tx->codec_bytes,
+                                    &tx->stats) != 0) {
+            return -1;
+        }
         if (emit_one_packet(
-                tx->encoder, &tx->config, tx->flow_id, tx->segment_id,
-                tx->final_dst, tx->ttl, tx->next_packet_id,
-                tx->packet_limit, tx->data_len, tx->stats.source_packets,
-                emit_fn, emit_ctx, &tx->stats) != 0) {
+                tx->encoder, tx->message, tx->codec_bytes, &tx->config,
+                tx->flow_id, tx->segment_id, tx->final_dst, tx->ttl,
+                tx->next_packet_id, tx->packet_limit, tx->data_len,
+                tx->stats.source_packets, emit_fn, emit_ctx, &tx->stats) != 0) {
             return -1;
         }
         tx->next_packet_id++;
@@ -430,12 +524,6 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
         message = padded;
     }
 
-    encoder = wirehair_encoder_create(NULL, message, codec_bytes,
-                                      WH_PACKET_SIZE);
-    if (encoder == NULL) {
-        goto out;
-    }
-
     local_stats.source_packets = source_packets;
     local_stats.repair_budget = repair_budget;
 
@@ -454,10 +542,16 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
                                   : source_packets + repair_budget;
 
         for (packet_id = 0; packet_id < send_limit; packet_id++) {
-            if (emit_one_packet(encoder, config, flow_id, segment_id,
-                                final_dst, ttl, packet_id, packet_limit,
-                                (uint32_t)data_len, source_packets, emit_fn,
-                                emit_ctx, &local_stats) != 0) {
+            if (packet_id >= source_packets &&
+                ensure_wirehair_encoder(&encoder, message, codec_bytes,
+                                        &local_stats) != 0) {
+                goto out;
+            }
+            if (emit_one_packet(encoder, message, codec_bytes, config,
+                                flow_id, segment_id, final_dst, ttl, packet_id,
+                                packet_limit, (uint32_t)data_len,
+                                source_packets, emit_fn, emit_ctx,
+                                &local_stats) != 0) {
                 goto out;
             }
         }
@@ -478,10 +572,10 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
                 goto out;
             }
         }
-        if (emit_one_packet(encoder, config, flow_id, segment_id, final_dst,
-                            ttl, packet_id, packet_limit, (uint32_t)data_len,
-                            source_packets, emit_fn, emit_ctx,
-                            &local_stats) != 0) {
+        if (emit_one_packet(encoder, message, codec_bytes, config, flow_id,
+                            segment_id, final_dst, ttl, packet_id,
+                            packet_limit, (uint32_t)data_len, source_packets,
+                            emit_fn, emit_ctx, &local_stats) != 0) {
             goto out;
         }
     }
@@ -514,6 +608,10 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
         if (round_end < packet_id || round_end > packet_limit) {
             round_end = packet_limit;
         }
+        if (ensure_wirehair_encoder(&encoder, message, codec_bytes,
+                                    &local_stats) != 0) {
+            goto out;
+        }
         local_stats.repair_rounds++;
         while (packet_id < round_end) {
             acked = ack_poll(flow_id, segment_id, 0u, ack_ctx);
@@ -526,10 +624,11 @@ int wirehair_segment_send(const WirehairSegmentConfig *config,
                 result = 0;
                 goto out;
             }
-            if (emit_one_packet(encoder, config, flow_id, segment_id,
-                                final_dst, ttl, packet_id, packet_limit,
-                                (uint32_t)data_len, source_packets, emit_fn,
-                                emit_ctx, &local_stats) != 0) {
+            if (emit_one_packet(encoder, message, codec_bytes, config,
+                                flow_id, segment_id, final_dst, ttl, packet_id,
+                                packet_limit, (uint32_t)data_len,
+                                source_packets, emit_fn, emit_ctx,
+                                &local_stats) != 0) {
                 goto out;
             }
             packet_id++;
@@ -562,10 +661,36 @@ out:
     return result;
 }
 
-static void release_slot(WirehairSegmentSlot *slot)
+static void clear_recovered(WirehairSegmentReceiver *receiver,
+                            uint64_t segment_id)
+{
+    size_t index = (size_t)(segment_id % WH_SEGMENT_WINDOW_MAX);
+
+    if (receiver == NULL) {
+        return;
+    }
+    if (atomic_load(&receiver->recovered_ids[index]) == segment_id) {
+        atomic_store(&receiver->recovered_valid[index], 0);
+    }
+}
+
+static void mark_recovered(WirehairSegmentReceiver *receiver,
+                           uint64_t segment_id)
+{
+    size_t index = (size_t)(segment_id % WH_SEGMENT_WINDOW_MAX);
+
+    atomic_store(&receiver->recovered_ids[index], segment_id);
+    atomic_store(&receiver->recovered_valid[index], 1);
+}
+
+static void release_slot(WirehairSegmentReceiver *receiver,
+                         WirehairSegmentSlot *slot)
 {
     if (slot == NULL) {
         return;
+    }
+    if (receiver != NULL && slot->state != WH_SEG_SLOT_EMPTY) {
+        clear_recovered(receiver, slot->segment_id);
     }
     wirehair_free(slot->decoder);
     free(slot->recovered);
@@ -629,7 +754,7 @@ static WirehairSegmentSlot *allocate_slot(WirehairSegmentReceiver *receiver,
             wirehair_decoder_create(NULL, codec_bytes, WH_PACKET_SIZE);
         slot->recovered = malloc(codec_bytes);
         if (slot->decoder == NULL || slot->recovered == NULL) {
-            release_slot(slot);
+            release_slot(receiver, slot);
             return NULL;
         }
         slot->state = WH_SEG_SLOT_COLLECTING;
@@ -650,6 +775,8 @@ static int emit_return_ack(WirehairSegmentReceiver *receiver,
                            uint32_t segment_bytes)
 {
     WireHeader ack;
+    uint64_t started;
+    int rc;
 
     if (receiver->ack_fn == NULL || origin_node == 0) {
         return 0;
@@ -665,7 +792,13 @@ static int emit_return_ack(WirehairSegmentReceiver *receiver,
         .flags = WIRE_FLAG_RETURN_PATH,
         .segment_bytes = segment_bytes,
     };
-    return receiver->ack_fn(&ack, receiver->ack_ctx);
+    started = wh_mono_ns();
+    rc = receiver->ack_fn(&ack, receiver->ack_ctx);
+    receiver->stats.ack_emit_ns += wh_mono_ns() - started;
+    if (rc == 0) {
+        receiver->stats.ack_count++;
+    }
+    return rc;
 }
 
 static int emit_ack(WirehairSegmentReceiver *receiver,
@@ -684,6 +817,8 @@ static int emit_ack(WirehairSegmentReceiver *receiver,
 
 static int emit_ready_segments(WirehairSegmentReceiver *receiver)
 {
+    uint64_t started;
+
     for (;;) {
         WirehairSegmentSlot *slot = find_slot(
             receiver, receiver->next_emit_segment);
@@ -691,12 +826,14 @@ static int emit_ready_segments(WirehairSegmentReceiver *receiver)
         if (slot == NULL || slot->state != WH_SEG_SLOT_RECOVERED) {
             break;
         }
+        started = wh_mono_ns();
         if (receiver->output_fn(receiver->flow_id, slot->recovered,
                                 slot->segment_bytes,
                                 receiver->output_ctx) != 0) {
             return -1;
         }
-        release_slot(slot);
+        receiver->stats.output_ns += wh_mono_ns() - started;
+        release_slot(receiver, slot);
         receiver->next_emit_segment++;
     }
     if (receiver->end_seen &&
@@ -712,6 +849,7 @@ WirehairSegmentReceiver *wirehair_segment_receiver_create(
     WirehairSegmentAckEmitFn ack_fn, void *ack_ctx)
 {
     WirehairSegmentReceiver *receiver;
+    size_t i;
 
     if (!wirehair_segment_config_valid(config) || output_fn == NULL ||
         !wirehair_ready()) {
@@ -728,6 +866,10 @@ WirehairSegmentReceiver *wirehair_segment_receiver_create(
     receiver->output_ctx = output_ctx;
     receiver->ack_fn = ack_fn;
     receiver->ack_ctx = ack_ctx;
+    for (i = 0; i < WH_SEGMENT_WINDOW_MAX; i++) {
+        atomic_init(&receiver->recovered_ids[i], 0);
+        atomic_init(&receiver->recovered_valid[i], 0);
+    }
     return receiver;
 }
 
@@ -739,7 +881,7 @@ void wirehair_segment_receiver_destroy(WirehairSegmentReceiver *receiver)
         return;
     }
     for (i = 0; i < WH_SEGMENT_WINDOW_MAX; i++) {
-        release_slot(&receiver->slots[i]);
+        release_slot(receiver, &receiver->slots[i]);
     }
     free(receiver);
 }
@@ -751,6 +893,7 @@ int wirehair_segment_receiver_ingest(WirehairSegmentReceiver *receiver,
 {
     WirehairSegmentSlot *slot;
     WirehairResult decode_result;
+    uint64_t started;
 
     if (receiver == NULL || header == NULL ||
         header->version != WIRE_VERSION_V4 ||
@@ -809,17 +952,24 @@ int wirehair_segment_receiver_ingest(WirehairSegmentReceiver *receiver,
         return emit_ack(receiver, slot);
     }
 
+    started = wh_mono_ns();
     decode_result = wirehair_decode(slot->decoder, header->shard_index,
                                     payload, (uint32_t)payload_len);
+    receiver->stats.decode_ns += wh_mono_ns() - started;
     if (decode_result == Wirehair_NeedMore) {
         return 0;
     }
+    started = wh_mono_ns();
     if (decode_result != Wirehair_Success ||
         wirehair_recover(slot->decoder, slot->recovered,
                          slot->codec_bytes) != Wirehair_Success) {
+        receiver->stats.recover_ns += wh_mono_ns() - started;
         return -1;
     }
+    receiver->stats.recover_ns += wh_mono_ns() - started;
+    receiver->stats.recover_count++;
     slot->state = WH_SEG_SLOT_RECOVERED;
+    mark_recovered(receiver, slot->segment_id);
     if (emit_ack(receiver, slot) != 0) {
         return -1;
     }
@@ -836,4 +986,45 @@ uint64_t wirehair_segment_receiver_ahead_drops(
     const WirehairSegmentReceiver *receiver)
 {
     return receiver != NULL ? receiver->ahead_window_drops : 0u;
+}
+
+const WirehairSegmentRecvStats *wirehair_segment_receiver_stats(
+    const WirehairSegmentReceiver *receiver)
+{
+    return receiver != NULL ? &receiver->stats : NULL;
+}
+
+int wirehair_segment_receiver_segment_recovered(
+    const WirehairSegmentReceiver *receiver, uint64_t segment_id)
+{
+    size_t index;
+
+    if (receiver == NULL) {
+        return 0;
+    }
+    index = (size_t)(segment_id % WH_SEGMENT_WINDOW_MAX);
+    return atomic_load(&receiver->recovered_valid[index]) != 0 &&
+           atomic_load(&receiver->recovered_ids[index]) == segment_id;
+}
+
+int wirehair_segment_receiver_fill_ack(const WirehairSegmentReceiver *receiver,
+                                       const WireHeader *data,
+                                       WireHeader *ack)
+{
+    if (receiver == NULL || data == NULL || ack == NULL ||
+        !wirehair_segment_receiver_segment_recovered(receiver, data->block_id)) {
+        return 0;
+    }
+    *ack = (WireHeader){
+        .version = WIRE_VERSION_V4,
+        .type = WIRE_TYPE_ACK,
+        .final_dst = data->origin_node,
+        .ttl = receiver->config.ack_ttl,
+        .flow_id = receiver->flow_id,
+        .block_id = data->block_id,
+        .origin_node = receiver->config.origin_node,
+        .flags = WIRE_FLAG_RETURN_PATH,
+        .segment_bytes = data->segment_bytes,
+    };
+    return 1;
 }

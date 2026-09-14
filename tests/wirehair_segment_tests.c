@@ -166,7 +166,7 @@ static int run_roundtrip(size_t bytes, int ack_enabled)
         ctx.output_size != bytes || memcmp(input, ctx.output, bytes) != 0 ||
         (ack_enabled &&
          (ctx.ack_count < 1u || !stats.stopped_by_ack ||
-          stats.repair_sent != 0u))) {
+          stats.repair_sent != 0u || stats.encode_create_ns != 0u))) {
         fprintf(stderr,
                 "roundtrip mismatch bytes=%zu complete=%d output=%zu ack=%u\n",
                 bytes, wirehair_segment_receiver_complete(ctx.receiver),
@@ -413,9 +413,11 @@ static int test_incremental_tx_batches(void)
     }
     emitted = wirehair_segment_tx_emit_source(
         tx, source_packets, store_emit, &store);
+    stats = wirehair_segment_tx_stats(tx);
     if (emitted != (int)source_packets - 1 ||
         !wirehair_segment_tx_source_complete(tx) ||
-        wirehair_segment_tx_repair_exhausted(tx)) {
+        wirehair_segment_tx_repair_exhausted(tx) || stats == NULL ||
+        stats->encode_create_ns != 0u) {
         wirehair_segment_tx_destroy(tx);
         return -1;
     }
@@ -425,7 +427,8 @@ static int test_incremental_tx_batches(void)
     if (emitted != (int)repair_packets || stats == NULL ||
         stats->repair_sent != repair_packets ||
         stats->repair_rounds != 1u ||
-        stats->packets_sent != source_packets + repair_packets) {
+        stats->packets_sent != source_packets + repair_packets ||
+        stats->encode_create_ns == 0u) {
         wirehair_segment_tx_destroy(tx);
         return -1;
     }
@@ -452,6 +455,10 @@ int main(void)
         wirehair_segment_repair_ceiling(100u, 10u, true) != 100u ||
         wirehair_segment_repair_ceiling(100u, 10u, false) != 10u ||
         wirehair_segment_repair_ceiling(3u, 10u, true) != 3u ||
+        wirehair_segment_ack_repair_delay_ms(0u) != WH_ACK_INITIAL_WAIT_MS ||
+        wirehair_segment_ack_repair_delay_ms(3u) != WH_ACK_WAIT_MIN_MS ||
+        wirehair_segment_ack_repair_delay_ms(15u) != 30u ||
+        wirehair_segment_ack_repair_delay_ms(100u) != WH_ACK_WAIT_MAX_MS ||
         run_roundtrip(28000u, 0) != 0 ||
         run_roundtrip(731u, 1) != 0 ||
         test_outof_window_drop() != 0 ||

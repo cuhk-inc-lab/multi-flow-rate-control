@@ -27,11 +27,17 @@
  */
 #define WH_ACK_REPAIR_ROUND_PCT 5u
 /*
- * Short decode/ACK windows: poll frequently between repair micro-rounds.
+ * Repair starts only after the in-flight window has no remaining source
+ * packets.  Spraying repair while later segments are still sending source
+ * congestes the shared decode worker and delays the ACK that would have
+ * stopped repair.  Wait is SRTT-based after the first ACK sample.
  */
 #define WH_ACK_INITIAL_WAIT_MS 50u
-#define WH_ACK_REPAIR_WAIT_MS 100u
-#define WH_ACK_POLL_SLICE_MS 10u
+#define WH_ACK_REPAIR_WAIT_MS 40u
+#define WH_ACK_POLL_SLICE_MS 5u
+#define WH_ACK_WAIT_MIN_MS 8u
+#define WH_ACK_WAIT_MAX_MS 80u
+#define WH_ACK_SRTT_MULT 2u
 
 typedef struct WirehairSegmentConfig {
     uint32_t segment_bytes;
@@ -50,7 +56,18 @@ typedef struct WirehairSegmentSendStats {
     uint32_t repair_rounds;
     bool stopped_by_ack;
     bool ack_timed_out;
+    uint64_t encode_create_ns;
+    uint64_t encode_ns;
 } WirehairSegmentSendStats;
+
+typedef struct WirehairSegmentRecvStats {
+    uint64_t decode_ns;
+    uint64_t recover_ns;
+    uint64_t ack_emit_ns;
+    uint64_t output_ns;
+    uint64_t recover_count;
+    uint64_t ack_count;
+} WirehairSegmentRecvStats;
 
 typedef struct WirehairSegmentTx WirehairSegmentTx;
 
@@ -73,6 +90,8 @@ uint32_t wirehair_segment_repair_packets(uint32_t source_packets,
                                           uint8_t repair_percent);
 /* Per-round repair batch size in ACK mode (independent of repair_percent). */
 uint32_t wirehair_segment_ack_repair_round_packets(uint32_t source_packets);
+/* Delay before the first repair round. srtt_ms=0 uses INITIAL_WAIT. */
+unsigned wirehair_segment_ack_repair_delay_ms(unsigned srtt_ms);
 /* On-wire repair ceiling. Without ACK this equals repair_packets (the
  * budget). With ACK it is a safety cap of 100% of source so the sender
  * can spray until ACK instead of a fixed redundancy. */
@@ -82,7 +101,8 @@ uint32_t wirehair_segment_repair_ceiling(uint32_t source_packets,
 
 /*
  * Incremental encoder used by the UDP sliding-window sender.  The caller must
- * keep data alive until the tx is destroyed.
+ * keep data alive until the tx is destroyed.  Source packets are systematic
+ * copies of that buffer; wirehair_encoder_create runs on the first repair.
  */
 WirehairSegmentTx *wirehair_segment_tx_create(
     const WirehairSegmentConfig *config, uint32_t flow_id,
@@ -123,5 +143,12 @@ bool wirehair_segment_receiver_complete(
     const WirehairSegmentReceiver *receiver);
 uint64_t wirehair_segment_receiver_ahead_drops(
     const WirehairSegmentReceiver *receiver);
+const WirehairSegmentRecvStats *wirehair_segment_receiver_stats(
+    const WirehairSegmentReceiver *receiver);
+int wirehair_segment_receiver_segment_recovered(
+    const WirehairSegmentReceiver *receiver, uint64_t segment_id);
+int wirehair_segment_receiver_fill_ack(const WirehairSegmentReceiver *receiver,
+                                       const WireHeader *data,
+                                       WireHeader *ack);
 
 #endif /* WIREHAIR_SEGMENT_H */

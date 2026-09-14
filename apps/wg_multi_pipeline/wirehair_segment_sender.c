@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct WirehairSegmentSenderSlot {
     int active;
@@ -11,6 +12,7 @@ typedef struct WirehairSegmentSenderSlot {
     size_t data_len;
     WirehairSegmentTx *tx;
     uint64_t repair_due_ns;
+    uint64_t source_complete_ns;
     int repair_due_valid;
 } WirehairSegmentSenderSlot;
 
@@ -35,6 +37,7 @@ struct WirehairSegmentSender {
     uint64_t segments_completed;
     uint64_t ack_ids[WH_SEGMENT_WINDOW_MAX];
     uint8_t ack_valid[WH_SEGMENT_WINDOW_MAX];
+    uint64_t srtt_ns;
     WirehairSegmentSenderSlot *slots;
 };
 
@@ -113,6 +116,34 @@ static void ack_mark(WirehairSegmentSender *sender, const WireHeader *header)
     sender->ack_valid[index] = 1;
 }
 
+static uint64_t sender_now_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static void note_ack_rtt(WirehairSegmentSender *sender,
+                         const WirehairSegmentSenderSlot *slot,
+                         uint64_t now_ns)
+{
+    uint64_t rtt_ns;
+
+    if (sender == NULL || slot == NULL || slot->source_complete_ns == 0 ||
+        now_ns < slot->source_complete_ns) {
+        return;
+    }
+    rtt_ns = now_ns - slot->source_complete_ns;
+    if (sender->srtt_ns == 0) {
+        sender->srtt_ns = rtt_ns;
+    } else {
+        sender->srtt_ns = (sender->srtt_ns * 7u + rtt_ns) / 8u;
+    }
+}
+
 static void release_slot(WirehairSegmentSender *sender,
                          WirehairSegmentSenderSlot *slot)
 {
@@ -157,7 +188,7 @@ static int release_acked_base(WirehairSegmentSender *sender)
     return 0;
 }
 
-static int apply_pending_acks(WirehairSegmentSender *sender)
+static int apply_pending_acks(WirehairSegmentSender *sender, uint64_t now_ns)
 {
     size_t i;
     int progress = 0;
@@ -167,6 +198,7 @@ static int apply_pending_acks(WirehairSegmentSender *sender)
 
         if (slot->active && !slot->acked &&
             ack_contains(sender, slot->segment_id)) {
+            note_ack_rtt(sender, slot, now_ns);
             slot->acked = 1;
             progress = 1;
         }
@@ -304,7 +336,7 @@ int wirehair_segment_sender_input_ack(WirehairSegmentSender *sender,
         return -1;
     }
     ack_mark(sender, &header);
-    (void)apply_pending_acks(sender);
+    (void)apply_pending_acks(sender, sender_now_ns());
     return 0;
 }
 
@@ -313,11 +345,27 @@ int wirehair_segment_sender_tick(WirehairSegmentSender *sender,
 {
     size_t i;
     int progress;
+    int source_pending = 0;
+    unsigned wait_ms;
+    uint64_t wait_ns;
 
     if (sender == NULL || sender->failed) {
         return -1;
     }
-    progress = apply_pending_acks(sender);
+    progress = apply_pending_acks(sender, now_ns);
+    for (i = 0; i < sender->window; i++) {
+        WirehairSegmentSenderSlot *slot = &sender->slots[i];
+
+        if (slot->active && !slot->acked && slot->tx != NULL &&
+            !wirehair_segment_tx_source_complete(slot->tx)) {
+            source_pending = 1;
+            break;
+        }
+    }
+    wait_ms = wirehair_segment_ack_repair_delay_ms(
+        (unsigned)((sender->srtt_ns + 500000u) / 1000000u));
+    wait_ns = (uint64_t)wait_ms * 1000000ull;
+
     for (i = 0; i < sender->window; i++) {
         WirehairSegmentSenderSlot *slot =
             &sender->slots[(sender->base_segment + i) % sender->window];
@@ -345,13 +393,23 @@ int wirehair_segment_sender_tick(WirehairSegmentSender *sender,
                 progress = 1;
             }
             if (wirehair_segment_tx_source_complete(slot->tx)) {
-                slot->repair_due_ns =
-                    now_ns + (uint64_t)WH_ACK_INITIAL_WAIT_MS * 1000000ull;
-                slot->repair_due_valid = 1;
+                slot->source_complete_ns = now_ns;
+                slot->repair_due_valid = 0;
             }
             continue;
         }
-        if (slot->repair_due_valid && now_ns < slot->repair_due_ns) {
+        if (source_pending) {
+            slot->repair_due_valid = 0;
+            continue;
+        }
+        if (slot->segment_id != sender->base_segment) {
+            continue;
+        }
+        if (!slot->repair_due_valid) {
+            slot->repair_due_ns = now_ns + wait_ns;
+            slot->repair_due_valid = 1;
+        }
+        if (now_ns < slot->repair_due_ns) {
             continue;
         }
         if (wirehair_segment_tx_repair_exhausted(slot->tx)) {

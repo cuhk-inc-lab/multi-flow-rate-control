@@ -40,7 +40,12 @@
 #define WIRE_SHARD_PACE_MIN_SEC   0.000005
 #define WIRE_RECV_POLL_MS         100
 #define WIREHAIR_RECV_BATCH       64u
-#define WIREHAIR_DECODE_QUEUE_CAP MF_QUEUE_CAPACITY
+/*
+ * Source packets of a 10 MiB segment are ~7.6k.  Blocking the recv thread
+ * once this queue fills lets the 416 KiB socket rcvbuf overflow and forces
+ * repair.  Size it to hold more than one in-flight segment.
+ */
+#define WIREHAIR_DECODE_QUEUE_CAP 16384u
 #define WIREHAIR_SEND_SOURCE_BATCH 32u
 
 struct WireUdpSharedPacer {
@@ -82,30 +87,55 @@ static const char *wire_codec_kind_name(CodecKind kind)
     }
 }
 
-static void wire_set_udp_buffers(int sock)
+static int wire_udp_sockopt_int(int sock, int opt)
 {
-    int recv_buf = WIRE_UDP_RCVBUF;
-    int send_buf = WIRE_UDP_SNDBUF;
+    int value = 0;
+    socklen_t len = sizeof(value);
+
+    if (sock < 0 || getsockopt(sock, SOL_SOCKET, opt, &value, &len) != 0) {
+        return 0;
+    }
+    return value;
+}
+
+static void wire_try_set_sockbuf(int sock, int opt, int force_opt, int want,
+                                 const char *name, const char *sysctl_key)
+{
+    int granted;
 
     if (sock < 0) {
         return;
     }
-    (void)setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &recv_buf,
-                     sizeof(recv_buf));
-    (void)setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &send_buf,
-                     sizeof(send_buf));
+    (void)setsockopt(sock, SOL_SOCKET, opt, &want, sizeof(want));
+    granted = wire_udp_sockopt_int(sock, opt);
+    /*
+     * Linux reports twice the allocated size.  Compare against `want` so a
+     * doubled-but-capped grant still looks short.
+     */
+    if (granted < want) {
+        (void)setsockopt(sock, SOL_SOCKET, force_opt, &want, sizeof(want));
+        granted = wire_udp_sockopt_int(sock, opt);
+    }
+    if (granted < want) {
+        fprintf(stderr,
+                "wire-udp: %s granted=%d requested=%d; kernel capped the "
+                "buffer. Raise the limit before high-rate runs:\n"
+                "  sudo sysctl -w %s=%d\n",
+                name, granted, want, sysctl_key, want);
+    }
+}
+
+static void wire_set_udp_buffers(int sock)
+{
+    wire_try_set_sockbuf(sock, SO_RCVBUF, SO_RCVBUFFORCE, WIRE_UDP_RCVBUF,
+                         "SO_RCVBUF", "net.core.rmem_max");
+    wire_try_set_sockbuf(sock, SO_SNDBUF, SO_SNDBUFFORCE, WIRE_UDP_SNDBUF,
+                         "SO_SNDBUF", "net.core.wmem_max");
 }
 
 static int wire_udp_actual_recv_buffer(int sock)
 {
-    int recv_buf = 0;
-    socklen_t recv_buf_len = sizeof(recv_buf);
-
-    if (sock < 0 ||
-        getsockopt(sock, SOL_SOCKET, SO_RCVBUF, &recv_buf, &recv_buf_len) != 0) {
-        return 0;
-    }
-    return recv_buf;
+    return wire_udp_sockopt_int(sock, SO_RCVBUF);
 }
 
 static uint64_t realtime_nanoseconds(void)
@@ -126,6 +156,23 @@ static double monotonic_seconds(void)
         return 0.0;
     }
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+static uint64_t monotonic_nanoseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t ns_elapsed(uint64_t started_ns)
+{
+    uint64_t now = monotonic_nanoseconds();
+
+    return now >= started_ns ? now - started_ns : 0u;
 }
 
 static void sleep_until_monotonic(double target)
@@ -319,8 +366,9 @@ static int send_wire_datagram(int sock, const struct sockaddr *address,
 }
 
 /*
- * Send multiple shards with one sendmmsg when pacing spacing is zero.
- * Falls back to per-shard sendto on partial/unsupported failure.
+ * Send multiple datagrams with one sendmmsg.  Header encoding follows each
+ * packet's version (v3 RS shards or v4 Wirehair).  Falls back to per-packet
+ * sendto on partial/unsupported failure.
  */
 static int send_wire_datagrams_batch(int sock, const struct sockaddr *address,
                                      socklen_t address_len,
@@ -328,7 +376,7 @@ static int send_wire_datagrams_batch(int sock, const struct sockaddr *address,
                                      const unsigned char *const *payloads,
                                      size_t count)
 {
-    unsigned char datagrams[WIRE_MAX_SHARDS][WIRE_HEADER_SIZE + PKG_SIZE];
+    unsigned char datagrams[WIRE_MAX_SHARDS][WIRE_MAX_HEADER_SIZE + PKG_SIZE];
     struct iovec iov[WIRE_MAX_SHARDS];
     struct mmsghdr msgs[WIRE_MAX_SHARDS];
     size_t i;
@@ -342,14 +390,19 @@ static int send_wire_datagrams_batch(int sock, const struct sockaddr *address,
 
     memset(msgs, 0, sizeof(msgs[0]) * count);
     for (i = 0; i < count; i++) {
-        size_t length = WIRE_HEADER_SIZE + headers[i].payload_len;
+        size_t header_size = wire_header_size(&headers[i]);
+        size_t length = header_size + headers[i].payload_len;
 
         if (headers[i].payload_len > PKG_SIZE) {
             return -1;
         }
-        wire_header_encode(datagrams[i], &headers[i]);
+        if (headers[i].version == WIRE_VERSION_V4) {
+            wire_header_encode_v4(datagrams[i], &headers[i]);
+        } else {
+            wire_header_encode(datagrams[i], &headers[i]);
+        }
         if (headers[i].payload_len > 0 && payloads[i] != NULL) {
-            memcpy(datagrams[i] + WIRE_HEADER_SIZE, payloads[i],
+            memcpy(datagrams[i] + header_size, payloads[i],
                    headers[i].payload_len);
         }
         iov[i].iov_base = datagrams[i];
@@ -559,6 +612,8 @@ typedef struct WirehairUdpSendCtx {
     double started;
     double rate_mbps;
     WireUdpSharedPacer *shared_pacer;
+    uint64_t sendto_ns;
+    uint64_t pace_ns;
 } WirehairUdpSendCtx;
 
 typedef struct WirehairUdpAckCtx {
@@ -578,6 +633,8 @@ typedef struct WirehairUdpSendSlot {
     size_t data_len;
     WirehairSegmentTx *tx;
     double repair_due;
+    double source_complete_at;
+    int repair_armed;
 } WirehairUdpSendSlot;
 
 typedef struct WirehairUdpRecvCtx {
@@ -861,28 +918,39 @@ static int wirehair_udp_emit(const WireHeader *header,
     wire_len = wire_header_size(header) + payload_len;
     if (ctx->shared_pacer != NULL) {
         WireUdpSharedPacer *pacer = ctx->shared_pacer;
+        uint64_t started;
 
         pthread_mutex_lock(&pacer->mutex);
+        started = monotonic_nanoseconds();
         pace_to_source_rate(pacer->started, pacer->wire_bytes + wire_len,
                             pacer->rate_mbps);
+        ctx->pace_ns += ns_elapsed(started);
+        started = monotonic_nanoseconds();
         send_result =
             send_wire_datagram(ctx->sock, ctx->address, ctx->address_len,
                                header, payload);
+        ctx->sendto_ns += ns_elapsed(started);
         if (send_result == 0) {
             pacer->wire_bytes += wire_len;
         }
         pthread_mutex_unlock(&pacer->mutex);
     } else {
+        uint64_t started = monotonic_nanoseconds();
+
         send_result =
             send_wire_datagram(ctx->sock, ctx->address, ctx->address_len,
                                header, payload);
+        ctx->sendto_ns += ns_elapsed(started);
     }
     if (send_result != 0) {
         return -1;
     }
     ctx->wire_bytes += wire_len;
     if (ctx->shared_pacer == NULL) {
+        uint64_t started = monotonic_nanoseconds();
+
         pace_to_source_rate(ctx->started, ctx->wire_bytes, ctx->rate_mbps);
+        ctx->pace_ns += ns_elapsed(started);
     }
     return 0;
 }
@@ -1016,8 +1084,23 @@ static int wirehair_udp_send_file(const WireUdpSendConfig *config)
     int eof = 0;
     int sock = -1;
     int result = -1;
-    double started;
+    double started = 0.0;
     size_t i;
+    uint64_t t_admit = 0;
+    uint64_t t_source = 0;
+    uint64_t t_repair = 0;
+    uint64_t t_ack_poll = 0;
+    uint64_t t_ack_wait = 0;
+    uint64_t t_idle = 0;
+    uint64_t encode_ns = 0;
+    uint64_t encode_create_ns = 0;
+    uint64_t ack_rtt_sum_ns = 0;
+    uint64_t ack_rtt_max_ns = 0;
+    uint64_t ack_rtt_count = 0;
+    uint64_t acked_during_source = 0;
+    uint64_t acked_before_repair = 0;
+    uint64_t acked_after_repair = 0;
+    double srtt_s = 0.0;
 
     if (config == NULL ||
         !wirehair_segment_config_valid(&config->wirehair)) {
@@ -1083,6 +1166,8 @@ static int wirehair_udp_send_file(const WireUdpSendConfig *config)
             source_bytes += n;
             repair_sent += stats.repair_sent;
             repair_rounds += stats.repair_rounds;
+            encode_ns += stats.encode_ns;
+            encode_create_ns += stats.encode_create_ns;
             next_segment++;
         }
         free(segment);
@@ -1095,21 +1180,54 @@ static int wirehair_udp_send_file(const WireUdpSendConfig *config)
         while (!eof || active_count != 0) {
             int progress = 0;
             int drained;
+            int waiting_only;
             double now;
+            uint64_t t0;
 
             ack_ctx.base_segment = base_segment;
+            t0 = monotonic_nanoseconds();
             drained = wirehair_udp_ack_drain(&ack_ctx, 0u);
+            t_ack_poll += ns_elapsed(t0);
             if (drained < 0) {
                 goto out;
             }
+            now = monotonic_seconds();
             for (i = 0; i < window; i++) {
                 WirehairUdpSendSlot *slot = &slots[i];
+                const WirehairSegmentSendStats *stats;
 
-                if (slot->active && !slot->acked &&
-                    wirehair_udp_ack_contains(&ack_ctx,
-                                              slot->segment_id)) {
-                    slot->acked = 1;
-                    progress = 1;
+                if (!(slot->active && !slot->acked &&
+                      wirehair_udp_ack_contains(&ack_ctx,
+                                                slot->segment_id))) {
+                    continue;
+                }
+                slot->acked = 1;
+                progress = 1;
+                stats = wirehair_segment_tx_stats(slot->tx);
+                if (slot->source_complete_at > 0.0 &&
+                    now >= slot->source_complete_at) {
+                    uint64_t rtt_ns = (uint64_t)((now -
+                        slot->source_complete_at) * 1000000000.0);
+                    double rtt_s = now - slot->source_complete_at;
+
+                    ack_rtt_sum_ns += rtt_ns;
+                    if (rtt_ns > ack_rtt_max_ns) {
+                        ack_rtt_max_ns = rtt_ns;
+                    }
+                    ack_rtt_count++;
+                    if (srtt_s <= 0.0) {
+                        srtt_s = rtt_s;
+                    } else {
+                        srtt_s = 0.875 * srtt_s + 0.125 * rtt_s;
+                    }
+                }
+                if (slot->tx != NULL &&
+                    !wirehair_segment_tx_source_complete(slot->tx)) {
+                    acked_during_source++;
+                } else if (stats == NULL || stats->repair_rounds == 0) {
+                    acked_before_repair++;
+                } else {
+                    acked_after_repair++;
                 }
             }
 
@@ -1126,6 +1244,9 @@ static int wirehair_udp_send_file(const WireUdpSendConfig *config)
                 source_bytes += slot->data_len;
                 repair_sent += stats != NULL ? stats->repair_sent : 0u;
                 repair_rounds += stats != NULL ? stats->repair_rounds : 0u;
+                encode_ns += stats != NULL ? stats->encode_ns : 0u;
+                encode_create_ns +=
+                    stats != NULL ? stats->encode_create_ns : 0u;
                 wirehair_segment_tx_destroy(slot->tx);
                 free(slot->data);
                 wire_udp_shared_window_release(config->shared_pacer);
@@ -1137,6 +1258,7 @@ static int wirehair_udp_send_file(const WireUdpSendConfig *config)
                 progress = 1;
             }
 
+            t0 = monotonic_nanoseconds();
             while (!eof &&
                    next_segment - base_segment < (uint64_t)window) {
                 WirehairUdpSendSlot *slot =
@@ -1185,81 +1307,146 @@ static int wirehair_udp_send_file(const WireUdpSendConfig *config)
                     window_hwm = active_count;
                 }
                 progress = 1;
+                /*
+                 * Admit one segment per loop so source packets start flowing
+                 * before the rest of the window is filled.  Encoder create is
+                 * deferred until the first repair packet.
+                 */
+                break;
             }
+            t_admit += ns_elapsed(t0);
 
             now = monotonic_seconds();
-            for (i = 0; i < window; i++) {
-                WirehairUdpSendSlot *slot =
-                    &slots[(base_segment + i) % window];
-                int emitted;
+            {
+                int source_pending = 0;
+                unsigned wait_ms;
+                double wait_s;
 
-                if (!slot->active || slot->acked) {
-                    continue;
+                for (i = 0; i < window; i++) {
+                    WirehairUdpSendSlot *slot = &slots[i];
+
+                    if (slot->active && !slot->acked && slot->tx != NULL &&
+                        !wirehair_segment_tx_source_complete(slot->tx)) {
+                        source_pending = 1;
+                        break;
+                    }
                 }
-                if (!wirehair_segment_tx_source_complete(slot->tx)) {
-                    emitted = wirehair_segment_tx_emit_source(
-                        slot->tx, WIREHAIR_SEND_SOURCE_BATCH,
+                wait_ms = wirehair_segment_ack_repair_delay_ms(
+                    (unsigned)(srtt_s * 1000.0 + 0.5));
+                wait_s = (double)wait_ms / 1000.0;
+
+                for (i = 0; i < window; i++) {
+                    WirehairUdpSendSlot *slot =
+                        &slots[(base_segment + i) % window];
+                    int emitted;
+
+                    if (!slot->active || slot->acked) {
+                        continue;
+                    }
+                    if (!wirehair_segment_tx_source_complete(slot->tx)) {
+                        t0 = monotonic_nanoseconds();
+                        emitted = wirehair_segment_tx_emit_source(
+                            slot->tx, WIREHAIR_SEND_SOURCE_BATCH,
+                            wirehair_udp_emit, &emit_ctx);
+                        t_source += ns_elapsed(t0);
+                        if (emitted < 0) {
+                            goto out;
+                        }
+                        if (emitted > 0) {
+                            progress = 1;
+                        }
+                        if (wirehair_segment_tx_source_complete(slot->tx)) {
+                            slot->source_complete_at = monotonic_seconds();
+                            slot->repair_armed = 0;
+                        }
+                        continue;
+                    }
+                    if (source_pending) {
+                        slot->repair_armed = 0;
+                        continue;
+                    }
+                    /*
+                     * Repair only the oldest outstanding segment.  Spraying
+                     * every in-flight slot at once floods the decode worker
+                     * and delays the ACK that would stop repair.
+                     */
+                    if (slot->segment_id != base_segment) {
+                        continue;
+                    }
+                    if (!slot->repair_armed) {
+                        slot->repair_due = now + wait_s;
+                        slot->repair_armed = 1;
+                    }
+                    if (now < slot->repair_due) {
+                        continue;
+                    }
+                    if (wirehair_segment_tx_repair_exhausted(slot->tx)) {
+                        const WirehairSegmentSendStats *stats =
+                            wirehair_segment_tx_stats(slot->tx);
+
+                        fprintf(stderr,
+                                "wirehair-send: segment=%llu failed "
+                                "ack_timeout=yes packets_sent=%u "
+                                "repair_sent=%u repair_rounds=%u\n",
+                                (unsigned long long)slot->segment_id,
+                                stats != NULL ? stats->packets_sent : 0u,
+                                stats != NULL ? stats->repair_sent : 0u,
+                                stats != NULL ? stats->repair_rounds : 0u);
+                        if (stats != NULL) {
+                            repair_sent += stats->repair_sent;
+                            repair_rounds += stats->repair_rounds;
+                            encode_ns += stats->encode_ns;
+                            encode_create_ns += stats->encode_create_ns;
+                        }
+                        goto out;
+                    }
+                    t0 = monotonic_nanoseconds();
+                    emitted = wirehair_segment_tx_emit_repair(
+                        slot->tx,
+                        wirehair_segment_ack_repair_round_packets(
+                            wirehair_segment_tx_stats(slot->tx)->source_packets),
                         wirehair_udp_emit, &emit_ctx);
+                    t_repair += ns_elapsed(t0);
                     if (emitted < 0) {
                         goto out;
                     }
+                    slot->repair_due =
+                        monotonic_seconds() +
+                        (double)WH_ACK_REPAIR_WAIT_MS / 1000.0;
                     if (emitted > 0) {
                         progress = 1;
                     }
-                    if (wirehair_segment_tx_source_complete(slot->tx)) {
-                        slot->repair_due =
-                            monotonic_seconds() +
-                            (double)WH_ACK_INITIAL_WAIT_MS / 1000.0;
-                    }
-                    continue;
-                }
-                if (now < slot->repair_due) {
-                    continue;
-                }
-                if (wirehair_segment_tx_repair_exhausted(slot->tx)) {
-                    const WirehairSegmentSendStats *stats =
-                        wirehair_segment_tx_stats(slot->tx);
-
-                    fprintf(stderr,
-                            "wirehair-send: segment=%llu failed "
-                            "ack_timeout=yes packets_sent=%u "
-                            "repair_sent=%u repair_rounds=%u\n",
-                            (unsigned long long)slot->segment_id,
-                            stats != NULL ? stats->packets_sent : 0u,
-                            stats != NULL ? stats->repair_sent : 0u,
-                            stats != NULL ? stats->repair_rounds : 0u);
-                    if (stats != NULL) {
-                        repair_sent += stats->repair_sent;
-                        repair_rounds += stats->repair_rounds;
-                    }
-                    goto out;
-                }
-                emitted = wirehair_segment_tx_emit_repair(
-                    slot->tx,
-                    wirehair_segment_ack_repair_round_packets(
-                        wirehair_segment_tx_stats(slot->tx)->source_packets),
-                    wirehair_udp_emit, &emit_ctx);
-                if (emitted < 0) {
-                    goto out;
-                }
-                slot->repair_due =
-                    monotonic_seconds() +
-                    (double)WH_ACK_REPAIR_WAIT_MS / 1000.0;
-                if (emitted > 0) {
-                    progress = 1;
                 }
             }
 
             if (!progress && active_count != 0) {
+                waiting_only = 1;
+                for (i = 0; i < window; i++) {
+                    WirehairUdpSendSlot *slot = &slots[i];
+
+                    if (slot->active && !slot->acked && slot->tx != NULL &&
+                        !wirehair_segment_tx_source_complete(slot->tx)) {
+                        waiting_only = 0;
+                        break;
+                    }
+                }
+                t0 = monotonic_nanoseconds();
                 drained = wirehair_udp_ack_drain(
                     &ack_ctx, WH_ACK_POLL_SLICE_MS);
+                if (waiting_only) {
+                    t_ack_wait += ns_elapsed(t0);
+                } else {
+                    t_ack_poll += ns_elapsed(t0);
+                }
                 if (drained < 0) {
                     goto out;
                 }
             } else if (!progress) {
                 struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
 
+                t0 = monotonic_nanoseconds();
                 (void)nanosleep(&pause, NULL);
+                t_idle += ns_elapsed(t0);
             }
         }
     }
@@ -1294,6 +1481,50 @@ out:
             config->wirehair.ack_enabled ? "on" : "off",
             result == 0 ? "ok" : "failed",
             (unsigned long long)repair_rounds, window_hwm);
+    {
+        double wall_ms = (monotonic_seconds() - started) * 1000.0;
+        uint64_t accounted = t_admit + t_source + t_repair + t_ack_poll +
+                             t_ack_wait + t_idle;
+        double ack_rtt_avg_ms =
+            ack_rtt_count == 0
+                ? 0.0
+                : (double)ack_rtt_sum_ns / (double)ack_rtt_count / 1.0e6;
+
+        if (slots != NULL) {
+            for (i = 0; i < window; i++) {
+                const WirehairSegmentSendStats *stats;
+
+                if (!slots[i].active) {
+                    continue;
+                }
+                stats = wirehair_segment_tx_stats(slots[i].tx);
+                if (stats == NULL) {
+                    continue;
+                }
+                encode_ns += stats->encode_ns;
+                encode_create_ns += stats->encode_create_ns;
+            }
+        }
+        fprintf(stderr,
+                "wirehair-send-time: wall_ms=%.1f admit_ms=%.1f "
+                "source_emit_ms=%.1f repair_emit_ms=%.1f encode_create_ms=%.1f "
+                "encode_ms=%.1f sendto_ms=%.1f pace_ms=%.1f ack_poll_ms=%.1f "
+                "ack_wait_ms=%.1f idle_sleep_ms=%.1f other_ms=%.1f "
+                "ack_rtt_avg_ms=%.2f ack_rtt_max_ms=%.2f ack_rtt_n=%llu "
+                "acked_during_source=%llu acked_before_repair=%llu "
+                "acked_after_repair=%llu\n",
+                wall_ms, (double)t_admit / 1.0e6, (double)t_source / 1.0e6,
+                (double)t_repair / 1.0e6, (double)encode_create_ns / 1.0e6,
+                (double)encode_ns / 1.0e6, (double)emit_ctx.sendto_ns / 1.0e6,
+                (double)emit_ctx.pace_ns / 1.0e6, (double)t_ack_poll / 1.0e6,
+                (double)t_ack_wait / 1.0e6, (double)t_idle / 1.0e6,
+                wall_ms - (double)accounted / 1.0e6, ack_rtt_avg_ms,
+                (double)ack_rtt_max_ns / 1.0e6,
+                (unsigned long long)ack_rtt_count,
+                (unsigned long long)acked_during_source,
+                (unsigned long long)acked_before_repair,
+                (unsigned long long)acked_after_repair);
+    }
     if (input != NULL) {
         fclose(input);
     }
@@ -1395,6 +1626,19 @@ static int wirehair_udp_process_datagram(
         fprintf(stderr,
                 "wirehair-recv: flow %u worker started queue_cap=%u\n",
                 flow->flow_id, (unsigned)flow->q.cap);
+    }
+    if (header.type == WIRE_TYPE_DATA) {
+        WireHeader ack;
+
+        if (wirehair_segment_receiver_fill_ack(flow->receiver, &header,
+                                               &ack) != 0) {
+            if ((header.flags & WIRE_FLAG_ACK_REQUEST) != 0 &&
+                send_wire_datagram(sock, (const struct sockaddr *)peer,
+                                   peer_len, &ack, NULL) != 0) {
+                return -1;
+            }
+            return 0;
+        }
     }
     return wirehair_udp_enqueue(
         flow, &header,
@@ -1519,6 +1763,9 @@ static int wirehair_udp_recv_file(const WireUdpRecvConfig *config)
             goto out;
         }
         if (flows[i].active) {
+            const WirehairSegmentRecvStats *st =
+                wirehair_segment_receiver_stats(flows[i].receiver);
+
             fprintf(stderr,
                     "wirehair-recv: flow=%u ahead_window_drops=%llu "
                     "decode_complete=yes\n",
@@ -1526,6 +1773,18 @@ static int wirehair_udp_recv_file(const WireUdpRecvConfig *config)
                     (unsigned long long)
                         wirehair_segment_receiver_ahead_drops(
                             flows[i].receiver));
+            if (st != NULL) {
+                fprintf(stderr,
+                        "wirehair-recv-time: flow=%u decode_ms=%.1f "
+                        "recover_ms=%.1f ack_emit_ms=%.1f fwrite_ms=%.1f "
+                        "recover_count=%llu ack_count=%llu\n",
+                        flows[i].flow_id, (double)st->decode_ns / 1.0e6,
+                        (double)st->recover_ns / 1.0e6,
+                        (double)st->ack_emit_ns / 1.0e6,
+                        (double)st->output_ns / 1.0e6,
+                        (unsigned long long)st->recover_count,
+                        (unsigned long long)st->ack_count);
+            }
         }
     }
     result = 0;
