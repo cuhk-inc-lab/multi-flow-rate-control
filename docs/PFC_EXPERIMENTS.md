@@ -240,8 +240,7 @@ Derived: `goodput = source_bytes × 8 / wall_s / 1e6` Mbps,
 `wire = wire_bytes × 8 / wall_s / 1e6` Mbps.
 
 Receiver: `ahead_window_drops`, `socket_rcvbuf`.  
-Relay: `ack_egress_*`, `data_egress_*` (HWM, wait, enqueue). TX prefers ACK;
-after 8 consecutive ACKs it sends 1 DATA if DATA is waiting.
+Relay: `ack_egress_*` / `data_egress_*` (HWM, wait, enqueue) on the two exit queues.
 
 Integrity: `sha256sum` on input vs output, or `--strict`. There is no auth.
 

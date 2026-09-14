@@ -4,13 +4,17 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 typedef struct EgressPacket {
-    uint8_t  *datagram;      /* owned complete wire datagram */
+    uint8_t  *datagram;      /* owned complete wire datagram (pointer, not copy) */
     size_t    len;
     uint32_t  flow_id;
     uint64_t  generation_id; /* WireHeader.block_id */
     uint64_t  enqueue_ns;    /* CLOCK_MONOTONIC nanoseconds */
+    struct sockaddr_storage dest;
+    socklen_t dest_len;
+    uint8_t   prefer_head;   /* insert at head (same-queue jump; ACK has its own Q) */
 } EgressPacket;
 
 /* Optional free hook for pooled datagrams (default: free). */

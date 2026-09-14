@@ -12,6 +12,7 @@ static void packet_clear(RelayDeferredPacket *pkt)
     pkt->len = 0;
     pkt->flow_id = 0;
     pkt->enqueue_ns = 0;
+    pkt->prefer_head = 0;
 }
 
 static void free_slot_ring(RelayDeferredHub *hub, RelayDeferredSlot *slot)
@@ -300,9 +301,14 @@ RelayDeferredStatus relay_deferred_hub_try_push(RelayDeferredHub *hub,
         became_nonempty = 1;
     }
 
-    slot->ring[slot->tail] = *pkt;
+    if (pkt->prefer_head) {
+        slot->head = (slot->head + slot->capacity - 1u) % slot->capacity;
+        slot->ring[slot->head] = *pkt;
+    } else {
+        slot->ring[slot->tail] = *pkt;
+        slot->tail = (slot->tail + 1u) % slot->capacity;
+    }
     packet_clear(pkt);
-    slot->tail = (slot->tail + 1u) % slot->capacity;
     slot->count++;
     hub->total_count++;
     hub->stats.enqueue_ok++;

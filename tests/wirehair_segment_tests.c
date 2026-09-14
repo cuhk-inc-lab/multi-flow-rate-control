@@ -458,7 +458,8 @@ int main(void)
         wirehair_segment_ack_repair_delay_ms(0u) != WH_ACK_INITIAL_WAIT_MS ||
         wirehair_segment_ack_repair_delay_ms(3u) != WH_ACK_WAIT_MIN_MS ||
         wirehair_segment_ack_repair_delay_ms(15u) != 30u ||
-        wirehair_segment_ack_repair_delay_ms(100u) != WH_ACK_WAIT_MAX_MS ||
+        wirehair_segment_ack_repair_delay_ms(100u) != 200u ||
+        wirehair_segment_ack_repair_delay_ms(500u) != WH_ACK_WAIT_MAX_MS ||
         run_roundtrip(28000u, 0) != 0 ||
         run_roundtrip(731u, 1) != 0 ||
         test_outof_window_drop() != 0 ||

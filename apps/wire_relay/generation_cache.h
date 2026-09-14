@@ -112,7 +112,9 @@ int generation_cache_init(GenerationCache *cache,
 void generation_cache_destroy(GenerationCache *cache);
 
 /*
- * Insert a copy of datagram (must already have TTL decremented + encoded).
+ * Insert a datagram (TTL already decremented + encoded).  When the cache has
+ * retain/release hooks and the buffer is shared (pool pointer), the cache
+ * stores the address and retains; otherwise it malloc-copies.
  * Only WIRE_TYPE_DATA. On DUPLICATE/MISMATCH/ADMISSION_FAILED the cache is
  * unchanged (or not created); caller still decides opaque forward.
  *
@@ -168,6 +170,10 @@ struct GenerationCache {
     GenerationCacheFlowAccount *flow_accounts;
     size_t                      flow_account_cap;
     GenerationCacheStats        stats;
+    int                       (*is_shared_fn)(const uint8_t *ptr, void *ctx);
+    void                      (*retain_fn)(uint8_t *ptr, void *ctx);
+    void                      (*release_fn)(uint8_t *ptr, void *ctx);
+    void                       *buf_ctx;
 };
 
 #endif /* WIRE_RELAY_GENERATION_CACHE_H */

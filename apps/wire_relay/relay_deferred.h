@@ -43,6 +43,7 @@ typedef struct RelayDeferredPacket {
     size_t   len;
     uint32_t flow_id;
     uint64_t enqueue_ns;
+    uint8_t  prefer_head; /* ACK: jump ahead of queued DATA on this flow */
 } RelayDeferredPacket;
 
 typedef enum {

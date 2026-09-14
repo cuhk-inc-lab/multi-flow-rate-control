@@ -130,6 +130,10 @@ static void relay_packet_free_cb(uint8_t *datagram, void *ctx)
     }
 }
 
+static int lookup_return_route(RelayCtx *ctx, uint32_t flow_id,
+                               struct sockaddr_storage *peer,
+                               socklen_t *peer_len);
+
 static uint8_t *relay_buf_acquire(RelayCtx *ctx)
 {
     if (ctx != NULL && ctx->dgram_pool_inited) {
@@ -148,6 +152,46 @@ static void relay_buf_release(RelayCtx *ctx, uint8_t *datagram)
     } else {
         free(datagram);
     }
+}
+
+/*
+ * Prefer a second owner on a pool buffer over memcpy of the payload.
+ * Foreign (non-slab) pointers and plus-minus egress (in-place mutate) copy.
+ */
+static uint8_t *relay_share_or_copy(RelayCtx *ctx, const uint8_t *datagram,
+                                    size_t len)
+{
+    uint8_t *owned;
+
+    if (ctx != NULL && ctx->dgram_pool_inited &&
+        ctx->config.egress_fn == NULL &&
+        datagram_pool_contains(&ctx->dgram_pool, datagram)) {
+        datagram_pool_retain(&ctx->dgram_pool, (uint8_t *)datagram);
+        return (uint8_t *)datagram;
+    }
+    owned = relay_buf_acquire(ctx);
+    if (owned == NULL) {
+        return NULL;
+    }
+    if (len > 0 && datagram != NULL) {
+        memcpy(owned, datagram, len);
+    }
+    return owned;
+}
+
+static void cache_retain_cb(uint8_t *ptr, void *opaque)
+{
+    datagram_pool_retain(&((RelayCtx *)opaque)->dgram_pool, ptr);
+}
+
+static void cache_release_cb(uint8_t *ptr, void *opaque)
+{
+    datagram_pool_release(&((RelayCtx *)opaque)->dgram_pool, ptr);
+}
+
+static int cache_is_shared_cb(const uint8_t *ptr, void *opaque)
+{
+    return datagram_pool_contains(&((RelayCtx *)opaque)->dgram_pool, ptr);
 }
 
 static int open_listen_socket(uint16_t port)
@@ -345,7 +389,8 @@ static void print_stats(const RelayCtx *ctx)
             "ack_egress_immediate=%llu ack_egress_waited=%llu "
             "ack_egress_wait_ns_total=%llu ack_egress_wait_ns_max=%llu "
             "ack_egress_high_watermark=%llu "
-            "deferred_hwm=%llu\n",
+            "deferred_hwm=%llu forward_data=%llu forward_ack=%llu "
+            "drop_no_return_hop=%llu\n",
             (unsigned)ctx->config.local_node_id,
             ctx->config.egress_capacity,
             (unsigned)RELAY_ACK_EGRESS_CAPACITY,
@@ -376,7 +421,10 @@ static void print_stats(const RelayCtx *ctx)
             (unsigned long long)ack_eq.wait_ns_total,
             (unsigned long long)ack_eq.wait_ns_max,
             (unsigned long long)ack_eq.high_watermark,
-            (unsigned long long)ds.high_watermark);
+            (unsigned long long)ds.high_watermark,
+            (unsigned long long)ctx->total.forward_data,
+            (unsigned long long)ctx->total.forward_ack,
+            (unsigned long long)ctx->total.drop_no_return_hop);
     if (gs != NULL) {
         fprintf(stderr,
                 "wire-relay: gen_cache created=%llu ready=%llu timeout=%llu "
@@ -465,6 +513,31 @@ typedef struct DecodeReencodeEmitBatch {
     ForwardPending   *items;
 } DecodeReencodeEmitBatch;
 
+static void fill_egress_dest(RelayCtx *ctx, ForwardPending *pending)
+{
+    struct sockaddr_storage learned;
+    socklen_t learned_len = 0;
+
+    if (ctx == NULL || pending == NULL) {
+        return;
+    }
+    if (pending->ack_lane) {
+        if (lookup_return_route(ctx, pending->pkt.flow_id, &learned,
+                                &learned_len)) {
+            pending->pkt.dest = learned;
+            pending->pkt.dest_len = learned_len;
+        } else if (ctx->have_return_hop) {
+            pending->pkt.dest = ctx->return_hop;
+            pending->pkt.dest_len = ctx->return_hop_len;
+        } else {
+            pending->pkt.dest_len = 0;
+        }
+        return;
+    }
+    pending->pkt.dest = ctx->next_hop;
+    pending->pkt.dest_len = ctx->next_hop_len;
+}
+
 static void prepare_forward_pending(ForwardPending *pending,
                                     RelayFlowStats *slot,
                                     uint8_t **datagram_owned, size_t len,
@@ -484,6 +557,7 @@ static void prepare_forward_pending(ForwardPending *pending,
     pending->pkt.flow_id = header->flow_id;
     pending->pkt.generation_id = header->block_id;
     pending->pkt.enqueue_ns = relay_mono_ns();
+    pending->pkt.prefer_head = 0;
     *datagram_owned = NULL;
 }
 
@@ -504,6 +578,7 @@ static void relay_apply_forward_pending(RelayCtx *ctx, ForwardPending *pending)
     }
 
     queue = pending->ack_lane ? &ctx->ack_egress : &ctx->data_egress;
+    fill_egress_dest(ctx, pending);
     if (ctx->config.egress_wait_ms == 0) {
         est = egress_queue_try_enqueue(queue, &pending->pkt);
         if (est == EGRESS_OK) {
@@ -579,11 +654,10 @@ static int decode_reencode_emit_cb(const uint8_t *datagram, size_t len,
     if (batch->relay == NULL || len > RELAY_MAX_DATAGRAM) {
         return -1;
     }
-    owned = relay_buf_acquire(batch->relay);
+    owned = relay_share_or_copy(batch->relay, datagram, len);
     if (owned == NULL) {
         return -1;
     }
-    memcpy(owned, datagram, len);
     item = &batch->items[batch->count];
     prepare_forward_pending(item, batch->slot, &owned, len, &hdr,
                             batch->source);
@@ -663,7 +737,6 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
     WireHeader header;
     RelayFlowStats *slot;
     uint8_t *datagram;
-    uint8_t *recode_out = NULL;
     size_t out_len;
     uint64_t now_ns;
     GenerationEntry *gen = NULL;
@@ -789,26 +862,16 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
     }
 
     out_len = len;
-    if (ctx->config.recode_fn != NULL &&
-        header.version == WIRE_VERSION_V3) {
-        recode_out = relay_buf_acquire(ctx);
-        if (recode_out == NULL) {
-            relay_buf_release(ctx, datagram);
-            return RELAY_INGRESS_ERR_ALLOC;
-        }
-        if (ctx->config.recode_fn(datagram, len, recode_out, RELAY_MAX_DATAGRAM,
+    if (ctx->config.recode_fn != NULL) {
+        if (ctx->config.recode_fn(datagram, len, datagram, RELAY_MAX_DATAGRAM,
                                   &out_len, &header,
                                   ctx->config.recode_ctx) != 0 ||
             out_len == 0 || out_len > RELAY_MAX_DATAGRAM) {
             slot->drop_malformed++;
             ctx->total.drop_malformed++;
             relay_buf_release(ctx, datagram);
-            relay_buf_release(ctx, recode_out);
             return RELAY_INGRESS_OK;
         }
-        relay_buf_release(ctx, datagram);
-        datagram = recode_out;
-        recode_out = NULL;
         if (wire_header_decode(&header, datagram, out_len) != 0) {
             slot->drop_malformed++;
             ctx->total.drop_malformed++;
@@ -859,8 +922,8 @@ static RelayIngressStatus ingress_submit_owned(RelayCtx *ctx,
         }
     } else if (ctx->config.decode_reencode_fn != NULL) {
         /*
-         * Hook may still observe packets without cache; gen is NULL.
-         * Without cache there is no emit batch path for generation replace.
+         * v4 (and any non-cached DATA) still enters the hook with gen=NULL.
+         * Stub returns OPAQUE; a future fountain recode fills this in.
          */
         dra = ctx->config.decode_reencode_fn(
             &header, datagram, out_len, NULL, GEN_INSERT_INVALID, NULL, NULL,
@@ -974,8 +1037,8 @@ static void sync_deferred_drops_to_total(RelayCtx *ctx)
  * Minimal RX parse via wire_header_decode (length / magic / version / endian).
  * Does not perform destination, TTL, cache, or recode work.
  */
-static int relay_parse_flow_id_min(const uint8_t *datagram, size_t len,
-                                   uint32_t *flow_id_out)
+static int relay_parse_rx(const uint8_t *datagram, size_t len,
+                          uint32_t *flow_id_out, int *prefer_head_out)
 {
     WireHeader header;
 
@@ -986,6 +1049,12 @@ static int relay_parse_flow_id_min(const uint8_t *datagram, size_t len,
         return -1;
     }
     *flow_id_out = header.flow_id;
+    if (prefer_head_out != NULL) {
+        *prefer_head_out =
+            header.version == WIRE_VERSION_V4 &&
+            header.type == WIRE_TYPE_ACK &&
+            (header.flags & WIRE_FLAG_RETURN_PATH) != 0;
+    }
     return 0;
 }
 
@@ -994,6 +1063,85 @@ static void account_deferred_push_fail(RelayCtx *ctx, RelayDeferredStatus st)
     /* Hub already counted the matching drop_* under deferred.mu. */
     (void)ctx;
     (void)st;
+}
+
+/*
+ * RX fast path for reverse-path ACK: TTL--, try-enqueue ACK lane, never wait.
+ * Returns 1 if the datagram was consumed (enqueued or dropped). Returns 0 if
+ * the caller should use the normal deferred path (not an ACK, recode hook,
+ * local-source ACK, etc.).
+ */
+static int rx_try_fast_ack(RelayCtx *ctx, uint8_t **datagram_owned, size_t len)
+{
+    WireHeader header;
+    EgressPacket pkt;
+    EgressStatus est;
+    RelayFlowStats *slot;
+    uint8_t *datagram;
+
+    if (ctx == NULL || datagram_owned == NULL || *datagram_owned == NULL) {
+        return 0;
+    }
+    if (ctx->config.recode_fn != NULL || ctx->config.egress_fn != NULL) {
+        return 0;
+    }
+    if (len < WIRE_HEADER_SIZE || len > RELAY_MAX_DATAGRAM) {
+        return 0;
+    }
+    if (wire_header_decode(&header, *datagram_owned, len) != 0) {
+        return 0;
+    }
+    if (header.version != WIRE_VERSION_V4 ||
+        header.type != WIRE_TYPE_ACK ||
+        (header.flags & WIRE_FLAG_RETURN_PATH) == 0) {
+        return 0;
+    }
+    if (wire_header_is_local(&header, ctx->config.local_node_id) &&
+        ctx->config.local_source != NULL) {
+        return 0;
+    }
+
+    datagram = *datagram_owned;
+    pthread_mutex_lock(&ctx->ingress_mu);
+    slot = flow_stats_slot(ctx, header.flow_id);
+    slot->rx++;
+    ctx->total.rx++;
+    if (header.ttl <= 1) {
+        slot->drop_ttl++;
+        ctx->total.drop_ttl++;
+        pthread_mutex_unlock(&ctx->ingress_mu);
+        relay_buf_release(ctx, datagram);
+        *datagram_owned = NULL;
+        return 1;
+    }
+    pthread_mutex_unlock(&ctx->ingress_mu);
+
+    header.ttl = (uint8_t)(header.ttl - 1u);
+    wire_header_encode_v4(datagram, &header);
+
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.datagram = datagram;
+    pkt.len = len;
+    pkt.flow_id = header.flow_id;
+    pkt.generation_id = header.block_id;
+    pkt.enqueue_ns = relay_mono_ns();
+    pkt.prefer_head = 1;
+    *datagram_owned = NULL;
+
+    est = egress_queue_try_enqueue(&ctx->ack_egress, &pkt);
+    if (est == EGRESS_OK) {
+        return 1;
+    }
+    pthread_mutex_lock(&ctx->ingress_mu);
+    slot = flow_stats_slot(ctx, header.flow_id);
+    if (est == EGRESS_ERR_FULL) {
+        slot->drop_egress_full++;
+        ctx->total.drop_egress_full++;
+    }
+    pthread_mutex_unlock(&ctx->ingress_mu);
+    relay_buf_release(ctx, pkt.datagram);
+    pkt.datagram = NULL;
+    return 1;
 }
 
 /*
@@ -1007,13 +1155,18 @@ static void rx_enqueue_datagram(RelayCtx *ctx, uint8_t **datagram_owned,
     RelayDeferredPacket pkt;
     RelayDeferredStatus st;
     uint32_t flow_id = 0;
+    int prefer_head = 0;
 
     if (ctx == NULL || datagram_owned == NULL || *datagram_owned == NULL) {
         return;
     }
 
+    if (rx_try_fast_ack(ctx, datagram_owned, len)) {
+        return;
+    }
+
     if (len < WIRE_HEADER_SIZE || len > RELAY_MAX_DATAGRAM ||
-        relay_parse_flow_id_min(*datagram_owned, len, &flow_id) != 0) {
+        relay_parse_rx(*datagram_owned, len, &flow_id, &prefer_head) != 0) {
         pthread_mutex_lock(&ctx->ingress_mu);
         ctx->total.drop_malformed++;
         pthread_mutex_unlock(&ctx->ingress_mu);
@@ -1027,6 +1180,7 @@ static void rx_enqueue_datagram(RelayCtx *ctx, uint8_t **datagram_owned,
     pkt.len = len;
     pkt.flow_id = flow_id;
     pkt.enqueue_ns = relay_mono_ns();
+    pkt.prefer_head = prefer_head ? 1 : 0;
     *datagram_owned = NULL;
 
     st = relay_deferred_hub_try_push(&ctx->deferred, &pkt);
@@ -1135,6 +1289,141 @@ static void tx_test_hold(const RelayCtx *ctx)
     usleep(hold_us);
 }
 
+static void relay_tx_account(RelayCtx *ctx, RelayFlowStats *slot,
+                             const WireHeader *header, int ok)
+{
+    if (!ok) {
+        slot->drop_send++;
+        ctx->total.drop_send++;
+        return;
+    }
+    slot->forward++;
+    ctx->total.forward++;
+    if (header->type == WIRE_TYPE_ACK) {
+        slot->forward_ack++;
+        ctx->total.forward_ack++;
+    } else {
+        slot->forward_data++;
+        ctx->total.forward_data++;
+    }
+}
+
+/*
+ * Emit one dequeued packet. Returns 1 if DATA sendto would block (pkt still
+ * owned) so the caller can drain ACK first. Returns 0 if consumed.
+ *
+ * ACK uses send_sock so a full DATA sndbuf on listen_sock cannot stall the
+ * reverse path. DATA uses listen_sock + MSG_DONTWAIT.
+ */
+static int relay_tx_emit(RelayCtx *ctx, EgressPacket *pkt, int data_dontwait)
+{
+    RelayFlowStats *slot;
+    WireHeader header;
+    const struct sockaddr *target;
+    socklen_t target_len;
+    int return_path;
+    int send_fd;
+    struct sockaddr_storage learned;
+    socklen_t learned_len = 0;
+    ssize_t sent;
+    int flags;
+
+    if (ctx == NULL || pkt == NULL || pkt->datagram == NULL) {
+        return 0;
+    }
+
+    slot = flow_stats_slot(ctx, pkt->flow_id);
+    if (wire_header_decode(&header, pkt->datagram, pkt->len) != 0) {
+        slot->drop_malformed++;
+        ctx->total.drop_malformed++;
+        relay_buf_release(ctx, pkt->datagram);
+        pkt->datagram = NULL;
+        return 0;
+    }
+    return_path = header.version == WIRE_VERSION_V4 &&
+                  (header.flags & WIRE_FLAG_RETURN_PATH) != 0;
+    if (return_path) {
+        if (lookup_return_route(ctx, header.flow_id, &learned,
+                                &learned_len)) {
+            target = (const struct sockaddr *)&learned;
+            target_len = learned_len;
+        } else if (ctx->have_return_hop) {
+            target = (const struct sockaddr *)&ctx->return_hop;
+            target_len = ctx->return_hop_len;
+        } else {
+            slot->drop_no_return_hop++;
+            ctx->total.drop_no_return_hop++;
+            relay_buf_release(ctx, pkt->datagram);
+            pkt->datagram = NULL;
+            return 0;
+        }
+        send_fd = ctx->send_sock >= 0 ? ctx->send_sock : ctx->listen_sock;
+    } else {
+        target = (const struct sockaddr *)&ctx->next_hop;
+        target_len = ctx->next_hop_len;
+        send_fd = ctx->listen_sock;
+    }
+    if (ctx->config.egress_fn != NULL) {
+        if (ctx->config.egress_fn(pkt->datagram, pkt->len, &header,
+                                  ctx->config.egress_ctx) != 0) {
+            slot->drop_malformed++;
+            ctx->total.drop_malformed++;
+            relay_buf_release(ctx, pkt->datagram);
+            pkt->datagram = NULL;
+            return 0;
+        }
+    }
+
+    if (ctx->tx_capture_fn != NULL) {
+        ctx->tx_capture_fn(pkt->datagram, pkt->len, ctx->tx_capture_ctx);
+        relay_tx_account(ctx, slot, &header, 1);
+        relay_buf_release(ctx, pkt->datagram);
+        pkt->datagram = NULL;
+        return 0;
+    }
+
+    flags = (!return_path && data_dontwait) ? MSG_DONTWAIT : 0;
+    do {
+        sent = sendto(send_fd, pkt->datagram, pkt->len, flags,
+                      target, target_len);
+    } while (sent < 0 && errno == EINTR);
+
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+        !return_path && data_dontwait) {
+        return 1;
+    }
+    relay_tx_account(ctx, slot, &header,
+                     sent >= 0 && (size_t)sent == pkt->len);
+    relay_buf_release(ctx, pkt->datagram);
+    pkt->datagram = NULL;
+    return 0;
+}
+
+static void relay_tx_drain_acks(RelayCtx *ctx)
+{
+    EgressPacket ack;
+
+    if (ctx == NULL) {
+        return;
+    }
+    while (egress_queue_try_dequeue(&ctx->ack_egress, &ack) == EGRESS_OK) {
+        (void)relay_tx_emit(ctx, &ack, 0);
+    }
+}
+
+static void relay_tx_wait_data_writable(const RelayCtx *ctx)
+{
+    struct pollfd pfd;
+
+    if (ctx == NULL || ctx->listen_sock < 0) {
+        return;
+    }
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = ctx->listen_sock;
+    pfd.events = POLLOUT;
+    (void)poll(&pfd, 1, 1);
+}
+
 static void *tx_worker_main(void *arg)
 {
     RelayCtx *ctx = arg;
@@ -1142,14 +1431,6 @@ static void *tx_worker_main(void *arg)
     while (1) {
         EgressPacket pkt;
         EgressStatus st;
-        ssize_t sent;
-        RelayFlowStats *slot;
-        WireHeader header;
-        const struct sockaddr *target;
-        socklen_t target_len;
-        struct sockaddr_storage learned_return;
-        socklen_t learned_return_len = 0;
-        int return_path;
 
         st = egress_fair_dequeue(&ctx->egress_dequeuer, &pkt);
         if (st == EGRESS_ERR_SHUTDOWN) {
@@ -1162,82 +1443,10 @@ static void *tx_worker_main(void *arg)
         /* After ownership leaves the queue, before send/capture. */
         tx_test_hold(ctx);
 
-        slot = flow_stats_slot(ctx, pkt.flow_id);
-        if (wire_header_decode(&header, pkt.datagram, pkt.len) != 0) {
-            slot->drop_malformed++;
-            ctx->total.drop_malformed++;
-            relay_buf_release(ctx, pkt.datagram);
-            continue;
+        while (relay_tx_emit(ctx, &pkt, 1) == 1) {
+            relay_tx_drain_acks(ctx);
+            relay_tx_wait_data_writable(ctx);
         }
-        return_path = header.version == WIRE_VERSION_V4 &&
-                      (header.flags & WIRE_FLAG_RETURN_PATH) != 0;
-        if (return_path) {
-            if (lookup_return_route(ctx, header.flow_id, &learned_return,
-                                    &learned_return_len)) {
-                target = (const struct sockaddr *)&learned_return;
-                target_len = learned_return_len;
-            } else if (ctx->have_return_hop) {
-                target = (const struct sockaddr *)&ctx->return_hop;
-                target_len = ctx->return_hop_len;
-            } else {
-                slot->drop_no_return_hop++;
-                ctx->total.drop_no_return_hop++;
-                relay_buf_release(ctx, pkt.datagram);
-                continue;
-            }
-        } else {
-            target = (const struct sockaddr *)&ctx->next_hop;
-            target_len = ctx->next_hop_len;
-        }
-        if (ctx->config.egress_fn != NULL) {
-            if (ctx->config.egress_fn(pkt.datagram, pkt.len, &header,
-                                      ctx->config.egress_ctx) != 0) {
-                slot->drop_malformed++;
-                ctx->total.drop_malformed++;
-                relay_buf_release(ctx, pkt.datagram);
-                continue;
-            }
-        }
-
-        if (ctx->tx_capture_fn != NULL) {
-            ctx->tx_capture_fn(pkt.datagram, pkt.len, ctx->tx_capture_ctx);
-            slot->forward++;
-            ctx->total.forward++;
-            if (header.type == WIRE_TYPE_ACK) {
-                slot->forward_ack++;
-                ctx->total.forward_ack++;
-            } else {
-                slot->forward_data++;
-                ctx->total.forward_data++;
-            }
-            relay_buf_release(ctx, pkt.datagram);
-            continue;
-        }
-
-        do {
-            /*
-             * Use the listening socket so downstream ACK replies naturally
-             * return to this relay's configured listen port.
-             */
-            sent = sendto(ctx->listen_sock, pkt.datagram, pkt.len, 0,
-                          target, target_len);
-        } while (sent < 0 && errno == EINTR);
-
-        if (sent < 0 || (size_t)sent != pkt.len) {
-            slot->drop_send++;
-            ctx->total.drop_send++;
-        } else {
-            slot->forward++;
-            ctx->total.forward++;
-            if (header.type == WIRE_TYPE_ACK) {
-                slot->forward_ack++;
-                ctx->total.forward_ack++;
-            } else {
-                slot->forward_data++;
-                ctx->total.forward_data++;
-            }
-        }
-        relay_buf_release(ctx, pkt.datagram);
     }
     return NULL;
 }
@@ -1254,8 +1463,8 @@ static void relay_ctx_cleanup(RelayCtx *ctx)
      *  2) join local source (injects fail with SHUTDOWN once stop set)
      *  3) deferred hub shutdown + join processing
      *  4) wait inject_in_flight; destroy generation cache
-     *  5) both egress lanes shutdown + join TX
-     *  6) destroy fair dequeuer and both egress lanes
+     *  5) ACK+DATA egress shutdown + join TX
+     *  6) destroy fair dequeuer and both egress queues
      *  7) destroy deferred (free residual datagrams once)
      *  8) destroy mutexes / sockets
      */
@@ -1376,7 +1585,7 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
 
     {
         size_t pool_cap = ctx->config.deferred_total + egress_cap +
-                          (size_t)RELAY_ACK_EGRESS_CAPACITY + 1024u;
+                          RELAY_ACK_EGRESS_CAPACITY + 1024u;
 
         if (pool_cap < DATAGRAM_POOL_DEFAULT_CAPACITY) {
             pool_cap = DATAGRAM_POOL_DEFAULT_CAPACITY;
@@ -1402,7 +1611,6 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         pthread_mutex_destroy(&ctx->ingress_mu);
         return -1;
     }
-    egress_queue_set_packet_free(&ctx->data_egress, relay_packet_free_cb, ctx);
     if (egress_queue_init(&ctx->ack_egress,
                           RELAY_ACK_EGRESS_CAPACITY) != EGRESS_OK) {
         egress_queue_destroy(&ctx->data_egress);
@@ -1413,7 +1621,6 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         pthread_mutex_destroy(&ctx->ingress_mu);
         return -1;
     }
-    egress_queue_set_packet_free(&ctx->ack_egress, relay_packet_free_cb, ctx);
     if (egress_fair_dequeuer_init(&ctx->egress_dequeuer,
                                   &ctx->ack_egress, &ctx->data_egress,
                                   RELAY_ACK_EGRESS_QUOTA) != EGRESS_OK) {
@@ -1426,6 +1633,8 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
         pthread_mutex_destroy(&ctx->ingress_mu);
         return -1;
     }
+    egress_queue_set_packet_free(&ctx->data_egress, relay_packet_free_cb, ctx);
+    egress_queue_set_packet_free(&ctx->ack_egress, relay_packet_free_cb, ctx);
 
     memset(&dcfg, 0, sizeof(dcfg));
     dcfg.max_active_flows = ctx->config.max_active_flows;
@@ -1461,6 +1670,13 @@ static int relay_ctx_init_common(RelayCtx *ctx, const RelayConfig *config,
             ctx->ingress_idle_inited = 0;
             pthread_mutex_destroy(&ctx->ingress_mu);
             return -1;
+        }
+        /* Share pool pointers with cache unless TX mutates after dequeue. */
+        if (ctx->config.egress_fn == NULL) {
+            ctx->gen_cache.is_shared_fn = cache_is_shared_cb;
+            ctx->gen_cache.retain_fn = cache_retain_cb;
+            ctx->gen_cache.release_fn = cache_release_cb;
+            ctx->gen_cache.buf_ctx = ctx;
         }
     }
 
@@ -1862,10 +2078,10 @@ RelayStatus relay_run(const RelayConfig *config)
             DecodeReencodeEmitBatch emit_batch;
 
             memset(&deferred, 0, sizeof(deferred));
-    deferred.relay = ctx;
+            deferred.relay = &ctx;
             memset(&forward_pending, 0, sizeof(forward_pending));
             memset(&emit_batch, 0, sizeof(emit_batch));
-    emit_batch.relay = ctx;
+            emit_batch.relay = &ctx;
             pthread_mutex_lock(&ctx.ingress_mu);
             (void)ingress_submit_owned(&ctx, &owned, (size_t)received,
                                        RELAY_SRC_PREVIOUS_NODE, &deferred,

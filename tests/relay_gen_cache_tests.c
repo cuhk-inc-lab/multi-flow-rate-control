@@ -1,3 +1,4 @@
+#include "datagram_pool.h"
 #include "egress_queue.h"
 #include "generation_cache.h"
 #include "recode.h"
@@ -1171,6 +1172,60 @@ static void test_bats_identity_hold_emit(void)
     pthread_cond_destroy(&cap.cv);
 }
 
+static int test_pool_is_shared(const uint8_t *ptr, void *ctx)
+{
+    return datagram_pool_contains(ctx, ptr);
+}
+
+static void test_pool_retain(uint8_t *ptr, void *ctx)
+{
+    datagram_pool_retain(ctx, ptr);
+}
+
+static void test_pool_release(uint8_t *ptr, void *ctx)
+{
+    datagram_pool_release(ctx, ptr);
+}
+
+static void test_cache_shares_pool_pointer(void)
+{
+    GenerationCache cache;
+    GenerationCacheConfig cfg;
+    DatagramPool pool;
+    GenerationEntry *entry = NULL;
+    WireHeader hdr;
+    uint8_t *buf;
+    size_t len;
+    DatagramPoolStats ps;
+
+    EXPECT(datagram_pool_init(&pool, 8, RELAY_MAX_DATAGRAM) == 0);
+    generation_cache_config_defaults(&cfg);
+    EXPECT(generation_cache_init(&cache, &cfg) == 0);
+    cache.is_shared_fn = test_pool_is_shared;
+    cache.retain_fn = test_pool_retain;
+    cache.release_fn = test_pool_release;
+    cache.buf_ctx = &pool;
+
+    buf = datagram_pool_acquire(&pool);
+    EXPECT(buf != NULL);
+    len = make_data_datagram(buf, RELAY_MAX_DATAGRAM, 9, 1, 0, 1, 4, 7, 8, 8,
+                             0x5A);
+    EXPECT(len > 0);
+    EXPECT(wire_header_decode(&hdr, buf, len) == 0);
+    EXPECT(generation_cache_insert(&cache, &hdr, buf, len, 1000ull, &entry) ==
+           GEN_INSERT_OK);
+    EXPECT(entry != NULL);
+    EXPECT(entry->slots[0].datagram_copy == buf);
+
+    datagram_pool_release(&pool, buf);
+    EXPECT(entry->slots[0].datagram_copy[WIRE_HEADER_SIZE] == 0x5A);
+
+    generation_cache_destroy(&cache);
+    datagram_pool_stats_snapshot(&pool, &ps);
+    EXPECT(ps.release_pooled >= 1);
+    datagram_pool_destroy(&pool);
+}
+
 int main(void)
 {
     test_key_isolation_flow();
@@ -1195,6 +1250,7 @@ int main(void)
     test_cache_repeated_evictions_keep_accounts_consistent();
     test_local_packets_still_bypass_generation_cache();
     test_bats_identity_hold_emit();
+    test_cache_shares_pool_pointer();
 
     if (g_failures != 0) {
         fprintf(stderr, "relay_gen_cache_tests: %d failure(s)\n", g_failures);

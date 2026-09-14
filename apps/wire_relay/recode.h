@@ -14,10 +14,10 @@
  * Pipeline position:
  *   UDP in → ttl==0? drop → local? decode : TTL-- → [here] → egress
  *
- * Today neither hook performs real FEC work:
- *   - recode_fn: optional per-datagram transform (NULL = opaque forward)
- *   - decode_reencode_fn: reserved for Phase 3A generation-level
- *     decode-and-reencode (NULL = never invoked; stub returns OPAQUE)
+ * recode_fn is in-place capable (in == out skips memcpy). It runs for every
+ * forwarded datagram version, including wirehair v4; NULL still means skip.
+ * decode_reencode_fn is generation-level (HOLD / EMIT / OPAQUE). Stub returns
+ * OPAQUE so a future fountain recode can land here without changing the pipe.
  *
  * Phase 3B true network recode needs a future wire version with coding
  * vectors; do not overload these hooks for that.

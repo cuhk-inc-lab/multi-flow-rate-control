@@ -280,7 +280,7 @@ Multi-segment window, recvmmsg, and the multi-flow pacer belong in
 | `apps/wg_multi_pipeline/pipeline.c` | Multi-flow + shared pacer |
 | `apps/wg_multi_pipeline/main.c` | CLI |
 | `apps/wire_relay/relay.c` | Forward, ACK return, route learn |
-| `apps/wire_relay/egress_queue.c` | ACK/DATA lanes |
+| `apps/wire_relay/egress_queue.c` | Single exit queue |
 | `src/fec_transport.c` | Socket-free RS + Wirehair |
 | `include/fec_transport.h` | Public library API |
 | `third_party/wirehair` | Fountain math |

@@ -216,6 +216,35 @@ static void test_fifo_order(void)
     egress_queue_destroy(&q);
 }
 
+static void test_prefer_head_jumps_fifo(void)
+{
+    EgressQueue q;
+    EgressPacket data1;
+    EgressPacket data2;
+    EgressPacket ack;
+    EgressPacket out;
+
+    EXPECT(egress_queue_init(&q, 8) == EGRESS_OK);
+    data1 = make_pkt(1);
+    data2 = make_pkt(2);
+    ack = make_pkt(9);
+    ack.prefer_head = 1;
+    EXPECT(egress_queue_try_enqueue(&q, &data1) == EGRESS_OK);
+    EXPECT(egress_queue_try_enqueue(&q, &data2) == EGRESS_OK);
+    EXPECT(egress_queue_try_enqueue(&q, &ack) == EGRESS_OK);
+
+    EXPECT(egress_queue_dequeue(&q, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 9);
+    free(out.datagram);
+    EXPECT(egress_queue_dequeue(&q, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 1);
+    free(out.datagram);
+    EXPECT(egress_queue_dequeue(&q, &out) == EGRESS_OK);
+    EXPECT(out.datagram[0] == 2);
+    free(out.datagram);
+    egress_queue_destroy(&q);
+}
+
 static void test_high_watermark(void)
 {
     EgressQueue q;
@@ -416,6 +445,7 @@ int main(void)
     test_timed_enqueue_timeout_ownership();
     test_timed_enqueue_shutdown_wakeup();
     test_fifo_order();
+    test_prefer_head_jumps_fifo();
     test_high_watermark();
     test_fair_ack_priority();
     test_fair_quota_prevents_data_starvation();

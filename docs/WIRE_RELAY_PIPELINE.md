@@ -56,11 +56,14 @@ UDP in
   → final_dst == local_node_id?
         yes → delivery_fn (LocalDecodeHub → file); no TTL-- / egress
         no  → TTL--
-            → [optional] recode_fn            # per-datagram; NULL = skip
-            → [--process cache] GenerationCache
-            → [optional] decode_reencode_fn   # HOLD / EMIT / OPAQUE
-            → ACK/Data EgressQueues → fair TX → [optional] egress_fn
-              → sendto(next-hop or learned return route)
+            → [optional] recode_fn            # in-place; all versions; NULL = skip
+            → [--process cache] GenerationCache  # v3; pool pointer retain
+            → [optional] decode_reencode_fn   # HOLD / EMIT / OPAQUE (v4 too)
+            → ACK: RX fast-path → ACK EgressQueue (skip deferred)
+              DATA: deferred → processing → DATA EgressQueue
+              → fair TX → [optional] egress_fn
+              → ACK sendto(send_sock, learned previous hop at send time)
+              → DATA sendto(listen_sock, MSG_DONTWAIT, --next-hop)
 
 Local file / FIFO (--source)
   → encode → fill final_dst/ttl → relay_inject_wire_datagram
@@ -83,7 +86,7 @@ Locality is **only** `final_dst == local_node_id` (never UDP/IP dst).
 
 | Phase | Scope | Status |
 |-------|--------|--------|
-| **1** | Opaque multi-flow forward + ACK/Data egress lanes + wire-level inject | **Implemented** |
+| **1** | Opaque multi-flow forward + single egress queue + wire-level inject | **Implemented** |
 | **2** | Copy-based GenerationCache + process hook; still opaque forward | **Implemented** |
 | **L0** | Extract reusable `WireFlowDecoder` from udp-recv | **Implemented** |
 | **L1** | Explicit-hop relay local-destination decode (`--output FILE`) | **Implemented** |
@@ -155,10 +158,13 @@ inject (harness): synchronous; does not enter deferred
 UDP RX → deferred → processing worker
   → ingress_mu
   → dest check / TTL-- (encode into datagram)
-  → DATA + --process cache: copy into GenerationCache; process hook
+  → DATA + --process cache: retain pool pointer (or copy if foreign)
   → END/control: expire stale gens for flow; never cache; enqueue
-  → build ForwardPending under ingress_mu; enqueue outside ingress_mu
-  → classify v4 RETURN_PATH ACK vs DATA/other egress lane → fair TX
+  → build ForwardPending under ingress_mu; copy dest sockaddr; enqueue outside
+  → ACK: RX fast-path → ACK EgressQueue → fair TX
+      sendto(send_sock, learned previous hop at send time)
+  → DATA: deferred → processing → DATA EgressQueue → fair TX
+      sendto(listen_sock, MSG_DONTWAIT, --next-hop)
 ```
 
 Defaults:
@@ -168,42 +174,34 @@ Defaults:
 - `--egress-wait-ms 0` — try-drop baseline; `>0` timed wait on **processing worker only**.
 - `--deferred-per-flow 4096`, `--deferred-total 32768`, `--max-active-flows 64`
   (sized for ~1 Gbps opaque-forward bursts; override downward to save memory).
-- `--egress-capacity 16384` for DATA/other; ACK capacity is fixed at 1024.
-- Limits: `gen_timeout_ms=500`, `max_gens=256`, `max_gens_per_flow=32`,
-  `max_cache_bytes=32MiB`.
+- `--egress-capacity 16384` for the DATA exit queue (ACK lane is 1024).
 
-### Dual-lane egress, fairness, and backpressure
+### Dual-queue egress and backpressure
 
-Two independent FIFO queues sit between the **processing worker** and TX:
+DATA sits on one FIFO between the **processing worker** and TX. Reverse-path
+ACK skips deferred: RX try-enqueues a separate 1024-slot ACK queue. TX
+fair-dequeues ACK first (quota 8) and emits ACK on `send_sock`. DATA
+`sendto` on `listen_sock` uses `MSG_DONTWAIT`; if the DATA sndbuf is full,
+TX drains ACK before retrying.
 
-- ACK lane: only wire v4 packets with type `ACK` and
-  `WIRE_FLAG_RETURN_PATH`; fixed capacity 1024.
-- DATA lane: DATA and every other packet; `--egress-capacity` retains its
-  existing default and CLI meaning.
+Each queued packet carries the payload pointer. TX re-resolves ACK dest from
+the learned previous hop at send time; DATA uses `--next-hop`.
 
-TX checks ACK first, but after eight consecutive ACK dequeues it must select
-one DATA packet if DATA is waiting. If DATA is empty, ACK continues
-immediately; if ACK is empty, DATA continues immediately. Both queues notify
-one shared condition-generation waiter, so an empty TX blocks without
-busy-spin and cannot miss an enqueue or either-lane shutdown transition. TX
-exits only after both lanes are shutdown and drained. Learned per-flow return
-route selection remains after dequeue and is unchanged.
-
-UDP RX never waits on either egress queue.
+UDP RX never waits on the egress queues. ACK does not enter `RelayDeferredHub`.
 | `--egress-wait-ms` | Behavior on full queue |
 |--------------------|-------------------------|
-| `0` | Non-blocking `try_enqueue` on the selected lane; drop new packet → `drop_egress_full` |
-| `>0` | Wait up to N ms for selected-lane space via `pthread_cond_timedwait`; timeout drops new packet → `drop_egress_timeout` |
+| `0` | Non-blocking `try_enqueue`; drop new packet → `drop_egress_full` |
+| `>0` | Wait up to N ms for space via `pthread_cond_timedwait`; timeout drops new packet → `drop_egress_timeout` |
 
 - Never drop-oldest; never overwrite queued packets.
 - Processing builds `ForwardPending` under `ingress_mu`, then enqueues **outside**
   `ingress_mu` so timed wait does not block cache work on the mutex.
-  UDP RX only enqueues into `RelayDeferredHub` and never waits on egress.
-- Per-lane summary metrics: `ack_egress_*` and `data_egress_*`, each reporting
-  enqueue-immediate, enqueue-waited, wait-ns total/max, and high watermark.
-  `relay_egress_stats_snapshot()` remains compatible as a DATA-lane snapshot;
-  `relay_ack_egress_stats_snapshot()` and
-  `relay_data_egress_stats_snapshot()` are explicit.
+  UDP RX enqueues DATA into `RelayDeferredHub` and never waits on egress.
+  Reverse-path ACK is try-enqueued to the ACK lane from the RX thread.
+- Summary metrics: `ack_egress_*` and `data_egress_*` (enqueue-immediate,
+  enqueue-waited, wait-ns total/max, high watermark).
+  `relay_ack_egress_stats_snapshot()` / `relay_data_egress_stats_snapshot()`
+  read those two queues.
 - Per-flow drop counters: `drop_egress_full` (try path), `drop_egress_timeout` (timed path).
 - Deferred hub drops (new packet only): `drop_deferred_overflow_flow`,
   `drop_deferred_overflow_total`, `drop_deferred_table_full`.
@@ -211,8 +209,8 @@ UDP RX never waits on either egress queue.
   may still report incomplete / missing groups — a fundamental UDP + bounded-queue
   limitation, not masked as success.
 
-Cache copy and EgressPacket ownership are **independent**. On admission failure,
-default policy is **still forward** the current packet without caching
+Cache and EgressPacket may **share** a pool buffer via refcount. On admission
+failure, default policy is **still forward** the current packet without caching
 (`gen_admission_failed++`).
 
 ### Local source (S0)

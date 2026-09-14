@@ -57,10 +57,15 @@ static void waiter_notify(EgressQueueWaiter *waiter)
 static EgressStatus enqueue_locked(EgressQueue *q, EgressPacket *pkt, int waited,
                                    uint64_t wait_ns)
 {
-    q->slots[q->tail] = *pkt;
+    if (pkt->prefer_head) {
+        q->head = (q->head + q->capacity - 1u) % q->capacity;
+        q->slots[q->head] = *pkt;
+    } else {
+        q->slots[q->tail] = *pkt;
+        q->tail = (q->tail + 1u) % q->capacity;
+    }
     pkt->datagram = NULL;
     pkt->len = 0;
-    q->tail = (q->tail + 1u) % q->capacity;
     q->count++;
     record_enqueue_stats(q, waited, wait_ns);
     pthread_cond_signal(&q->not_empty);

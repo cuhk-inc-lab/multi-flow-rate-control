@@ -15,18 +15,23 @@ int datagram_pool_init(DatagramPool *pool, size_t capacity, size_t buf_size)
     pool->buf_size = buf_size;
     pool->slab = (uint8_t *)calloc(capacity, buf_size);
     pool->free_stack = (uint8_t **)calloc(capacity, sizeof(uint8_t *));
-    if (pool->slab == NULL || pool->free_stack == NULL) {
+    pool->refs = (uint32_t *)calloc(capacity, sizeof(uint32_t));
+    if (pool->slab == NULL || pool->free_stack == NULL || pool->refs == NULL) {
         free(pool->slab);
         free(pool->free_stack);
+        free(pool->refs);
         pool->slab = NULL;
         pool->free_stack = NULL;
+        pool->refs = NULL;
         return -1;
     }
     if (pthread_mutex_init(&pool->mu, NULL) != 0) {
         free(pool->slab);
         free(pool->free_stack);
+        free(pool->refs);
         pool->slab = NULL;
         pool->free_stack = NULL;
+        pool->refs = NULL;
         return -1;
     }
     pool->mu_inited = 1;
@@ -48,6 +53,7 @@ void datagram_pool_destroy(DatagramPool *pool)
     }
     free(pool->slab);
     free(pool->free_stack);
+    free(pool->refs);
     memset(pool, 0, sizeof(*pool));
 }
 
@@ -80,6 +86,7 @@ uint8_t *datagram_pool_acquire(DatagramPool *pool)
     if (pool->free_count > 0) {
         pool->free_count--;
         ptr = pool->free_stack[pool->free_count];
+        pool->refs[(size_t)(ptr - pool->slab) / pool->buf_size] = 1u;
         pool->in_use++;
         pool->stats.acquire_pooled++;
         if (pool->in_use > pool->stats.high_watermark_in_use) {
@@ -99,8 +106,25 @@ uint8_t *datagram_pool_acquire(DatagramPool *pool)
     return ptr;
 }
 
+void datagram_pool_retain(DatagramPool *pool, uint8_t *ptr)
+{
+    size_t idx;
+
+    if (pool == NULL || !pool->mu_inited || !datagram_pool_contains(pool, ptr)) {
+        return;
+    }
+    idx = (size_t)(ptr - pool->slab) / pool->buf_size;
+    pthread_mutex_lock(&pool->mu);
+    if (pool->refs[idx] > 0u) {
+        pool->refs[idx]++;
+    }
+    pthread_mutex_unlock(&pool->mu);
+}
+
 void datagram_pool_release(DatagramPool *pool, uint8_t *ptr)
 {
+    size_t idx;
+
     if (ptr == NULL) {
         return;
     }
@@ -114,21 +138,27 @@ void datagram_pool_release(DatagramPool *pool, uint8_t *ptr)
         return;
     }
 
+    idx = (size_t)(ptr - pool->slab) / pool->buf_size;
     pthread_mutex_lock(&pool->mu);
+    if (pool->refs[idx] > 1u) {
+        pool->refs[idx]--;
+        pthread_mutex_unlock(&pool->mu);
+        return;
+    }
+    pool->refs[idx] = 0;
     if (pool->free_count < pool->capacity) {
         pool->free_stack[pool->free_count++] = ptr;
         if (pool->in_use > 0) {
             pool->in_use--;
         }
         pool->stats.release_pooled++;
-    } else {
-        /* Should not happen; treat as foreign to avoid corruption. */
-        pool->stats.release_foreign++;
         pthread_mutex_unlock(&pool->mu);
-        free(ptr);
         return;
     }
+    /* Should not happen; treat as foreign to avoid corruption. */
+    pool->stats.release_foreign++;
     pthread_mutex_unlock(&pool->mu);
+    free(ptr);
 }
 
 void datagram_pool_stats_snapshot(const DatagramPool *pool,

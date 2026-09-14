@@ -449,16 +449,23 @@ cat {slog}
             check=False,
         )
         row["relay_tail"] = rx.stdout[-800:]
+        hwm = re.search(r"(?<![a-z_])egress_high_watermark=(\d+)", rx.stdout)
         data_hwm = re.search(
             r"data_egress_high_watermark=(\d+)", rx.stdout
         )
         ack_hwm = re.search(
             r"ack_egress_high_watermark=(\d+)", rx.stdout
         )
+        if hwm:
+            row["relay_egress_hwm"] = int(hwm.group(1))
         if data_hwm:
             row["relay_data_egress_hwm"] = int(data_hwm.group(1))
+        elif hwm:
+            row["relay_data_egress_hwm"] = int(hwm.group(1))
         if ack_hwm:
             row["relay_ack_egress_hwm"] = int(ack_hwm.group(1))
+        elif hwm:
+            row["relay_ack_egress_hwm"] = int(hwm.group(1))
 
     return row
 

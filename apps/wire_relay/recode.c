@@ -28,7 +28,7 @@ int relay_recode_identity(const uint8_t *in, size_t in_len,
     if (in == NULL || out == NULL || out_len == NULL || in_len > out_cap) {
         return -1;
     }
-    if (in_len > 0) {
+    if (in != out && in_len > 0) {
         memcpy(out, in, in_len);
     }
     *out_len = in_len;
@@ -46,7 +46,9 @@ int relay_recode_payload_add1(const uint8_t *in, size_t in_len,
         !payload_bounds_ok(in_len, hdr)) {
         return -1;
     }
-    memcpy(out, in, in_len);
+    if (in != out) {
+        memcpy(out, in, in_len);
+    }
     if (hdr->type == WIRE_TYPE_DATA) {
         for (byte = 0; byte < (size_t)hdr->payload_len; byte++) {
             out[WIRE_HEADER_SIZE + byte] =

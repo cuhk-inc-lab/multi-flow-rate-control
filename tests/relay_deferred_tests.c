@@ -88,6 +88,49 @@ static uint8_t *make_v4_return_ack(uint32_t flow_id, uint64_t segment_id,
     return buf;
 }
 
+static uint8_t *make_v4_data(uint32_t flow_id, uint64_t segment_id,
+                             size_t *len_out)
+{
+    uint8_t *buf;
+    WireHeader hdr;
+
+    buf = calloc(1, WIRE_V4_HEADER_SIZE + 4u);
+    if (buf == NULL) {
+        return NULL;
+    }
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version = WIRE_VERSION_V4;
+    hdr.type = WIRE_TYPE_DATA;
+    hdr.final_dst = 4;
+    hdr.ttl = 8;
+    hdr.flow_id = flow_id;
+    hdr.block_id = segment_id;
+    hdr.origin_node = 1;
+    hdr.payload_len = 4;
+    wire_header_encode_v4(buf, &hdr);
+    buf[WIRE_V4_HEADER_SIZE] = 0xAB;
+    *len_out = WIRE_V4_HEADER_SIZE + 4u;
+    return buf;
+}
+
+typedef struct {
+    unsigned calls;
+    uint8_t last_version;
+} RecodeCount;
+
+static int counting_recode(const uint8_t *in, size_t in_len, uint8_t *out,
+                           size_t out_cap, size_t *out_len,
+                           const WireHeader *hdr, void *ctx)
+{
+    RecodeCount *count = ctx;
+
+    if (count != NULL && hdr != NULL) {
+        count->calls++;
+        count->last_version = hdr->version;
+    }
+    return relay_recode_identity(in, in_len, out, out_cap, out_len, hdr, ctx);
+}
+
 static RelayDeferredPacket make_pkt(uint32_t flow_id, uint64_t seq)
 {
     RelayDeferredPacket pkt;
@@ -145,6 +188,38 @@ static void test_per_flow_fifo(void)
         free(pkt.datagram);
     }
     EXPECT(relay_deferred_hub_try_pop(&hub, &pkt) == RELAY_DEFERRED_ERR_EMPTY);
+    relay_deferred_hub_destroy(&hub);
+}
+
+static void test_prefer_head_jumps_flow_fifo(void)
+{
+    RelayDeferredHub hub;
+    RelayDeferredHubConfig cfg;
+    RelayDeferredPacket pkt;
+    uint64_t i;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.max_active_flows = 4;
+    cfg.per_flow_capacity = 16;
+    cfg.total_capacity = 64;
+    EXPECT(relay_deferred_hub_init(&hub, &cfg) == RELAY_DEFERRED_OK);
+
+    for (i = 0; i < 3; i++) {
+        pkt = make_pkt(100, i);
+        EXPECT(relay_deferred_hub_try_push(&hub, &pkt) == RELAY_DEFERRED_OK);
+    }
+    pkt = make_pkt(100, 99);
+    pkt.prefer_head = 1;
+    EXPECT(relay_deferred_hub_try_push(&hub, &pkt) == RELAY_DEFERRED_OK);
+
+    EXPECT(relay_deferred_hub_try_pop(&hub, &pkt) == RELAY_DEFERRED_OK);
+    EXPECT(pkt.enqueue_ns == 99);
+    free(pkt.datagram);
+    for (i = 0; i < 3; i++) {
+        EXPECT(relay_deferred_hub_try_pop(&hub, &pkt) == RELAY_DEFERRED_OK);
+        EXPECT(pkt.enqueue_ns == i);
+        free(pkt.datagram);
+    }
     relay_deferred_hub_destroy(&hub);
 }
 
@@ -444,25 +519,33 @@ static void test_relay_ack_data_lane_classification(void)
     EgressQueueStats compat_stats;
     uint8_t *buf;
     size_t len;
+    RecodeCount recode;
 
     memset(&cap, 0, sizeof(cap));
     memset(&cfg, 0, sizeof(cfg));
+    memset(&recode, 0, sizeof(recode));
     cfg.local_node_id = 2;
     cfg.egress_capacity = 16;
+    cfg.recode_fn = counting_recode;
+    cfg.recode_ctx = &recode;
     EXPECT(relay_harness_open(&ctx, &cfg, tx_capture_cb, &cap) == RELAY_OK);
 
     buf = make_v4_return_ack(7, 100, &len);
     EXPECT(buf != NULL);
     EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
     free(buf);
-    buf = make_owned_data(7, 101, WIRE_TYPE_DATA, &len);
+    buf = make_v4_data(7, 101, &len);
     EXPECT(buf != NULL);
     EXPECT(relay_inject_wire_datagram(ctx, buf, len) == RELAY_INGRESS_OK);
     free(buf);
 
+    EXPECT(recode.calls == 2);
+    EXPECT(recode.last_version == WIRE_VERSION_V4);
+
     relay_ack_egress_stats_snapshot(ctx, &ack_stats);
     relay_data_egress_stats_snapshot(ctx, &data_stats);
     relay_egress_stats_snapshot(ctx, &compat_stats);
+    /* ACK uses the dedicated ACK egress lane; DATA uses the data lane. */
     EXPECT(ack_stats.enqueue_immediate == 1);
     EXPECT(data_stats.enqueue_immediate == 1);
     EXPECT(memcmp(&data_stats, &compat_stats, sizeof(data_stats)) == 0);
@@ -576,6 +659,7 @@ int main(void)
 {
     test_hub_init_rejects_bad_config();
     test_per_flow_fifo();
+    test_prefer_head_jumps_flow_fifo();
     test_multi_flow_round_robin_quota();
     test_overflows_and_table_full();
     test_wakeup_and_shutdown();

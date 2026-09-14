@@ -20,12 +20,12 @@ UDP in
   → final_dst == local_node_id?
         yes → [--local-decode] LocalDecodeHub / WireFlowDecoder → file
         no  → TTL--
-            → [--transit-hook identity|plus-minus] ingress transform
+            → [--transit-hook identity|plus-minus] in-place recode_fn
             → [--process cache] GenerationCache
             → [--bats-recoder identity] HOLD until GEN_READY, I×M, EMIT
-              (or [--decode-reencode-stub] always OPAQUE)
-            → ACK/Data EgressQueues → fair TX
-              → [plus-minus: payload -1] → sendto(next-hop/return route)
+              (or identity recode + OPAQUE decode_reencode stub)
+            → one EgressQueue (pointer + dest sockaddr)
+              → [plus-minus: payload -1] → sendto(precomputed dest)
 
 Local file/FIFO
   → [--source] encode → inject → same Destination Check / transit / egress
@@ -100,8 +100,8 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 | `--listen` | UDP bind port |
 | `--next-hop` | `HOST:PORT` for non-local forward |
 | `--idle-exit-sec` | Optional; exit after N seconds with no UDP/source activity (tests) |
-| `--egress-capacity` | DATA/other egress lane slots (default 16384); the ACK lane is fixed at 1024 |
-| `--egress-wait-ms` | Max wait when the selected egress lane is full (default **0** = try-drop); `>0` blocks processing worker only, never UDP RX |
+| `--egress-capacity` | DATA exit queue slots (default 16384); ACK lane is a separate 1024-slot queue |
+| `--egress-wait-ms` | Max wait when the DATA/ACK exit queue is full (default **0** = try-drop); `>0` blocks processing worker only, never UDP RX |
 | `--deferred-per-flow` | Per-flow RX deferred datagram cap (default 4096) |
 | `--deferred-total` | Global RX deferred datagram cap (default 32768) |
 | `--max-active-flows` | Max concurrent wire flow_id slots in deferred hub (1..64, default 64) |
@@ -132,15 +132,14 @@ Relays learn the previous-hop UDP endpoint independently for each forward
 `--return-hop` is retained as a fallback for ACKs that arrive before a route
 has been learned.
 
-Forwarded v4 ACK packets carrying `WIRE_FLAG_RETURN_PATH` use a dedicated
-1024-slot ACK egress lane. All DATA and other packets retain the
-`--egress-capacity` lane. TX prefers ACK but sends one waiting DATA packet
-after at most eight consecutive ACK packets; if only one lane has packets it
-drains that lane without waiting for the other. Shutdown and empty-lane waits
-use a shared condition notification, not polling. Summary output reports
-`ack_egress_*` and `data_egress_*` queue metrics separately. The legacy
-`relay_egress_stats_snapshot()` API remains a DATA-lane snapshot; explicit
-ACK/DATA snapshot APIs are also available.
+Forwarded v4 ACK packets carrying `WIRE_FLAG_RETURN_PATH` skip the deferred
+DATA path: RX TTL-- and try-enqueues a dedicated ACK `EgressQueue`. DATA stays
+on the data queue. TX fair-dequeues ACK first (quota 8) and sends ACK on
+`send_sock` so a full DATA sndbuf cannot block the reverse path. DATA uses
+`listen_sock` with `MSG_DONTWAIT`; if that would block, TX drains ACK first.
+ACK dest is resolved at send time from the learned previous hop. Summary output reports `ack_egress_*` and `data_egress_*`.
+`relay_ack_egress_stats_snapshot()` / `relay_data_egress_stats_snapshot()`
+read those two queues.
 
 Library API (same v4, no sockets):
 **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPORT.md)**.

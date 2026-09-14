@@ -29,6 +29,7 @@ typedef struct DatagramPoolStats {
 typedef struct DatagramPool {
     uint8_t           *slab;       /* capacity * buf_size */
     uint8_t          **free_stack; /* pointers into slab */
+    uint32_t          *refs;       /* per-slot refcount; 0 when on free_stack */
     size_t             capacity;
     size_t             buf_size;
     size_t             free_count;
@@ -45,7 +46,14 @@ void datagram_pool_destroy(DatagramPool *pool);
 uint8_t *datagram_pool_acquire(DatagramPool *pool);
 
 /*
- * Return a buffer. Safe with NULL. Foreign (non-slab) pointers are free()'d.
+ * Extra owner on a slab pointer (cache + egress sharing). No-op for NULL or
+ * foreign malloc fallbacks — those cannot be shared.
+ */
+void datagram_pool_retain(DatagramPool *pool, uint8_t *ptr);
+
+/*
+ * Drop one owner. Slab buffers return to the free list at refcount 0.
+ * Safe with NULL. Foreign (non-slab) pointers are free()'d.
  */
 void datagram_pool_release(DatagramPool *pool, uint8_t *ptr);
 

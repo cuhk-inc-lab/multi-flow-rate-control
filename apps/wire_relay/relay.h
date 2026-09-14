@@ -20,10 +20,11 @@
  *     → final_dst == local_node_id?
  *           yes → delivery_fn (decode → file/app); no TTL-- / no egress
  *           no  → TTL--
- *               → [optional] recode_fn (per-datagram; NULL = opaque)
- *               → [optional] decode_reencode_fn (Phase 3A reserved; stub OPAQUE)
- *               → ACK/Data EgressQueues → fair TX
- *                 → [optional] egress_fn → sendto(next-hop/return route)
+ *               → [optional] recode_fn (in-place; NULL = opaque)
+ *               → [optional] decode_reencode_fn (HOLD / EMIT / OPAQUE)
+ *               → ACK: RX fast-path → ACK EgressQueue (skip deferred)
+ *                 DATA: deferred → processing → DATA EgressQueue
+ *               → fair TX → ACK send_sock / DATA listen_sock (DATA MSG_DONTWAIT)
  *
  *   Local file/FIFO (optional LocalSourceConfig)
  *     → encode → fill final_dst/ttl → relay_inject_wire_datagram
@@ -108,7 +109,8 @@ typedef struct RelayConfig {
     uint16_t            return_hop_port;
     /*
      * Optional per-datagram mid-hop transform after TTL--
-     * (default NULL = opaque forward). When set, must still produce a
+     * (default NULL = skip). Called in-place on the owned buffer for every
+     * forwarded version (v3 and v4). When set, must still produce a
      * complete wire datagram; TX only sends those bytes.
      */
     RelayRecodeFn       recode_fn;
@@ -140,7 +142,7 @@ typedef struct RelayConfig {
     void               *process_ctx;
     /* 0 => run until SIGINT/SIGTERM; otherwise exit after idle seconds. */
     unsigned            idle_exit_sec;
-    /* Packet slots in the DATA/other EgressQueue (default 16384). */
+    /* Packet slots in the DATA EgressQueue (default 16384). ACK lane is 1024. */
     size_t              egress_capacity;
     /*
      * Max wait when EgressQueue is full (milliseconds). 0 = try-drop only

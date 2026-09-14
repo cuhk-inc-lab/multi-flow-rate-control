@@ -34,9 +34,10 @@ static void print_usage(const char *prog)
             "--wh-ack|--no-wh-ack]\n"
             "     [--test-tx-hold-us N]   (TEST ONLY; default 0)\n"
             "\n"
-            "Unified per-node wire v3 pipeline:\n"
+            "Unified per-node wire pipeline (v3 + v4):\n"
             "  UDP in -> ttl==0 drop -> final_dst==me? decode : TTL-- ->\n"
-            "    [optional transit hooks] -> EgressQueue -> next-hop\n"
+            "    [recode_fn] -> [optional cache / decode_reencode] ->\n"
+            "    one EgressQueue -> sendto(precomputed dest)\n"
             "  Local file/FIFO (--source) -> encode -> inject -> same path\n"
             "Phase 3A decode-reencode / 3B network recode are reserved only.\n"
             "Locality is only wire_header_is_local (never UDP/IP dst).\n",

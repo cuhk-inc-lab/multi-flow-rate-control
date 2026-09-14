@@ -79,6 +79,23 @@ static void test_plus_minus_transit_hooks(void)
     }
     memcpy(datagram + WIRE_HEADER_SIZE, original, sizeof(original));
 
+    /* in == out: recode must not require a second packet buffer. */
+    {
+        uint8_t inplace[sizeof(datagram)];
+        size_t inplace_len = 0;
+
+        memcpy(inplace, datagram, sizeof(datagram));
+        EXPECT(relay_recode_identity(inplace, sizeof(inplace), inplace,
+                                     sizeof(inplace), &inplace_len, &hdr,
+                                     NULL) == 0);
+        EXPECT(inplace_len == sizeof(datagram));
+        EXPECT(memcmp(inplace, datagram, sizeof(datagram)) == 0);
+        EXPECT(relay_recode_payload_add1(inplace, sizeof(inplace), inplace,
+                                         sizeof(inplace), &inplace_len, &hdr,
+                                         NULL) == 0);
+        EXPECT(inplace[WIRE_HEADER_SIZE] == (uint8_t)(original[0] + 1u));
+    }
+
     EXPECT(relay_recode_payload_add1(datagram, sizeof(datagram), transformed,
                                      sizeof(transformed), &out_len, &hdr,
                                      NULL) == 0);

@@ -132,7 +132,19 @@ static size_t flow_generation_count(const GenerationCache *cache,
     return 0;
 }
 
-static void entry_free(GenerationEntry *entry)
+static void slot_buf_free(GenerationCache *cache, uint8_t *ptr)
+{
+    if (ptr == NULL) {
+        return;
+    }
+    if (cache != NULL && cache->release_fn != NULL) {
+        cache->release_fn(ptr, cache->buf_ctx);
+    } else {
+        free(ptr);
+    }
+}
+
+static void entry_free(GenerationCache *cache, GenerationEntry *entry)
 {
     uint16_t i;
 
@@ -141,7 +153,7 @@ static void entry_free(GenerationEntry *entry)
     }
     if (entry->slots != NULL) {
         for (i = 0; i < entry->shard_count; i++) {
-            free(entry->slots[i].datagram_copy);
+            slot_buf_free(cache, entry->slots[i].datagram_copy);
             entry->slots[i].datagram_copy = NULL;
         }
         free(entry->slots);
@@ -214,7 +226,7 @@ static void cache_remove_entry(GenerationCache *cache, GenerationEntry *entry,
     } else if (reason == CACHE_REMOVE_EVICT) {
         cache->stats.gen_evicted++;
     }
-    entry_free(entry);
+    entry_free(cache, entry);
 }
 
 static int entry_timed_out(const GenerationCache *cache,
@@ -501,12 +513,19 @@ static GenerationInsertStatus store_slot(GenerationCache *cache,
         return GEN_INSERT_ADMISSION_FAILED;
     }
 
-    copy = malloc(len);
-    if (copy == NULL) {
-        cache->stats.gen_admission_failed++;
-        return GEN_INSERT_ADMISSION_FAILED;
+    copy = NULL;
+    if (cache->is_shared_fn != NULL && cache->retain_fn != NULL &&
+        cache->is_shared_fn(datagram, cache->buf_ctx)) {
+        cache->retain_fn((uint8_t *)datagram, cache->buf_ctx);
+        copy = (uint8_t *)datagram;
+    } else {
+        copy = malloc(len);
+        if (copy == NULL) {
+            cache->stats.gen_admission_failed++;
+            return GEN_INSERT_ADMISSION_FAILED;
+        }
+        memcpy(copy, datagram, len);
     }
-    memcpy(copy, datagram, len);
     slot->datagram_copy = copy;
     slot->len = len;
     slot->present = 1;
@@ -597,7 +616,7 @@ GenerationInsertStatus generation_cache_insert(
         size_t ti = telemetry_stat_index(hdr->flow_id);
 
         if (account_add_generation(cache, hdr->flow_id) != 0) {
-            entry_free(entry);
+            entry_free(cache, entry);
             cache->stats.gen_admission_failed++;
             return GEN_INSERT_ADMISSION_FAILED;
         }
@@ -673,7 +692,7 @@ void generation_cache_destroy(GenerationCache *cache)
     cur = cache->lru_head;
     while (cur != NULL) {
         next = cur->lru_next;
-        entry_free(cur);
+        entry_free(cache, cur);
         cur = next;
     }
     free(cache->flow_accounts);

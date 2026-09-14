@@ -32,11 +32,16 @@
  * congestes the shared decode worker and delays the ACK that would have
  * stopped repair.  Wait is SRTT-based after the first ACK sample.
  */
-#define WH_ACK_INITIAL_WAIT_MS 50u
+#define WH_ACK_INITIAL_WAIT_MS 200u
 #define WH_ACK_REPAIR_WAIT_MS 40u
 #define WH_ACK_POLL_SLICE_MS 5u
 #define WH_ACK_WAIT_MIN_MS 8u
-#define WH_ACK_WAIT_MAX_MS 80u
+/*
+ * Must cover 2× SRTT on the app-relay path (measured ~300 ms, spikes to
+ * seconds).  The old 80 ms cap started repair while the ACK was still in
+ * flight, filled the window, and collapsed hop TX to ~250 Mbps.
+ */
+#define WH_ACK_WAIT_MAX_MS 800u
 #define WH_ACK_SRTT_MULT 2u
 
 typedef struct WirehairSegmentConfig {
