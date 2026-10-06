@@ -4,7 +4,7 @@
 #
 # Example:
 #   CODECS="copy block xor-fec rs-fec rs" RATES="20 24 28 32" \
-#     ./scripts/run_wire_matrix.sh fyp1@10.10.10.164 10.10.34.2 input-128m.ts
+#     ./scripts/run_wire_matrix.sh fyp1@10.10.10.164 10.40.40.2 input-128m.ts
 #
 # For codec=rs, recover uses the matrix erasure path (no extra flag).
 # Artifacts (kept lean):
@@ -30,7 +30,7 @@ ssh_opts="-o BatchMode=yes -o ConnectTimeout=10"
 
 usage() {
     echo "Usage: $0 RECEIVER_SSH RECEIVER_DATA_IP INPUT_FILE" >&2
-    echo "Example: $0 fyp1@10.10.10.164 10.10.34.2 input-128m.ts" >&2
+    echo "Example: $0 fyp1@10.10.10.164 10.40.40.2 input-128m.ts" >&2
     echo "Set CODECS, RATES, RECEIVER_REPO, IDLE_SEC, PORT_BASE, RESULT_DIR," >&2
     echo "KEEP_REMOTE_OUTPUT=0 to delete receiver output after hash check," >&2
     echo "DECODE_MARK=1 to append a decode proof footer into the received file." >&2

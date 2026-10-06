@@ -72,7 +72,7 @@ Requires `--codec`, `--final-dst`, and `--ttl`. Optional `--flow-id`, `--rate-mb
 ./build/wire_relay \
   --local-node-id 2 \
   --listen 9000 \
-  --next-hop 10.10.23.2:9000 \
+  --next-hop 10.30.30.2:9000 \
   [--idle-exit-sec N] \
   [--egress-capacity N] \
   [--egress-wait-ms N] \

@@ -102,7 +102,7 @@ Default is **RS(6,4)** (`k=4`, `parity=2`). Set your own numbers:
 
 ```bash
 ./build/wg_multi_pipeline --codec rs --rs-k=16 --rs-parity=2 \
-  --udp-send 10.10.34.2 9000 input.bin
+  --udp-send 10.40.40.2 9000 input.bin
 # or: --rs-profile=16+2
 
 ./build/wg_multi_pipeline --codec rs --rs-k=16 --rs-parity=2 \
@@ -123,7 +123,7 @@ Library embedding (no sockets): **[docs/FEC_TRANSPORT.md](../../docs/FEC_TRANSPO
 ```bash
 ./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
   --wh-segment-mib=1 --wh-repair-pct=10 \
-  --final-dst 4 --ttl 8 --udp-send 10.10.12.2 9000 input.bin
+  --final-dst 4 --ttl 8 --udp-send 10.20.20.2 9000 input.bin
 
 ./build/wg_multi_pipeline --codec wirehair --wh-ack \
   --udp-recv 9000 out.bin --local-node-id 4 --idle-sec 5 --strict
@@ -275,16 +275,16 @@ Node1 (sender, explicit flow ids):
 
 ```bash
 ./build/wg_multi_pipeline --codec copy --final-dst 4 --ttl 8 --udp-send-multi \
-  --flow "0:10.10.34.2:9000:input0.ts:32" \
-  --flow "1:10.10.34.2:9000:input1.ts:32"
+  --flow "0:10.40.40.2:9000:input0.ts:32" \
+  --flow "1:10.40.40.2:9000:input1.ts:32"
 ```
 
 Node1 (sender, file + fake 5-tuple → flow_id, then same wire path):
 
 ```bash
 ./build/wg_multi_pipeline --codec copy --udp-send-multi \
-  --flow "tuple:10.0.0.1:4001:10.10.12.1:5000:10.10.34.2:9000:input0.ts:32" \
-  --flow "tuple:10.0.0.1:4002:10.10.12.1:5000:10.10.34.2:9000:input1.ts:32"
+  --flow "tuple:10.0.0.1:4001:10.20.20.1:5000:10.40.40.2:9000:input0.ts:32" \
+  --flow "tuple:10.0.0.1:4002:10.20.20.1:5000:10.40.40.2:9000:input1.ts:32"
 ```
 
 Stderr prints `tuple … => flow_id=N`. File chunks use `ingress_push_tuple` (same API as `--udp`).

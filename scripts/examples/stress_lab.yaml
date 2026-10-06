@@ -15,20 +15,20 @@
 nodes:
   node1:
     ssh: local
-    ip: 10.10.12.1
-    monitor_ifaces: "station0"
+    ip: 10.20.20.1
+    monitor_ifaces: "enp6s19"
   node2:
     ssh: fyp1@10.10.10.162
-    ip: 10.10.12.2
-    monitor_ifaces: "ap0 station1"
+    ip: 10.20.20.2
+    monitor_ifaces: "enp6s19 enp6s20"
   node3:
     ssh: fyp1@10.10.10.163
-    ip: 10.10.23.2
-    monitor_ifaces: "ap1 station2"
+    ip: 10.30.30.2
+    monitor_ifaces: "enp6s20 enp6s21"
   node4:
     ssh: fyp1@10.10.10.164
-    ip: 10.10.34.2
-    monitor_ifaces: "ap2"
+    ip: 10.40.40.2
+    monitor_ifaces: "enp6s21"
 
 defaults:
   idle_sec: 20

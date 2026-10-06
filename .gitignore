@@ -1,7 +1,5 @@
-# Build artifacts (keep published experiment reports)
+# Build artifacts
 build/**
-!build/report-data/
-!build/report-data/**
 
 # Editor
 *.swp

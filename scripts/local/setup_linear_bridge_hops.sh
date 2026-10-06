@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Configure LINEAR hop topology on virtio bridges (not VXLAN).
+# Configure LINEAR hop topology on virtio bridges.
 # Keep SSH on 10.10.10.16x / enp6s18 unchanged.
 #
 # Target:

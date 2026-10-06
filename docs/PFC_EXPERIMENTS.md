@@ -135,7 +135,7 @@ Node2 --ACK--------> Node1 --ack-port
 ./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
   --wh-segment-mib=2 --wh-repair-pct=20 --wh-window=8 \
   --final-dst 4 --ttl 8 --rate-mbps 1000 \
-  --udp-send 10.10.12.2 9000 input.bin
+  --udp-send 10.20.20.2 9000 input.bin
 ```
 
 Without ACK, drop `--wh-ack` / `--ack-port` and raise `--wh-repair-pct` to cover loss.
@@ -150,7 +150,7 @@ ACK: Node3 → relay → Node1 --ack-port
 ```bash
 # Node2
 ./build/wire_relay --local-node-id 2 --listen 9000 \
-  --next-hop 10.10.23.2:9000
+  --next-hop 10.30.30.2:9000
 
 # Node3
 ./build/wg_multi_pipeline --codec wirehair --wh-ack \
@@ -158,28 +158,20 @@ ACK: Node3 → relay → Node1 --ack-port
 
 # Node1
 ./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
-  --final-dst 4 --ttl 8 --udp-send 10.10.12.2 9000 input.bin
+  --final-dst 4 --ttl 8 --udp-send 10.20.20.2 9000 input.bin
 ```
 
 Use `--return-hop` on the relay only until it has learned the `flow_id` return
 address (first DATA from that flow).
 
-### 4.3 Lab VM matrix
+### 4.3 Lab VMs
 
 | Node | SSH | Data network |
 | --- | --- | --- |
-| Node1 | `fyp1@10.10.10.161` | `10.10.12.1` |
-| Node2 | `fyp1@10.10.10.162` | `10.10.12.2` |
-| Node3 | `fyp1@10.10.10.163` | `10.10.23.2` |
-
-```bash
-python3 scripts/vm_wirehair_full_matrix.py
-WH_MATRIX_ACK_ONLY=1 python3 scripts/vm_wirehair_full_matrix.py
-WH_MATRIX_FRESH=1 python3 scripts/vm_wirehair_full_matrix.py
-```
-
-Dimensions: direct / relay × ACK on/off × 1/2/4 flows × 500/1000/2000/5000 Mbps.  
-Output: `build/wirehair_full_matrix.json`.
+| Node1 | `fyp1@10.10.10.161` | `10.20.20.1` |
+| Node2 | `fyp1@10.10.10.162` | `10.20.20.2` |
+| Node3 | `fyp1@10.10.10.163` | `10.30.30.2` |
+| Node4 | `fyp1@10.10.10.164` | `10.40.40.2` |
 
 ---
 
@@ -187,8 +179,8 @@ Output: `build/wirehair_full_matrix.json`.
 
 ```bash
 ./build/wg_multi_pipeline --codec wirehair --wh-ack --udp-send-multi \
-  --flow "0:10.10.12.2:9000:input0.bin:500" \
-  --flow "1:10.10.12.2:9000:input1.bin:500"
+  --flow "0:10.20.20.2:9000:input0.bin:500" \
+  --flow "1:10.20.20.2:9000:input1.bin:500"
 
 ./build/wg_multi_pipeline --codec wirehair --wh-ack \
   --udp-recv 9000 /tmp/out_ --max-flows 4 --local-node-id 4

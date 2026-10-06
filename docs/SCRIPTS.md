@@ -20,12 +20,10 @@ it, and the most common command forms.
 | `scripts/run_wire_matrix.sh` | Single-flow codec×rate matrix (Node1 -> Node4) | Find passing bitrate per codec |
 | `scripts/run_wire_multiflow_matrix.sh` | Multi-flow codec×rate matrix with per-flow checks | Validate concurrent flow behavior and relay load |
 | `scripts/run_wire_stress.sh` | Configurable multi-stream stress (YAML/JSON) | Custom from/to/file/rate/codec mixes across nodes |
-| `scripts/vm_wirehair_full_matrix.py` | Wirehair VM matrix: direct/relay × ACK × 1/2/4 flows × rates | ACK throughput/regression on Node1→Node2/Node3 |
-| `scripts/run_rs_compute_penalty.sh` | RS encode/recover CPU penalty experiments | See `docs/rs_compute_penalty_benchmark.md` |
-| `scripts/run_ffrs_resource_matrix.sh` | FFRS-style resource matrix runner | Lab CPU/NIC sampling with monitors |
 | `scripts/encode_multibitrate.sh` | Generate `input_1m.ts` / `input_10m.ts` / `input_20m.ts` | Prepare demo sources |
 | `scripts/run_dual_fifo.sh` | Live 3-stream FIFO demo with ffplay windows | Visual local demo of multi-flow processing |
-| `scripts/local/` | Linear-bridge lab topo + phase0–5 VM runners | Local topology; see `scripts/local/LINEAR_BRIDGE_HOPS.md` |
+| `scripts/local/run_bats_linear.py` | BATS source/relay/dest on the linear bridge | Current VM path for `bats_line` |
+| `scripts/local/setup_linear_bridge_hops.sh` | Assign linear virtio-bridge addresses | See `scripts/local/LINEAR_BRIDGE_HOPS.md` |
 
 Helper (kept for multiflow / stress relay NIC sampling):
 
@@ -34,8 +32,7 @@ Helper (kept for multiflow / stress relay NIC sampling):
 | `scripts/iperf_like_monitor.py` | Sample NIC/CPU timeseries; used by multiflow matrix and stress |
 | `scripts/wire_stress_run.py` | Orchestrator behind `run_wire_stress.sh` |
 | `scripts/wire_stress_charts.py` | SVG CPU/RX/TX charts from stress `monitor/*.csv` |
-| `scripts/parse_rs_compute_penalty.py` | Parse RS compute-penalty run outputs |
-| `scripts/proc_resource_monitor.py` | Process CPU/RSS sampler used by resource matrices |
+| `scripts/flow_loss_metrics.py` | Per-flow loss summary used by the multiflow matrix |
 
 ## Script Details
 
@@ -122,8 +119,8 @@ Helper (kept for multiflow / stress relay NIC sampling):
 - Stream `id` is the wire `flow_id` (0..7), unique per `(to, codec)`.
 - Max 8 flows per receiver process.
 - Loopback: `to: loopback` (or same `from`/`to`) uses `127.0.0.1`.
-- Set `monitor_ifaces` per node (lab defaults: node1 `station0`, node2
-  `ap0 station1`, node3 `ap1 station2`, node4 `ap2`). Empty → CPU only.
+- Set `monitor_ifaces` per node (lab defaults: node1 `enp6s19`, node2
+  `enp6s19 enp6s20`, node3 `enp6s20 enp6s21`, node4 `enp6s21`). Empty → CPU only.
 - YAML needs PyYAML; JSON uses the stdlib only.
 
 **Key env / flags**
@@ -147,29 +144,6 @@ Helper (kept for multiflow / stress relay NIC sampling):
 
 **Key env**
 - `DURATION` (optional clip length)
-
----
-
-### `vm_wirehair_full_matrix.py`
-
-**What it does**
-- Runs the Wirehair ACK regression matrix on the Node1/Node2/Node3 VMs:
-  direct vs relay, ACK on/off, 1/2/4 flows, and rates 500–5000 Mbps.
-- Parses sender summaries (`goodput`, `wire_mbps`, `repair_sent`,
-  `send_window_hwm`, `repair_rounds`) and receiver `ahead_window_drops`.
-- Relay learns per-flow previous-hop UDP endpoints for RETURN_PATH ACK;
-  `--return-hop` is only a fallback before a route is learned.
-
-Full PFC system reference: [`docs/PFC.md`](../docs/PFC.md).
-
-**Usage**
-- `python3 scripts/vm_wirehair_full_matrix.py`
-- `WH_MATRIX_ACK_ONLY=1 python3 scripts/vm_wirehair_full_matrix.py` (ACK cases only)
-- `WH_MATRIX_FRESH=1 python3 scripts/vm_wirehair_full_matrix.py` (ignore prior JSON)
-
-**Key env**
-- `WH_MATRIX_SKIP` — resume after N completed cases
-- `WH_MATRIX_NAME` — output JSON basename under `build/`
 
 ---
 

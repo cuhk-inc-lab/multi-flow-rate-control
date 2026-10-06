@@ -5,17 +5,17 @@
 #
 # Provide one local file per flow (recommended):
 #   CODECS="copy xor-fec rs" RATES="10 20" \
-#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 \
+#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.40.40.2 \
 #       a.bin b.bin c.bin d.bin
 #
 # For codec=rs, recover uses the matrix erasure path (no extra flag).
 # Teaching decode-mark (footer proves Codec_decode; status MARKED):
 #   DECODE_MARK=1 KEEP_REMOTE_OUTPUT=1 CODECS="xor-fec" RATES="10" \
-#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 a.bin b.bin
+#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.40.40.2 a.bin b.bin
 #
 # Or one seed file (legacy seed mode): script synthesizes FLOWS distinct payloads:
 #   FLOWS=4 DURATION_S=10 RATES="10 20" \
-#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 seed.ts
+#     ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.40.40.2 seed.ts
 #
 # Artifacts under build/wire-multiflow-<ts>/ (kept lean):
 #   results.md   — compact summary (est. + measured link Mbps, loss, latency)
@@ -60,8 +60,8 @@ monitor_relays=${MONITOR_RELAYS:-1}
 monitor_hz=${MONITOR_HZ:-1}
 node2_ssh=${NODE2_SSH:-"fyp1@10.10.10.162"}
 node3_ssh=${NODE3_SSH:-"fyp1@10.10.10.163"}
-node2_ifaces=${NODE2_IFACES:-"ap0 station1"}
-node3_ifaces=${NODE3_IFACES:-"ap1 station2"}
+node2_ifaces=${NODE2_IFACES:-"enp6s19 enp6s20"}
+node3_ifaces=${NODE3_IFACES:-"enp6s20 enp6s21"}
 # Wire v3 hop control (defaults: binary final-dst=4 ttl=8 local-node-id=4).
 final_dst=${FINAL_DST:-}
 ttl=${TTL:-}
@@ -128,12 +128,12 @@ Usage:
 Examples:
   # Your own files = one flow each (flow_id 0..N-1)
   CODECS="copy" RATES="10 20" \
-    ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 \
+    ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.40.40.2 \
       flow0.bin flow1.bin flow2.bin flow3.bin
 
   # Synthesize N payloads from one seed (sized by rate × DURATION_S)
   FLOWS=4 DURATION_S=10 RATES="10 20" \
-    ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.10.34.2 seed.ts
+    ./scripts/run_wire_multiflow_matrix.sh fyp1@10.10.10.164 10.40.40.2 seed.ts
 
 Env:
   CODECS="copy ..."
@@ -155,8 +155,8 @@ Env:
   USE_NO_PACE=0
   MONITOR_RELAYS=1       sample Node2/Node3 NIC bitrate during each case
   MONITOR_HZ=1
-  NODE2_SSH=fyp1@10.10.10.162   NODE2_IFACES="ap0 station1"
-  NODE3_SSH=fyp1@10.10.10.163   NODE3_IFACES="ap1 station2"
+  NODE2_SSH=fyp1@10.10.10.162   NODE2_IFACES="enp6s19 enp6s20"
+  NODE3_SSH=fyp1@10.10.10.163   NODE3_IFACES="enp6s20 enp6s21"
   FINAL_DST=4  TTL=8  LOCAL_NODE_ID=4   # Node1→Node2 direct: FINAL_DST=2 TTL=2 LOCAL_NODE_ID=2
   RECEIVER_REPO=$HOME/work/multi-flow-rate-control
   RESULT_DIR=build/wire-multiflow-<timestamp>

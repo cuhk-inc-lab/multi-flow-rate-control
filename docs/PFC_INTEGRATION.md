@@ -24,11 +24,11 @@ Typical lab (one relay hop):
 
 ```text
 Node1 (encoder)          Node2 (relay)              Node3 (decoder)
-10.10.12.1               10.10.12.2 listen          10.10.23.2 listen
+10.20.20.1               10.20.20.2 listen          10.30.30.2 listen
 local-node-id = 1        local-node-id = 2          local-node-id = 4
 
-DATA:  udp-send → 10.10.12.2:PORT  →  forward → 10.10.23.2:PORT
-ACK:   ack-port ← 10.10.12.1       ←  return  ← (decoder emits ACK)
+DATA:  udp-send → 10.20.20.2:PORT  →  forward → 10.30.30.2:PORT
+ACK:   ack-port ← 10.20.20.1       ←  return  ← (decoder emits ACK)
 ```
 
 Routing uses **wire header** fields, not UDP destination alone:
@@ -233,8 +233,8 @@ Opaque forward; does not decode PFC.
 ./build/wire_relay \
   --local-node-id 2 \
   --listen 9000 \
-  --next-hop 10.10.23.2:9000 \
-  --return-hop 10.10.12.1:9100 \
+  --next-hop 10.30.30.2:9000 \
+  --return-hop 10.20.20.1:9100 \
   --idle-exit-sec 120
 ```
 
@@ -249,7 +249,7 @@ for each `flow_id`. After the first forward DATA, ACKs route automatically.
   --wh-segment-mib=2 --wh-window=4 \
   --local-node-id 1 --final-dst 4 --ttl 8 \
   --rate-mbps 200 \
-  --udp-send 10.10.12.2 9000 /tmp/input.bin
+  --udp-send 10.20.20.2 9000 /tmp/input.bin
 ```
 
 Verify: `sha256sum` of `input.bin` and `out.bin` must match.

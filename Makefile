@@ -169,13 +169,30 @@ WIREHAIR_SEGMENT_TEST_BIN = $(OBJ_DIR)/wirehair_segment_tests
 
 RELAY_HDRS := $(wildcard $(RELAY_DIR)/*.h)
 
-.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline integration-test fec-transport fec-interleave-sim fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
+BATS_DIR = ../bats
+BATS_LINE_BIN = $(OBJ_DIR)/bats_line
+BATS_LINE_SRCS = \
+	apps/bats_line/bats_line.c \
+	$(BATS_DIR)/field.c \
+	$(BATS_DIR)/source.c \
+	$(BATS_DIR)/dest.c \
+	$(BATS_DIR)/codec.c \
+	$(BATS_DIR)/sim.c \
+	$(BATS_DIR)/link.c \
+	$(BATS_DIR)/relay.c
+
+.PHONY: all test check wg-demo wire-relay wire-relay-hol-baseline bats-line integration-test fec-transport fec-interleave-sim fec-trace rs-recovery-bench rs-encode-bench sanitize tsan clean
 
 all: $(LIB)
 
 wg-demo: $(WG_BIN)
 
 wire-relay: $(RELAY_BIN)
+
+bats-line: $(BATS_LINE_BIN)
+
+$(BATS_LINE_BIN): $(BATS_LINE_SRCS) | $(OBJ_DIR)
+	$(CC) -std=c11 -Wall -Wextra -O2 -I$(BATS_DIR) -I../buffer-management-module/include -o $@ $(BATS_LINE_SRCS) ../buffer-management-module/src/circular_buffer.c -pthread -lm
 
 # TEST ONLY: Phase-0 HOL baseline (inline RX on the recv thread).
 wire-relay-hol-baseline: $(OBJ_DIR)/wire_relay_hol_baseline

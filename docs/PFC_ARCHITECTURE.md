@@ -284,7 +284,6 @@ Multi-segment window, recvmmsg, and the multi-flow pacer belong in
 | `src/fec_transport.c` | Socket-free RS + Wirehair |
 | `include/fec_transport.h` | Public library API |
 | `third_party/wirehair` | Fountain math |
-| `scripts/vm_wirehair_full_matrix.py` | VM matrix |
 | `docs/FEC_TRANSPORT.md` | Library-only guide (RS + Wirehair) |
 
 ---

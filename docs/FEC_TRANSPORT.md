@@ -204,7 +204,7 @@ Wirehair cases in `tests/fec_transport_tests.c`:
 ./build/wg_multi_pipeline --codec wirehair --wh-ack --ack-port=9100 \
   --wh-segment-mib=1 --wh-repair-pct=10 \
   --final-dst 4 --ttl 8 --flow-id 0 \
-  --udp-send 10.10.12.2 9000 input.bin
+  --udp-send 10.20.20.2 9000 input.bin
 ```
 
 Defaults: 10 MiB segments, 10% repair, ACK **off** (`--no-wh-ack`).
